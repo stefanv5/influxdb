@@ -994,10 +994,9 @@ func runCompactionWithMetrics(t testing.TB, compactor *tsm1.Compactor, tsmFiles 
 }
 
 // TestStreamingCompaction_100KKeys_2GBx4 tests streaming compaction with 100K keys,
-// 1000 points per key, across 4 non-overlapping TSM files.
-// Total: 100K keys × 1000 points/key × 4 files = 400M points.
-// Note: TSMWriter buffers all values in memory before writing to disk,
-// so pointsPerKey must keep total memory under system RAM (~16GB).
+// 5000 points per key, across 4 non-overlapping TSM files.
+// Total: 100K keys × 5000 points/key × 4 files = 2B points.
+// TSMWriter buffers compressed blocks in memory; estimated ~10GB peak on 16GB system.
 func TestStreamingCompaction_100KKeys_2GBx4(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping 100K keys test in short mode")
@@ -1007,7 +1006,7 @@ func TestStreamingCompaction_100KKeys_2GBx4(t *testing.T) {
 	defer os.RemoveAll(dir)
 
 	numKeys := 100_000
-	pointsPerKey := 1_000
+	pointsPerKey := 5_000
 	numFiles := 4
 
 	t.Logf("Generating %d files: %d keys × %d points/key = %d points/file",
@@ -1033,8 +1032,7 @@ func TestStreamingCompaction_100KKeys_2GBx4(t *testing.T) {
 }
 
 // TestStreamingCompaction_100KKeys_2GBx4_Overlap tests streaming compaction with 100K keys,
-// 1000 points per key, across 4 overlapping TSM files. Each file has a time offset
-// creating overlapping time ranges that require deduplication.
+// 5000 points per key, across 4 overlapping TSM files with 50% overlap.
 func TestStreamingCompaction_100KKeys_2GBx4_Overlap(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping 100K keys overlap test in short mode")
@@ -1044,7 +1042,7 @@ func TestStreamingCompaction_100KKeys_2GBx4_Overlap(t *testing.T) {
 	defer os.RemoveAll(dir)
 
 	numKeys := 100_000
-	pointsPerKey := 1_000
+	pointsPerKey := 5_000
 	numFiles := 4
 	overlapStep := pointsPerKey / 2 // 50% overlap between consecutive files
 
@@ -1132,14 +1130,14 @@ func TestStreamingCompaction_100KKeys_2GBx4_Overlap(t *testing.T) {
 }
 
 // TestCompaction_100KKeys_StreamingVsBatch compares streaming vs batch compaction
-// performance on the same dataset (100K keys × 1000 points/key × 4 files).
+// performance on the same dataset (100K keys × 5000 points/key × 4 files = 2B points).
 func TestCompaction_100KKeys_StreamingVsBatch(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping streaming vs batch comparison in short mode")
 	}
 
 	numKeys := 100_000
-	pointsPerKey := 1_000
+	pointsPerKey := 5_000
 	numFiles := 4
 
 	t.Logf("=== Streaming vs Batch Compaction Comparison ===")
@@ -1185,14 +1183,14 @@ func TestCompaction_100KKeys_StreamingVsBatch(t *testing.T) {
 	t.Log("=== Comparison complete. See metrics above. ===")
 }
 
-// BenchmarkCompaction_100KKeys benchmarks streaming compaction with 100K keys.
+// BenchmarkCompaction_100KKeys benchmarks streaming compaction with 100K keys × 5000 points.
 func BenchmarkCompaction_100KKeys(b *testing.B) {
 	if testing.Short() {
 		b.Skip("Skipping benchmark in short mode")
 	}
 
 	numKeys := 100_000
-	pointsPerKey := 1_000
+	pointsPerKey := 5_000
 	numFiles := 4
 
 	dir := MustTempDir()
