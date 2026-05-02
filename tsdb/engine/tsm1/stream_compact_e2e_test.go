@@ -914,12 +914,40 @@ func generateLargeTSMFileWithOffset(t testing.TB, dir string, gen, numKeys, poin
 }
 
 // runCompactionWithMetrics runs a compaction and returns performance metrics.
+// A background goroutine samples memory stats every 10ms to capture peak usage
+// during compaction (GC alone can't show the true peak).
 func runCompactionWithMetrics(t testing.TB, compactor *tsm1.Compactor, tsmFiles []string, mode string) {
 	t.Helper()
 
 	runtime.GC()
 	var memBefore runtime.MemStats
 	runtime.ReadMemStats(&memBefore)
+
+	// Start background memory sampler to capture peak during compaction
+	var peakHeapAlloc, peakHeapInuse, peakHeapSys uint64
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				var m runtime.MemStats
+				runtime.ReadMemStats(&m)
+				if m.HeapAlloc > peakHeapAlloc {
+					peakHeapAlloc = m.HeapAlloc
+				}
+				if m.HeapInuse > peakHeapInuse {
+					peakHeapInuse = m.HeapInuse
+				}
+				if m.HeapSys > peakHeapSys {
+					peakHeapSys = m.HeapSys
+				}
+			}
+		}
+	}()
 
 	t.Logf("[%s] Starting compaction of %d files...", mode, len(tsmFiles))
 	start := time.Now()
@@ -932,6 +960,10 @@ func runCompactionWithMetrics(t testing.TB, compactor *tsm1.Compactor, tsmFiles 
 		result, err = compactor.CompactFast(tsmFiles)
 	}
 	elapsed := time.Since(start)
+
+	// Stop sampler and capture final peak
+	close(done)
+	time.Sleep(20 * time.Millisecond) // let sampler goroutine finish
 
 	if err != nil {
 		t.Fatalf("[%s] compact failed: %v", mode, err)
@@ -986,15 +1018,17 @@ func runCompactionWithMetrics(t testing.TB, compactor *tsm1.Compactor, tsmFiles 
 		mode,
 		float64(totalPoints)/elapsed.Seconds(),
 		float64(totalOutputSize)/1024/1024/elapsed.Seconds())
-	t.Logf("[%s] Memory Breakdown:", mode)
-	t.Logf("[%s]   HeapAlloc  = %.2f MB (live heap objects)", mode, float64(memAfter.HeapAlloc)/1024/1024)
-	t.Logf("[%s]   HeapInuse  = %.2f MB (in-use heap spans)", mode, float64(memAfter.HeapInuse)/1024/1024)
-	t.Logf("[%s]   HeapSys    = %.2f MB (heap memory from OS)", mode, float64(memAfter.HeapSys)/1024/1024)
-	t.Logf("[%s]   StackInuse = %.2f MB (goroutine stacks)", mode, float64(memAfter.StackInuse)/1024/1024)
-	t.Logf("[%s]   StackSys   = %.2f MB (stack memory from OS)", mode, float64(memAfter.StackSys)/1024/1024)
-	t.Logf("[%s]   MSpanInuse = %.2f MB (mspan structures)", mode, float64(memAfter.MSpanInuse)/1024/1024)
-	t.Logf("[%s]   MCacheInuse= %.2f MB (mcache structures)", mode, float64(memAfter.MCacheInuse)/1024/1024)
-	t.Logf("[%s]   Sys        = %.2f MB (total from OS)", mode, float64(memAfter.Sys)/1024/1024)
+	t.Logf("[%s] Memory After GC (post-compaction):", mode)
+	t.Logf("[%s]   HeapAlloc  = %.2f MB", mode, float64(memAfter.HeapAlloc)/1024/1024)
+	t.Logf("[%s]   HeapInuse  = %.2f MB", mode, float64(memAfter.HeapInuse)/1024/1024)
+	t.Logf("[%s]   HeapSys    = %.2f MB", mode, float64(memAfter.HeapSys)/1024/1024)
+	t.Logf("[%s] Memory Peak During Compaction (sampled every 10ms):", mode)
+	t.Logf("[%s]   PeakHeapAlloc = %.2f MB (live objects at peak)", mode, float64(peakHeapAlloc)/1024/1024)
+	t.Logf("[%s]   PeakHeapInuse = %.2f MB (in-use spans at peak)", mode, float64(peakHeapInuse)/1024/1024)
+	t.Logf("[%s]   PeakHeapSys   = %.2f MB (from OS at peak)", mode, float64(peakHeapSys)/1024/1024)
+	t.Logf("[%s] Other:", mode)
+	t.Logf("[%s]   StackInuse = %.2f MB", mode, float64(memAfter.StackInuse)/1024/1024)
+	t.Logf("[%s]   Sys        = %.2f MB", mode, float64(memAfter.Sys)/1024/1024)
 	t.Logf("[%s]   TotalAlloc = %.2f MB (cumulative)", mode, float64(memAfter.TotalAlloc)/1024/1024)
 	t.Logf("[%s]   NumGC      = %d", mode, memAfter.NumGC-memBefore.NumGC)
 }
