@@ -986,11 +986,17 @@ func runCompactionWithMetrics(t testing.TB, compactor *tsm1.Compactor, tsmFiles 
 		mode,
 		float64(totalPoints)/elapsed.Seconds(),
 		float64(totalOutputSize)/1024/1024/elapsed.Seconds())
-	t.Logf("[%s] Memory: AllocDiff=%.2f MB, Sys=%.2f MB, NumGC=%d",
-		mode,
-		float64(memAllocDiff)/1024/1024,
-		float64(memAfter.Sys)/1024/1024,
-		memAfter.NumGC-memBefore.NumGC)
+	t.Logf("[%s] Memory Breakdown:", mode)
+	t.Logf("[%s]   HeapAlloc  = %.2f MB (live heap objects)", mode, float64(memAfter.HeapAlloc)/1024/1024)
+	t.Logf("[%s]   HeapInuse  = %.2f MB (in-use heap spans)", mode, float64(memAfter.HeapInuse)/1024/1024)
+	t.Logf("[%s]   HeapSys    = %.2f MB (heap memory from OS)", mode, float64(memAfter.HeapSys)/1024/1024)
+	t.Logf("[%s]   StackInuse = %.2f MB (goroutine stacks)", mode, float64(memAfter.StackInuse)/1024/1024)
+	t.Logf("[%s]   StackSys   = %.2f MB (stack memory from OS)", mode, float64(memAfter.StackSys)/1024/1024)
+	t.Logf("[%s]   MSpanInuse = %.2f MB (mspan structures)", mode, float64(memAfter.MSpanInuse)/1024/1024)
+	t.Logf("[%s]   MCacheInuse= %.2f MB (mcache structures)", mode, float64(memAfter.MCacheInuse)/1024/1024)
+	t.Logf("[%s]   Sys        = %.2f MB (total from OS)", mode, float64(memAfter.Sys)/1024/1024)
+	t.Logf("[%s]   TotalAlloc = %.2f MB (cumulative)", mode, float64(memAfter.TotalAlloc)/1024/1024)
+	t.Logf("[%s]   NumGC      = %d", mode, memAfter.NumGC-memBefore.NumGC)
 }
 
 // TestStreamingCompaction_100KKeys_2GBx4 tests streaming compaction with 100K keys,
