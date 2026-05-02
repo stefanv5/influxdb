@@ -945,9 +945,15 @@ func (c *Compactor) compact(fast bool, tsmFiles []string) ([]string, error) {
 		return nil, nil
 	}
 
-	tsm, err := NewTSMBatchKeyIterator(size, fast, intC, tsmFiles, trs...)
-	if err != nil {
-		return nil, err
+	var tsm KeyIterator
+	if fast {
+		var err error
+		tsm, err = NewTSMBatchKeyIterator(size, fast, intC, tsmFiles, trs...)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		tsm = NewStreamingKeyIterator(tsmFiles, trs, size, intC)
 	}
 
 	return c.writeNewFiles(maxGeneration, maxSequence, tsmFiles, tsm, true)
