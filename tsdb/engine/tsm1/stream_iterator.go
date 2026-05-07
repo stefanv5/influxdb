@@ -262,10 +262,15 @@ func (it *BlockValueIterator) Close() {
 	it.pos = 0
 }
 
+// blockTypeUnset is a sentinel value for currentType that does not collide
+// with any valid block type (BlockFloat64=0 through BlockUnsigned=4).
+const blockTypeUnset = byte(0xFF)
+
 // valueEntry represents an entry in the value heap.
 type valueEntry struct {
 	value     Value
 	iterator  *BlockValueIterator
+	key       []byte // snapshot of the key at entry creation time
 	timestamp int64
 	fileIdx   int
 }
@@ -413,7 +418,7 @@ func (m *KeyAwareMergingIterator) Next() bool {
 		entry := m.popAndDedup()
 		if entry != nil {
 			// Set currentType for first value
-			if m.currentType == 0 {
+			if m.currentType == blockTypeUnset {
 				m.currentType = blockTypeForValue(entry.value)
 			}
 			m.buf = append(m.buf, entry.value)
@@ -460,6 +465,12 @@ func (m *KeyAwareMergingIterator) Read() (key []byte, minTime int64, maxTime int
 	data, err = m.encodeValues(m.currentType, m.buf)
 	if err != nil {
 		return nil, 0, 0, nil, err
+	}
+
+	// If all values were skipped due to type mismatch, data is nil.
+	// Return nil data without error — the caller should skip this block.
+	if data == nil {
+		return nil, 0, 0, nil, nil
 	}
 
 	return key, minTime, maxTime, data, nil
@@ -517,6 +528,7 @@ func (m *KeyAwareMergingIterator) initIterators() bool {
 	m.currentKey = minKey
 	// Initialize blockKey for first block
 	m.blockKey = minKey
+	m.currentType = blockTypeUnset
 	m.activateIteratorsForKey(minKey)
 	return true
 }
@@ -603,6 +615,7 @@ func (m *KeyAwareMergingIterator) activateIteratorForBlock(iter *BlockValueItera
 			entry := &valueEntry{
 				value:     v,
 				iterator:  iter,
+				key:       append([]byte(nil), iter.currentKey...),
 				timestamp: v.UnixNano(),
 				fileIdx:   iter.FileIdx(),
 			}
@@ -634,30 +647,47 @@ func (m *KeyAwareMergingIterator) activateIteratorForBlock(iter *BlockValueItera
 	}
 }
 
-// popAndDedup pops the top entry and consumes all same-timestamp entries,
-// keeping the value from the highest fileIdx.
+// popAndDedup pops the top entry and consumes all same-timestamp entries
+// for the SAME key, keeping the value from the highest fileIdx.
+// The winner's iterator is advanced after dedup completes to prevent
+// cross-key value mixing in the heap during the dedup loop.
 func (m *KeyAwareMergingIterator) popAndDedup() *valueEntry {
 	if m.heap.Len() == 0 {
 		return nil
 	}
 
 	top := heap.Pop(&m.heap).(*valueEntry)
-	m.advanceAndPush(top.iterator)
 
-	// Consume all same-timestamp entries
+	// Collect losers for deferred advancement
+	var losers []*valueEntry
+
+	// Consume all same-timestamp entries for the same key
 	for m.heap.Len() > 0 {
 		next := m.heap.Peek()
 		if next.timestamp != top.timestamp {
 			break
 		}
+		if !bytes.Equal(next.key, top.key) {
+			break
+		}
 		popped := heap.Pop(&m.heap).(*valueEntry)
-		m.advanceAndPush(popped.iterator)
 
 		// Newer file wins (higher fileIdx)
 		if popped.fileIdx > top.fileIdx {
+			losers = append(losers, top)
 			top = popped
+		} else {
+			losers = append(losers, popped)
 		}
 	}
+
+	// Advance losers' iterators and push their next values if still on the same key
+	for _, loser := range losers {
+		m.advanceAndPush(loser.iterator)
+	}
+
+	// Advance winner's iterator last
+	m.advanceAndPush(top.iterator)
 
 	return top
 }
@@ -671,6 +701,7 @@ func (m *KeyAwareMergingIterator) advanceAndPush(iter *BlockValueIterator) {
 		entry := &valueEntry{
 			value:     v,
 			iterator:  iter,
+			key:       append([]byte(nil), iter.currentKey...),
 			timestamp: v.UnixNano(),
 			fileIdx:   iter.FileIdx(),
 		}
@@ -687,6 +718,7 @@ func (m *KeyAwareMergingIterator) advanceAndPush(iter *BlockValueIterator) {
 			entry := &valueEntry{
 				value:     v,
 				iterator:  iter,
+				key:       append([]byte(nil), iter.currentKey...),
 				timestamp: v.UnixNano(),
 				fileIdx:   iter.FileIdx(),
 			}
@@ -728,71 +760,93 @@ func (m *KeyAwareMergingIterator) moveToNextKey() bool {
 
 	// Set currentKey and activate iterators for minKey
 	m.currentKey = minKey
-	m.currentType = 0
+	m.currentType = blockTypeUnset
 	m.activateIteratorsForKey(minKey)
 	return true
 }
 
 // encodeValues encodes a slice of values into a TSM block.
+// On type mismatch, the mismatched value is skipped and the error is recorded
+// in m.err. This prevents a single corrupted value from aborting compaction.
 func (m *KeyAwareMergingIterator) encodeValues(typ byte, values []Value) ([]byte, error) {
 	switch typ {
 	case BlockFloat64:
-		arr := tsdb.NewFloatArrayLen(len(values))
-		for i, v := range values {
+		arr := tsdb.NewFloatArrayLen(0)
+		for _, v := range values {
 			fv, ok := v.(FloatValue)
 			if !ok {
-				return nil, fmt.Errorf("type mismatch: expected FloatValue, got %T", v)
+				m.err = fmt.Errorf("type mismatch: expected FloatValue, got %T for key %s", v, m.blockKey)
+				continue
 			}
-			arr.Timestamps[i] = v.UnixNano()
-			arr.Values[i] = fv.value
+			arr.Timestamps = append(arr.Timestamps, v.UnixNano())
+			arr.Values = append(arr.Values, fv.value)
+		}
+		if arr.Len() == 0 {
+			return nil, nil
 		}
 		return EncodeFloatArrayBlock(arr, nil)
 
 	case BlockInteger:
-		arr := tsdb.NewIntegerArrayLen(len(values))
-		for i, v := range values {
+		arr := tsdb.NewIntegerArrayLen(0)
+		for _, v := range values {
 			iv, ok := v.(IntegerValue)
 			if !ok {
-				return nil, fmt.Errorf("type mismatch: expected IntegerValue, got %T", v)
+				m.err = fmt.Errorf("type mismatch: expected IntegerValue, got %T for key %s", v, m.blockKey)
+				continue
 			}
-			arr.Timestamps[i] = v.UnixNano()
-			arr.Values[i] = iv.value
+			arr.Timestamps = append(arr.Timestamps, v.UnixNano())
+			arr.Values = append(arr.Values, iv.value)
+		}
+		if arr.Len() == 0 {
+			return nil, nil
 		}
 		return EncodeIntegerArrayBlock(arr, nil)
 
 	case BlockUnsigned:
-		arr := tsdb.NewUnsignedArrayLen(len(values))
-		for i, v := range values {
+		arr := tsdb.NewUnsignedArrayLen(0)
+		for _, v := range values {
 			uv, ok := v.(UnsignedValue)
 			if !ok {
-				return nil, fmt.Errorf("type mismatch: expected UnsignedValue, got %T", v)
+				m.err = fmt.Errorf("type mismatch: expected UnsignedValue, got %T for key %s", v, m.blockKey)
+				continue
 			}
-			arr.Timestamps[i] = v.UnixNano()
-			arr.Values[i] = uv.value
+			arr.Timestamps = append(arr.Timestamps, v.UnixNano())
+			arr.Values = append(arr.Values, uv.value)
+		}
+		if arr.Len() == 0 {
+			return nil, nil
 		}
 		return EncodeUnsignedArrayBlock(arr, nil)
 
 	case BlockBoolean:
-		arr := tsdb.NewBooleanArrayLen(len(values))
-		for i, v := range values {
+		arr := tsdb.NewBooleanArrayLen(0)
+		for _, v := range values {
 			bv, ok := v.(BooleanValue)
 			if !ok {
-				return nil, fmt.Errorf("type mismatch: expected BooleanValue, got %T", v)
+				m.err = fmt.Errorf("type mismatch: expected BooleanValue, got %T for key %s", v, m.blockKey)
+				continue
 			}
-			arr.Timestamps[i] = v.UnixNano()
-			arr.Values[i] = bv.value
+			arr.Timestamps = append(arr.Timestamps, v.UnixNano())
+			arr.Values = append(arr.Values, bv.value)
+		}
+		if arr.Len() == 0 {
+			return nil, nil
 		}
 		return EncodeBooleanArrayBlock(arr, nil)
 
 	case BlockString:
-		arr := tsdb.NewStringArrayLen(len(values))
-		for i, v := range values {
+		arr := tsdb.NewStringArrayLen(0)
+		for _, v := range values {
 			sv, ok := v.(StringValue)
 			if !ok {
-				return nil, fmt.Errorf("type mismatch: expected StringValue, got %T", v)
+				m.err = fmt.Errorf("type mismatch: expected StringValue, got %T for key %s", v, m.blockKey)
+				continue
 			}
-			arr.Timestamps[i] = v.UnixNano()
-			arr.Values[i] = sv.value
+			arr.Timestamps = append(arr.Timestamps, v.UnixNano())
+			arr.Values = append(arr.Values, sv.value)
+		}
+		if arr.Len() == 0 {
+			return nil, nil
 		}
 		return EncodeStringArrayBlock(arr, nil)
 
@@ -831,24 +885,31 @@ type streamingKeyIterator struct {
 }
 
 func (s *streamingKeyIterator) Next() bool {
-	if !s.mergeIter.Next() {
-		if s.mergeIter.Err() != nil {
-			s.err = s.mergeIter.Err()
+	for {
+		if !s.mergeIter.Next() {
+			if s.mergeIter.Err() != nil {
+				s.err = s.mergeIter.Err()
+			}
+			return false
 		}
-		return false
-	}
 
-	key, minTime, maxTime, data, err := s.mergeIter.Read()
-	if err != nil {
-		s.err = err
-		return false
-	}
+		key, minTime, maxTime, data, err := s.mergeIter.Read()
+		if err != nil {
+			s.err = err
+			return false
+		}
 
-	s.key = key
-	s.minTime = minTime
-	s.maxTime = maxTime
-	s.data = data
-	return true
+		// Skip blocks where all values were skipped due to type mismatch
+		if data == nil {
+			continue
+		}
+
+		s.key = key
+		s.minTime = minTime
+		s.maxTime = maxTime
+		s.data = data
+		return true
+	}
 }
 
 func (s *streamingKeyIterator) Read() (key []byte, minTime int64, maxTime int64, data []byte, err error) {

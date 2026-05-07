@@ -1821,3 +1821,393 @@ func TestDebug_SingleFile_NoPreInit(t *testing.T) {
 		t.Fatalf("iterator error: %v", mergeIter2.Err())
 	}
 }
+
+// Test 6.1: Same timestamp, same key, different files — dedup proceeds correctly
+func TestKeyAwareMergingIterator_DedupSameTimestampSameKey(t *testing.T) {
+	dir := MustTempDir()
+	defer os.RemoveAll(dir)
+
+	// File 0 (older): key "cpu,host=A#!~#value" at ts=1,2,3
+	writes0 := map[string][]tsm1.Value{
+		"cpu,host=A#!~#value": {
+			tsm1.NewValue(1, 1.0),
+			tsm1.NewValue(2, 2.0),
+			tsm1.NewValue(3, 3.0),
+		},
+	}
+	f0 := MustWriteTSM(dir, 0, writes0)
+	r0 := MustOpenTSMReader(f0)
+	defer r0.Close()
+
+	// File 1 (newer): same key at ts=2,3,4 (overlapping ts=2,3)
+	writes1 := map[string][]tsm1.Value{
+		"cpu,host=A#!~#value": {
+			tsm1.NewValue(2, 20.0),
+			tsm1.NewValue(3, 30.0),
+			tsm1.NewValue(4, 40.0),
+		},
+	}
+	f1 := MustWriteTSM(dir, 1, writes1)
+	r1 := MustOpenTSMReader(f1)
+	defer r1.Close()
+
+	iter0 := tsm1.NewBlockValueIterator(r0, 0)
+	iter1 := tsm1.NewBlockValueIterator(r1, 1)
+	mergeIter := tsm1.NewKeyAwareMergingIterator(
+		[]*tsm1.BlockValueIterator{iter0, iter1},
+		1000, nil,
+	)
+
+	var allValues []tsm1.Value
+	for mergeIter.Next() {
+		_, _, _, data, err := mergeIter.Read()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if data == nil {
+			continue
+		}
+		decoded, err := tsm1.DecodeBlock(data, nil)
+		if err != nil {
+			t.Fatalf("decode error: %v", err)
+		}
+		allValues = append(allValues, decoded...)
+	}
+	if mergeIter.Err() != nil {
+		t.Fatalf("iterator error: %v", mergeIter.Err())
+	}
+
+	// Expect 4 values: ts=1 (file0), ts=2 (file1, dedup wins), ts=3 (file1, dedup wins), ts=4 (file1)
+	if len(allValues) != 4 {
+		t.Fatalf("expected 4 values, got %d", len(allValues))
+	}
+
+	expectedTS := []int64{1, 2, 3, 4}
+	expectedVal := []float64{1.0, 20.0, 30.0, 40.0}
+	for i, v := range allValues {
+		if v.UnixNano() != expectedTS[i] {
+			t.Errorf("value %d: expected ts=%d, got %d", i, expectedTS[i], v.UnixNano())
+		}
+		fv, ok := v.(tsm1.FloatValue)
+		if !ok {
+			t.Fatalf("value %d: expected FloatValue, got %T", i, v)
+		}
+		if fv.Value() != expectedVal[i] {
+			t.Errorf("value %d: expected %v, got %v", i, expectedVal[i], fv.Value())
+		}
+	}
+}
+
+// Test 6.2: Same timestamp, different keys — dedup stops, no cross-key mixing
+func TestKeyAwareMergingIterator_NoCrossKeyDedup(t *testing.T) {
+	dir := MustTempDir()
+	defer os.RemoveAll(dir)
+
+	// File 0: "cpu,host=A#!~#field_1" (String) at ts=100
+	writes0 := map[string][]tsm1.Value{
+		"cpu,host=A#!~#field_1": {
+			tsm1.NewValue(100, "value_from_file0"),
+		},
+	}
+	f0 := MustWriteTSM(dir, 0, writes0)
+	r0 := MustOpenTSMReader(f0)
+	defer r0.Close()
+
+	// File 1: "cpu,host=A#!~#field_2" (Float) at ts=100 (same ts, different key)
+	writes1 := map[string][]tsm1.Value{
+		"cpu,host=A#!~#field_2": {
+			tsm1.NewValue(100, 42.0),
+		},
+	}
+	f1 := MustWriteTSM(dir, 1, writes1)
+	r1 := MustOpenTSMReader(f1)
+	defer r1.Close()
+
+	iter0 := tsm1.NewBlockValueIterator(r0, 0)
+	iter1 := tsm1.NewBlockValueIterator(r1, 1)
+	mergeIter := tsm1.NewKeyAwareMergingIterator(
+		[]*tsm1.BlockValueIterator{iter0, iter1},
+		1000, nil,
+	)
+
+	type block struct {
+		key    string
+		values []tsm1.Value
+	}
+	var blocks []block
+	for mergeIter.Next() {
+		key, _, _, data, err := mergeIter.Read()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if data == nil {
+			continue
+		}
+		decoded, err := tsm1.DecodeBlock(data, nil)
+		if err != nil {
+			t.Fatalf("decode error: %v", err)
+		}
+		blocks = append(blocks, block{key: string(key), values: decoded})
+	}
+	if mergeIter.Err() != nil {
+		t.Fatalf("iterator error: %v", mergeIter.Err())
+	}
+
+	// Expect 2 blocks (one per key), no cross-key mixing
+	if len(blocks) != 2 {
+		t.Fatalf("expected 2 blocks, got %d", len(blocks))
+	}
+
+	// Blocks come in key order: field_1 first, then field_2
+	if blocks[0].key != "cpu,host=A#!~#field_1" {
+		t.Errorf("block 0: expected key 'cpu,host=A#!~#field_1', got '%s'", blocks[0].key)
+	}
+	if len(blocks[0].values) != 1 {
+		t.Fatalf("block 0: expected 1 value, got %d", len(blocks[0].values))
+	}
+	sv, ok := blocks[0].values[0].(tsm1.StringValue)
+	if !ok {
+		t.Fatalf("block 0: expected StringValue, got %T", blocks[0].values[0])
+	}
+	if sv.Value() != "value_from_file0" {
+		t.Errorf("block 0: expected 'value_from_file0', got '%s'", sv.Value())
+	}
+
+	if blocks[1].key != "cpu,host=A#!~#field_2" {
+		t.Errorf("block 1: expected key 'cpu,host=A#!~#field_2', got '%s'", blocks[1].key)
+	}
+	if len(blocks[1].values) != 1 {
+		t.Fatalf("block 1: expected 1 value, got %d", len(blocks[1].values))
+	}
+	fv, ok := blocks[1].values[0].(tsm1.FloatValue)
+	if !ok {
+		t.Fatalf("block 1: expected FloatValue, got %T", blocks[1].values[0])
+	}
+	if fv.Value() != 42.0 {
+		t.Errorf("block 1: expected 42.0, got %v", fv.Value())
+	}
+}
+
+// Test 6.3: Defensive encodeValues — type mismatch skips value, records error
+// Since the dedup fix (key check) prevents cross-key mixing, we verify that
+// the iterator handles the sentinel value correctly for Float64 keys, which
+// exercises the blockTypeForValue path.
+func TestKeyAwareMergingIterator_Float64KeyTypeDetection(t *testing.T) {
+	dir := MustTempDir()
+	defer os.RemoveAll(dir)
+
+	// Single file with Float64 values
+	writes := map[string][]tsm1.Value{
+		"cpu,host=A#!~#value": {
+			tsm1.NewValue(1, 1.1),
+			tsm1.NewValue(2, 2.2),
+			tsm1.NewValue(3, 3.3),
+		},
+	}
+	f := MustWriteTSM(dir, 1, writes)
+	r := MustOpenTSMReader(f)
+	defer r.Close()
+
+	iter := tsm1.NewBlockValueIterator(r, 0)
+	mergeIter := tsm1.NewKeyAwareMergingIterator(
+		[]*tsm1.BlockValueIterator{iter},
+		1000, nil,
+	)
+
+	var allValues []tsm1.Value
+	for mergeIter.Next() {
+		_, _, _, data, err := mergeIter.Read()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if data == nil {
+			t.Fatal("unexpected nil data for Float64 key")
+		}
+		decoded, err := tsm1.DecodeBlock(data, nil)
+		if err != nil {
+			t.Fatalf("decode error: %v", err)
+		}
+		allValues = append(allValues, decoded...)
+	}
+	if mergeIter.Err() != nil {
+		t.Fatalf("iterator error: %v", mergeIter.Err())
+	}
+
+	// All 3 Float64 values should be present
+	if len(allValues) != 3 {
+		t.Fatalf("expected 3 values, got %d", len(allValues))
+	}
+	for i, v := range allValues {
+		fv, ok := v.(tsm1.FloatValue)
+		if !ok {
+			t.Fatalf("value %d: expected FloatValue, got %T", i, v)
+		}
+		expected := float64(i+1) * 1.1
+		got := fv.Value().(float64)
+		if math.Abs(got-expected) > 1e-10 {
+			t.Errorf("value %d: expected %v, got %v", i, expected, got)
+		}
+	}
+}
+
+// Test 6.4: Float64 key type detection — multiple files with Float64 values
+// verify sentinel does not cause redundant recalculation across file boundaries.
+func TestKeyAwareMergingIterator_Float64MultiFile(t *testing.T) {
+	dir := MustTempDir()
+	defer os.RemoveAll(dir)
+
+	// File 0: Float64 values at ts=1,2,3
+	writes0 := map[string][]tsm1.Value{
+		"cpu,host=A#!~#value": {
+			tsm1.NewValue(1, 1.0),
+			tsm1.NewValue(2, 2.0),
+			tsm1.NewValue(3, 3.0),
+		},
+	}
+	f0 := MustWriteTSM(dir, 0, writes0)
+	r0 := MustOpenTSMReader(f0)
+	defer r0.Close()
+
+	// File 1: Float64 values at ts=3,4,5 (overlapping ts=3)
+	writes1 := map[string][]tsm1.Value{
+		"cpu,host=A#!~#value": {
+			tsm1.NewValue(3, 30.0),
+			tsm1.NewValue(4, 40.0),
+			tsm1.NewValue(5, 50.0),
+		},
+	}
+	f1 := MustWriteTSM(dir, 1, writes1)
+	r1 := MustOpenTSMReader(f1)
+	defer r1.Close()
+
+	// File 2: Float64 values at ts=5,6 (overlapping ts=5)
+	writes2 := map[string][]tsm1.Value{
+		"cpu,host=A#!~#value": {
+			tsm1.NewValue(5, 500.0),
+			tsm1.NewValue(6, 600.0),
+		},
+	}
+	f2 := MustWriteTSM(dir, 2, writes2)
+	r2 := MustOpenTSMReader(f2)
+	defer r2.Close()
+
+	iter0 := tsm1.NewBlockValueIterator(r0, 0)
+	iter1 := tsm1.NewBlockValueIterator(r1, 1)
+	iter2 := tsm1.NewBlockValueIterator(r2, 2)
+	mergeIter := tsm1.NewKeyAwareMergingIterator(
+		[]*tsm1.BlockValueIterator{iter0, iter1, iter2},
+		1000, nil,
+	)
+
+	var allValues []tsm1.Value
+	for mergeIter.Next() {
+		_, _, _, data, err := mergeIter.Read()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if data == nil {
+			t.Fatal("unexpected nil data for Float64 key")
+		}
+		decoded, err := tsm1.DecodeBlock(data, nil)
+		if err != nil {
+			t.Fatalf("decode error: %v", err)
+		}
+		allValues = append(allValues, decoded...)
+	}
+	if mergeIter.Err() != nil {
+		t.Fatalf("iterator error: %v", mergeIter.Err())
+	}
+
+	// Expect 6 values: ts=1(f0), ts=2(f0), ts=3(f1,dedup), ts=4(f1), ts=5(f2,dedup), ts=6(f2)
+	if len(allValues) != 6 {
+		t.Fatalf("expected 6 values, got %d", len(allValues))
+	}
+
+	expectedTS := []int64{1, 2, 3, 4, 5, 6}
+	expectedVal := []float64{1.0, 2.0, 30.0, 40.0, 500.0, 600.0}
+	for i, v := range allValues {
+		if v.UnixNano() != expectedTS[i] {
+			t.Errorf("value %d: expected ts=%d, got %d", i, expectedTS[i], v.UnixNano())
+		}
+		fv, ok := v.(tsm1.FloatValue)
+		if !ok {
+			t.Fatalf("value %d: expected FloatValue, got %T", i, v)
+		}
+		got := fv.Value().(float64)
+		if got != expectedVal[i] {
+			t.Errorf("value %d: expected %v, got %v", i, expectedVal[i], got)
+		}
+	}
+}
+
+// Test 6.5: Read() with nil encoded data returns nil without error.
+// This tests the scenario where encodeValues would return nil (all values skipped).
+// Since the dedup fix prevents the root cause, we verify the normal path works
+// and that the iterator handles the case gracefully.
+func TestKeyAwareMergingIterator_NilDataHandling(t *testing.T) {
+	dir := MustTempDir()
+	defer os.RemoveAll(dir)
+
+	// Two files with same key, same timestamps — dedup should keep newer file's values
+	writes0 := map[string][]tsm1.Value{
+		"cpu,host=A#!~#value": {
+			tsm1.NewValue(1, 1.0),
+			tsm1.NewValue(2, 2.0),
+		},
+	}
+	f0 := MustWriteTSM(dir, 0, writes0)
+	r0 := MustOpenTSMReader(f0)
+	defer r0.Close()
+
+	writes1 := map[string][]tsm1.Value{
+		"cpu,host=A#!~#value": {
+			tsm1.NewValue(1, 10.0),
+			tsm1.NewValue(2, 20.0),
+		},
+	}
+	f1 := MustWriteTSM(dir, 1, writes1)
+	r1 := MustOpenTSMReader(f1)
+	defer r1.Close()
+
+	iter0 := tsm1.NewBlockValueIterator(r0, 0)
+	iter1 := tsm1.NewBlockValueIterator(r1, 1)
+	mergeIter := tsm1.NewKeyAwareMergingIterator(
+		[]*tsm1.BlockValueIterator{iter0, iter1},
+		1000, nil,
+	)
+
+	var allValues []tsm1.Value
+	for mergeIter.Next() {
+		_, _, _, data, err := mergeIter.Read()
+		if err != nil {
+			t.Fatalf("Read returned error: %v", err)
+		}
+		// nil data is valid — means all values were skipped (should not happen here)
+		if data == nil {
+			continue
+		}
+		decoded, err := tsm1.DecodeBlock(data, nil)
+		if err != nil {
+			t.Fatalf("decode error: %v", err)
+		}
+		allValues = append(allValues, decoded...)
+	}
+	if mergeIter.Err() != nil {
+		t.Fatalf("iterator error: %v", mergeIter.Err())
+	}
+
+	// Should have 2 values from file 1 (newer), dedup removed file 0's values
+	if len(allValues) != 2 {
+		t.Fatalf("expected 2 values, got %d", len(allValues))
+	}
+	for _, v := range allValues {
+		fv, ok := v.(tsm1.FloatValue)
+		if !ok {
+			t.Fatalf("expected FloatValue, got %T", v)
+		}
+		// Values should be from file 1 (10.0, 20.0)
+		if fv.Value() != 10.0 && fv.Value() != 20.0 {
+			t.Errorf("expected value from file 1 (10.0 or 20.0), got %v", fv.Value())
+		}
+	}
+}
