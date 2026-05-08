@@ -418,6 +418,13 @@ func (m *KeyAwareMergingIterator) Next() bool {
 
 		entry := m.popAndDedup()
 		if entry != nil {
+			// Defense-in-depth: popAndDedup already filters by currentKey,
+			// but double-check to prevent any stale entry from contaminating
+			// the buffer (which would cause type mismatch errors).
+			if !bytes.Equal(entry.key, currentKeyForBlock) {
+				heap.Push(&m.heap, entry)
+				break
+			}
 			// Set currentType for first value
 			if m.currentType == blockTypeUnset {
 				m.currentType = blockTypeForValue(entry.value)
@@ -657,49 +664,57 @@ func (m *KeyAwareMergingIterator) activateIteratorForBlock(iter *BlockValueItera
 	}
 }
 
-// popAndDedup pops the top entry and consumes all same-timestamp entries
-// for the SAME key, keeping the value from the highest fileIdx.
+// popAndDedup pops the top entry for the current key and consumes all
+// same-timestamp entries for the same key, keeping the value from the
+// highest fileIdx. Stale entries from different keys are discarded.
 // The winner's iterator is advanced after dedup completes to prevent
 // cross-key value mixing in the heap during the dedup loop.
 func (m *KeyAwareMergingIterator) popAndDedup() *valueEntry {
-	if m.heap.Len() == 0 {
-		return nil
-	}
-
-	top := heap.Pop(&m.heap).(*valueEntry)
-
-	// Collect losers for deferred advancement
-	var losers []*valueEntry
-
-	// Consume all same-timestamp entries for the same key
 	for m.heap.Len() > 0 {
-		next := m.heap.Peek()
-		if next.timestamp != top.timestamp {
-			break
-		}
-		if !bytes.Equal(next.key, top.key) {
-			break
-		}
-		popped := heap.Pop(&m.heap).(*valueEntry)
+		top := heap.Pop(&m.heap).(*valueEntry)
 
-		// Newer file wins (higher fileIdx)
-		if popped.fileIdx > top.fileIdx {
-			losers = append(losers, top)
-			top = popped
-		} else {
-			losers = append(losers, popped)
+		// Discard stale entries from previous keys. Their iterators are not
+		// advanced here — moveToNextKey will reactivate them when their key
+		// becomes current.
+		if !bytes.Equal(top.key, m.currentKey) {
+			continue
 		}
+
+		// Collect losers for deferred advancement
+		var losers []*valueEntry
+
+		// Consume all same-timestamp entries for the same key
+		for m.heap.Len() > 0 {
+			next := m.heap.Peek()
+			if next.timestamp != top.timestamp {
+				break
+			}
+			if !bytes.Equal(next.key, top.key) {
+				break
+			}
+			popped := heap.Pop(&m.heap).(*valueEntry)
+
+			// Newer file wins (higher fileIdx)
+			if popped.fileIdx > top.fileIdx {
+				losers = append(losers, top)
+				top = popped
+			} else {
+				losers = append(losers, popped)
+			}
+		}
+
+		// Advance losers' iterators and push their next values if still on the same key
+		for _, loser := range losers {
+			m.advanceAndPush(loser.iterator)
+		}
+
+		// Advance winner's iterator last
+		m.advanceAndPush(top.iterator)
+
+		return top
 	}
 
-	// Advance losers' iterators and push their next values if still on the same key
-	for _, loser := range losers {
-		m.advanceAndPush(loser.iterator)
-	}
-
-	// Advance winner's iterator last
-	m.advanceAndPush(top.iterator)
-
-	return top
+	return nil
 }
 
 // advanceAndPush advances the iterator and pushes the next valid value to the heap.

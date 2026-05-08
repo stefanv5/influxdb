@@ -2211,3 +2211,119 @@ func TestKeyAwareMergingIterator_NilDataHandling(t *testing.T) {
 		}
 	}
 }
+
+// TestKeyAwareMergingIterator_StaleHeapEntryIsolation verifies that stale
+// heap entries from a previous key do not contaminate the current key's buffer.
+// This is the root cause of "type mismatch" production errors: when file 1's
+// iterator advances to key "B" during dedup of key "A", it pushes a "B" entry
+// into the heap. Without a key check in the buffer-filling loop, this stale
+// entry gets mixed into key "A"'s output, causing type mismatches.
+func TestKeyAwareMergingIterator_StaleHeapEntryIsolation(t *testing.T) {
+	dir := MustTempDir()
+	defer os.RemoveAll(dir)
+
+	// File 0: key "A" at timestamps 10, 11
+	file0Vals := map[string][]tsm1.Value{
+		"A#!~#value": {
+			tsm1.NewValue(10, 1.0),
+			tsm1.NewValue(11, 2.0),
+		},
+	}
+	f0 := MustWriteTSM(dir, 1, file0Vals)
+	r0 := MustOpenTSMReader(f0)
+	defer r0.Close()
+
+	// File 1: key "A" at timestamp 10, key "B" at timestamp 5
+	// When processing key "A", file 1 wins dedup (newer file), then advances
+	// to key "B" and pushes a stale "B" entry (ts=5) into the heap.
+	file1Vals := map[string][]tsm1.Value{
+		"A#!~#value": {tsm1.NewValue(10, 10.0)},
+		"B#!~#value": {tsm1.NewValue(5, 100.0)},
+	}
+	f1 := MustWriteTSM(dir, 2, file1Vals)
+	r1 := MustOpenTSMReader(f1)
+	defer r1.Close()
+
+	iter0 := tsm1.NewBlockValueIterator(r0, 0)
+	iter1 := tsm1.NewBlockValueIterator(r1, 1)
+
+	mergeIter := tsm1.NewKeyAwareMergingIterator(
+		[]*tsm1.BlockValueIterator{iter0, iter1},
+		1000, nil,
+	)
+
+	// First block: key "A" — should contain ONLY "A" values
+	if !mergeIter.Next() {
+		t.Fatal("expected first Next() to return true")
+	}
+	key, _, _, data, err := mergeIter.Read()
+	if err != nil {
+		t.Fatalf("first Read error: %v", err)
+	}
+	if string(key) != "A#!~#value" {
+		t.Fatalf("expected key 'A#!~#value', got '%s'", string(key))
+	}
+
+	block1Values, err := tsm1.DecodeBlock(data, nil)
+	if err != nil {
+		t.Fatalf("decode block 1 error: %v", err)
+	}
+	if len(block1Values) != 2 {
+		t.Fatalf("expected 2 values for key A, got %d", len(block1Values))
+	}
+	for _, v := range block1Values {
+		if v.UnixNano() != 10 && v.UnixNano() != 11 {
+			t.Errorf("unexpected timestamp for key A: %d", v.UnixNano())
+		}
+		if _, ok := v.(tsm1.FloatValue); !ok {
+			t.Errorf("expected FloatValue for key A, got %T", v)
+		}
+	}
+	// Verify dedup: timestamp 10 should use file 1's value (10.0, not 1.0)
+	for _, v := range block1Values {
+		if v.UnixNano() == 10 {
+			fv := v.(tsm1.FloatValue)
+			if fv.Value() != 10.0 {
+				t.Errorf("expected dedup value 10.0 at ts=10, got %v", fv.Value())
+			}
+		}
+	}
+
+	// Second block: key "B" — stale entry must have been deferred, not mixed into "A"
+	if !mergeIter.Next() {
+		t.Fatal("expected second Next() to return true")
+	}
+	key, _, _, data, err = mergeIter.Read()
+	if err != nil {
+		t.Fatalf("second Read error: %v", err)
+	}
+	if string(key) != "B#!~#value" {
+		t.Fatalf("expected key 'B#!~#value', got '%s'", string(key))
+	}
+
+	block2Values, err := tsm1.DecodeBlock(data, nil)
+	if err != nil {
+		t.Fatalf("decode block 2 error: %v", err)
+	}
+	if len(block2Values) != 1 {
+		t.Fatalf("expected 1 value for key B, got %d", len(block2Values))
+	}
+	if block2Values[0].UnixNano() != 5 {
+		t.Errorf("expected timestamp 5 for key B, got %d", block2Values[0].UnixNano())
+	}
+	bv, ok := block2Values[0].(tsm1.FloatValue)
+	if !ok {
+		t.Fatalf("expected FloatValue for key B, got %T", block2Values[0])
+	}
+	if bv.Value() != 100.0 {
+		t.Errorf("expected value 100.0 for key B, got %v", bv.Value())
+	}
+
+	// No more blocks
+	if mergeIter.Next() {
+		t.Error("expected no more blocks")
+	}
+	if mergeIter.Err() != nil {
+		t.Fatalf("unexpected error: %v", mergeIter.Err())
+	}
+}
