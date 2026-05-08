@@ -340,10 +340,6 @@ type KeyAwareMergingIterator struct {
 
 	// For tracking estimated index size
 	estimatedIndexSize int
-
-	// Debug logging
-	debug  bool
-	callID int // increments on each Next() call
 }
 
 // NewKeyAwareMergingIterator creates a new merging iterator from the given
@@ -382,9 +378,6 @@ func (m *KeyAwareMergingIterator) Next() bool {
 		}
 	}
 
-	m.callID++
-	callID := m.callID
-
 	// Clear output buffer
 	m.buf = m.buf[:0]
 
@@ -394,8 +387,6 @@ func (m *KeyAwareMergingIterator) Next() bool {
 
 	// Track the key for this output block
 	currentKeyForBlock := m.currentKey
-
-	m.dlog("call %d: START currentKey=%s currentType=%d heapSize=%d", callID, m.currentKey, m.currentType, m.heap.Len())
 
 	// Fill output buffer from heap
 	for len(m.buf) < m.bufSize && iterations < maxIterations {
@@ -411,37 +402,29 @@ func (m *KeyAwareMergingIterator) Next() bool {
 			// Current key exhausted, find next key
 			if len(m.buf) > 0 {
 				// We have values from previous key, return them
-				m.dlog("call %d: heap empty, buf has %d values, breaking", callID, len(m.buf))
 				break
 			}
-			m.dlog("call %d: heap empty, buf empty, calling moveToNextKey", callID)
 			if !m.moveToNextKey() {
 				m.exhausted = true
-				m.dlog("call %d: moveToNextKey returned false, exhausted", callID)
 				break
 			}
 			// Update currentKeyForBlock to the new key
 			currentKeyForBlock = m.currentKey
-			m.dlog("call %d: moveToNextKey -> newKey=%s newType=%d heapSize=%d heap=%s", callID, m.currentKey, m.currentType, m.heap.Len(), m.heapDump())
 			// Check if we got any values in the heap
 			if m.heap.Len() == 0 {
 				// No values for the new key, continue to find next key
-				m.dlog("call %d: no values for new key, continuing", callID)
 				continue
 			}
 		}
 
 		entry := m.popAndDedup()
 		if entry != nil {
-			keyMatch := bytes.Equal(entry.key, currentKeyForBlock)
-			m.dlog("call %d: popAndDedup -> key=%s valType=%T ts=%d fIdx=%d keyMatch=%v currentTypeBefore=%d", callID, entry.key, entry.value, entry.value.UnixNano(), entry.fileIdx, keyMatch, m.currentType)
 			// Defense-in-depth: popAndDedup already filters by currentKey,
 			// but double-check to prevent any stale entry from contaminating
 			// the buffer (which would cause type mismatch errors).
-			if !keyMatch {
+			if !bytes.Equal(entry.key, currentKeyForBlock) {
 				// Advance the stale iterator without pushing — moveToNextKey
 				// will re-activate it when its key becomes current.
-				m.dlog("call %d: STALE entry key=%s (expected %s), advancing iterator", callID, entry.key, currentKeyForBlock)
 				m.advanceOnly(entry.iterator)
 				continue
 			}
@@ -449,14 +432,13 @@ func (m *KeyAwareMergingIterator) Next() bool {
 			// so stale entries cannot corrupt the encoding type.
 			if m.currentType == blockTypeUnset {
 				m.currentType = blockTypeForValue(entry.value)
-				m.dlog("call %d: set currentType=%d from first entry", callID, m.currentType)
 			}
 			// Verify type consistency before appending to buffer.
 			entryType := blockTypeForValue(entry.value)
 			if entryType != m.currentType {
-				m.dlog("call %d: *** TYPE MISMATCH DETECTED *** currentType=%d(%s) entryType=%d(%s) key=%s valType=%T ts=%d fIdx=%d bufLen=%d",
-					callID, m.currentType, blockTypeName(m.currentType), entryType, blockTypeName(entryType),
-					entry.key, entry.value, entry.value.UnixNano(), entry.fileIdx, len(m.buf))
+				log.Printf("[stream-iter] TYPE MISMATCH in Next(): key=%s currentType=%s entryType=%s valueType=%T ts=%d fIdx=%d bufLen=%d heap=%s",
+					currentKeyForBlock, blockTypeName(m.currentType), blockTypeName(entryType),
+					entry.value, entry.value.UnixNano(), entry.fileIdx, len(m.buf), m.heapDump())
 				m.err = fmt.Errorf("type mismatch at buffer insertion: currentType=%s, valueType=%T for key %s (ts=%d, fIdx=%d, bufLen=%d)",
 					blockTypeName(m.currentType), entry.value, entry.key, entry.value.UnixNano(), entry.fileIdx, len(m.buf))
 				return len(m.buf) > 0
@@ -464,8 +446,6 @@ func (m *KeyAwareMergingIterator) Next() bool {
 			m.buf = append(m.buf, entry.value)
 		}
 	}
-
-	m.dlog("call %d: END bufLen=%d currentType=%d currentKey=%s", callID, len(m.buf), m.currentType, currentKeyForBlock)
 
 	// Save the block key for Read()
 	if len(m.buf) > 0 {
@@ -475,13 +455,6 @@ func (m *KeyAwareMergingIterator) Next() bool {
 	}
 
 	return len(m.buf) > 0
-}
-
-// dlog prints a debug log line if debug mode is enabled.
-func (m *KeyAwareMergingIterator) dlog(format string, args ...interface{}) {
-	if m.debug {
-		log.Printf("[stream-iter] "+format, args...)
-	}
 }
 
 // heapDump returns a string representation of the heap for debugging.
@@ -536,14 +509,6 @@ func (m *KeyAwareMergingIterator) Read() (key []byte, minTime int64, maxTime int
 	minTime = m.buf[0].UnixNano()
 	maxTime = m.buf[len(m.buf)-1].UnixNano()
 
-	if m.debug {
-		typeSet := make(map[string]bool)
-		for _, v := range m.buf {
-			typeSet[fmt.Sprintf("%T", v)] = true
-		}
-		m.dlog("Read: key=%s currentType=%d bufLen=%d types=%v", m.blockKey, m.currentType, len(m.buf), typeSet)
-	}
-
 	data, err = m.encodeValues(m.currentType, m.buf)
 	if err != nil {
 		// Log full diagnostic on type mismatch
@@ -589,11 +554,6 @@ func (m *KeyAwareMergingIterator) Err() error {
 // EstimatedIndexSize returns the estimated index size.
 func (m *KeyAwareMergingIterator) EstimatedIndexSize() int {
 	return m.estimatedIndexSize
-}
-
-// SetDebug enables or disables debug logging for this iterator.
-func (m *KeyAwareMergingIterator) SetDebug(debug bool) {
-	m.debug = debug
 }
 
 // initIterators initializes all iterators and finds the first key.
@@ -714,7 +674,6 @@ func (m *KeyAwareMergingIterator) activateIteratorForBlock(iter *BlockValueItera
 				fileIdx:   iter.FileIdx(),
 			}
 			heap.Push(&m.heap, entry)
-			m.dlog("activateIteratorForBlock: pushed key=%s valType=%T ts=%d fIdx=%d", entry.key, entry.value, entry.timestamp, entry.fileIdx)
 			return
 		}
 
@@ -756,11 +715,9 @@ func (m *KeyAwareMergingIterator) popAndDedup() *valueEntry {
 		// iterators so the consumed value is not re-pushed when
 		// moveToNextKey re-activates the iterator.
 		if !bytes.Equal(top.key, m.currentKey) {
-			m.dlog("popAndDedup: STALE key=%s (current=%s) valType=%T ts=%d fIdx=%d, advancing", top.key, m.currentKey, top.value, top.timestamp, top.fileIdx)
 			m.advanceOnly(top.iterator)
 			continue
 		}
-		m.dlog("popAndDedup: top key=%s valType=%T ts=%d fIdx=%d", top.key, top.value, top.timestamp, top.fileIdx)
 
 		// Collect losers for deferred advancement
 		var losers []*valueEntry
@@ -812,7 +769,6 @@ func (m *KeyAwareMergingIterator) advanceAndPush(iter *BlockValueIterator) {
 			timestamp: v.UnixNano(),
 			fileIdx:   iter.FileIdx(),
 		}
-		m.dlog("advanceAndPush: pushed key=%s valType=%T ts=%d fIdx=%d", entry.key, entry.value, entry.timestamp, entry.fileIdx)
 		heap.Push(&m.heap, entry)
 		return
 	}
@@ -830,14 +786,12 @@ func (m *KeyAwareMergingIterator) advanceAndPush(iter *BlockValueIterator) {
 				timestamp: v.UnixNano(),
 				fileIdx:   iter.FileIdx(),
 			}
-			m.dlog("advanceAndPush: pushed (new block) key=%s valType=%T ts=%d fIdx=%d", entry.key, entry.value, entry.timestamp, entry.fileIdx)
 			heap.Push(&m.heap, entry)
 			return
 		}
 		// Fall through - block exhausted or all tombstoned
 	}
 	// Either key changed (hasNextBlock now set) or iterator exhausted
-	m.dlog("advanceAndPush: exhausted fIdx=%d hasNextBlock=%v nextKey=%s", iter.FileIdx(), iter.hasNextBlock, iter.nextKey)
 	iter.exhausted = true
 }
 
@@ -846,18 +800,13 @@ func (m *KeyAwareMergingIterator) advanceAndPush(iter *BlockValueIterator) {
 // so the consumed value is not re-pushed when the iterator is re-activated.
 func (m *KeyAwareMergingIterator) advanceOnly(iter *BlockValueIterator) {
 	if iter.Next() {
-		m.dlog("advanceOnly: advanced fIdx=%d key=%s", iter.FileIdx(), iter.currentKey)
 		return
 	}
 	// Current block exhausted — pre-fetch next block
 	if iter.NextBlock() {
-		// Same key, new block — nothing more to do; the iterator
-		// is now positioned at the start of the next block.
-		m.dlog("advanceOnly: new block fIdx=%d key=%s", iter.FileIdx(), iter.currentKey)
 		return
 	}
 	// Key changed (hasNextBlock now set) or iterator exhausted
-	m.dlog("advanceOnly: exhausted fIdx=%d hasNextBlock=%v nextKey=%s", iter.FileIdx(), iter.hasNextBlock, iter.nextKey)
 	iter.exhausted = true
 }
 
@@ -885,16 +834,13 @@ func (m *KeyAwareMergingIterator) moveToNextKey() bool {
 	// Now find minimum key among all iterators
 	minKey := m.findMinKey()
 	if minKey == nil {
-		m.dlog("moveToNextKey: no minKey found, returning false")
 		return false
 	}
 
 	// Set currentKey and activate iterators for minKey
 	m.currentKey = minKey
 	m.currentType = blockTypeUnset
-	m.dlog("moveToNextKey: newKey=%s, calling activateIteratorsForKey", minKey)
 	m.activateIteratorsForKey(minKey)
-	m.dlog("moveToNextKey: done, heapSize=%d heap=%s", m.heap.Len(), m.heapDump())
 	return true
 }
 

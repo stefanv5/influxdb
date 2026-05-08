@@ -2482,7 +2482,6 @@ func TestKeyAwareMergingIterator_DebugTypeMismatch(t *testing.T) {
 		[]*tsm1.BlockValueIterator{iter0, iter1, iter2},
 		1000, nil,
 	)
-	mergeIter.SetDebug(true)
 
 	blockCount := 0
 	for mergeIter.Next() {
