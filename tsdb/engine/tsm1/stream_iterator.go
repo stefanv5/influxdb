@@ -100,7 +100,7 @@ func (it *BlockValueIterator) Init() bool {
 		return false
 	}
 
-	it.currentKey = key
+	it.currentKey = append([]byte(nil), key...)
 	it.currentType = typ
 	it.tombstones = it.r.TombstoneRange(key)
 
@@ -157,7 +157,7 @@ func (it *BlockValueIterator) NextBlock() bool {
 
 	// Key changed - cache the new block info
 	if !bytes.Equal(key, it.currentKey) {
-		it.nextKey = key
+		it.nextKey = append([]byte(nil), key...)
 		it.nextType = typ
 		it.nextRaw = buf
 		it.nextMin = minTime
