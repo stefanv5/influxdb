@@ -1,6 +1,7 @@
 package tsm1_test
 
 import (
+	"fmt"
 	"math"
 	"os"
 	"testing"
@@ -2435,4 +2436,78 @@ func TestKeyAwareMergingIterator_StaleEntryDifferentTypes(t *testing.T) {
 	if mergeIter.Err() != nil {
 		t.Fatalf("unexpected error: %v", mergeIter.Err())
 	}
+}
+
+// TestKeyAwareMergingIterator_DebugTypeMismatch exercises a multi-file,
+// multi-key scenario with different types (Float/String/Integer) to
+// diagnose the persistent "type mismatch" production error. Debug
+// logging is enabled; run with -v to see the output.
+func TestKeyAwareMergingIterator_DebugTypeMismatch(t *testing.T) {
+	dir := MustTempDir()
+	defer os.RemoveAll(dir)
+
+	// File 0: "cpu"=Float, "host"=String, "count"=Integer
+	file0Vals := map[string][]tsm1.Value{
+		"cpu#!~#value":   {tsm1.NewValue(10, 1.0), tsm1.NewValue(20, 2.0)},
+		"host#!~#value":  {tsm1.NewValue(10, "server0")},
+		"count#!~#value": {tsm1.NewValue(10, int64(100))},
+	}
+	f0 := MustWriteTSM(dir, 1, file0Vals)
+	r0 := MustOpenTSMReader(f0)
+	defer r0.Close()
+
+	// File 1: "cpu"=Float, "host"=String, "count"=Integer (overlapping ts)
+	file1Vals := map[string][]tsm1.Value{
+		"cpu#!~#value":   {tsm1.NewValue(10, 10.0), tsm1.NewValue(30, 3.0)},
+		"host#!~#value":  {tsm1.NewValue(20, "server1")},
+		"count#!~#value": {tsm1.NewValue(10, int64(200)), tsm1.NewValue(30, int64(300))},
+	}
+	f1 := MustWriteTSM(dir, 2, file1Vals)
+	r1 := MustOpenTSMReader(f1)
+	defer r1.Close()
+
+	// File 2: "cpu"=Float only
+	file2Vals := map[string][]tsm1.Value{
+		"cpu#!~#value": {tsm1.NewValue(10, 100.0)},
+	}
+	f2 := MustWriteTSM(dir, 3, file2Vals)
+	r2 := MustOpenTSMReader(f2)
+	defer r2.Close()
+
+	iter0 := tsm1.NewBlockValueIterator(r0, 0)
+	iter1 := tsm1.NewBlockValueIterator(r1, 1)
+	iter2 := tsm1.NewBlockValueIterator(r2, 2)
+
+	mergeIter := tsm1.NewKeyAwareMergingIterator(
+		[]*tsm1.BlockValueIterator{iter0, iter1, iter2},
+		1000, nil,
+	)
+	mergeIter.SetDebug(true)
+
+	blockCount := 0
+	for mergeIter.Next() {
+		blockCount++
+		key, _, _, data, err := mergeIter.Read()
+		if err != nil {
+			t.Fatalf("block %d Read error: %v", blockCount, err)
+		}
+		vals, err := tsm1.DecodeBlock(data, nil)
+		if err != nil {
+			t.Fatalf("block %d decode error: %v", blockCount, err)
+		}
+		types := make(map[string]bool)
+		for _, v := range vals {
+			types[fmt.Sprintf("%T", v)] = true
+		}
+		t.Logf("block %d: key=%s count=%d types=%v", blockCount, string(key), len(vals), types)
+
+		// Verify all values in this block have the same type
+		if len(types) > 1 {
+			t.Errorf("block %d: MIXED TYPES in single block: %v", blockCount, types)
+		}
+	}
+	if mergeIter.Err() != nil {
+		t.Fatalf("iterator error: %v", mergeIter.Err())
+	}
+	t.Logf("total blocks: %d", blockCount)
 }
