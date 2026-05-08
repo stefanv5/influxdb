@@ -278,7 +278,7 @@ func (d *directIndex) Add(key []byte, blockType byte, minTime, maxTime int64, of
 		// size of the count of entries stored in the index
 		d.size += indexCountSize
 
-		d.key = key
+		d.key = append(d.key[:0], key...)
 		if d.indexEntries == nil {
 			d.indexEntries = &indexEntries{}
 		}
@@ -320,7 +320,7 @@ func (d *directIndex) Add(key []byte, blockType byte, minTime, maxTime int64, of
 		// size of the count of entries stored in the index
 		d.size += indexCountSize
 
-		d.key = key
+		d.key = append(d.key[:0], key...)
 		d.indexEntries.Type = blockType
 		d.indexEntries.entries = append(d.indexEntries.entries, IndexEntry{
 			MinTime: minTime,

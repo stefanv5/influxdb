@@ -105,7 +105,7 @@ func (it *BlockValueIterator) Init() bool {
 	it.currentType = typ
 	it.tombstones = it.r.TombstoneRange(key)
 
-	decoded, err := DecodeBlock(buf, nil)
+	decoded, err := DecodeBlock(buf, it.decoded[:0])
 	if err != nil {
 		it.err = fmt.Errorf("decode error: unable to decompress block type %s for key '%s': %v", blockTypeName(typ), key, err)
 		return false
@@ -169,7 +169,7 @@ func (it *BlockValueIterator) NextBlock() bool {
 
 	// Same key - decode and replace current block
 	it.tombstones = it.r.TombstoneRange(key)
-	decoded, err := DecodeBlock(buf, nil)
+	decoded, err := DecodeBlock(buf, it.decoded[:0])
 	if err != nil {
 		it.err = fmt.Errorf("decode error: unable to decompress block type %s for key '%s': %v", blockTypeName(typ), key, err)
 		return false
@@ -193,7 +193,7 @@ func (it *BlockValueIterator) ActivatePending() bool {
 	it.currentType = it.nextType
 	it.tombstones = it.r.TombstoneRange(it.currentKey)
 
-	decoded, err := DecodeBlock(it.nextRaw, nil)
+	decoded, err := DecodeBlock(it.nextRaw, it.decoded[:0])
 	if err != nil {
 		it.err = fmt.Errorf("decode error: unable to decompress block type %s for key '%s': %v", blockTypeName(it.nextType), it.nextKey, err)
 		return false
@@ -328,6 +328,16 @@ type KeyAwareMergingIterator struct {
 	// Output buffer
 	buf     []Value
 	bufSize int
+
+	// Reusable typed arrays for encodeValues (avoids allocation per block)
+	floatArr    *tsdb.FloatArray
+	integerArr  *tsdb.IntegerArray
+	unsignedArr *tsdb.UnsignedArray
+	booleanArr  *tsdb.BooleanArray
+	stringArr   *tsdb.StringArray
+
+	// Reusable key buffer for Read()
+	keyBuf []byte
 
 	// State
 	initialized bool
@@ -494,9 +504,13 @@ func (m *KeyAwareMergingIterator) Read() (key []byte, minTime int64, maxTime int
 
 	// Return the key that was set when this block was started
 	// (m.blockKey tracks the key for the current block being returned)
-	keyCopy := make([]byte, len(m.blockKey))
-	copy(keyCopy, m.blockKey)
-	key = keyCopy
+	if cap(m.keyBuf) < len(m.blockKey) {
+		m.keyBuf = make([]byte, len(m.blockKey))
+	} else {
+		m.keyBuf = m.keyBuf[:len(m.blockKey)]
+	}
+	copy(m.keyBuf, m.blockKey)
+	key = m.keyBuf
 
 	// Sort buffer by timestamp before encoding. The heap merge can produce
 	// unsorted output when an iterator advances across block boundaries
@@ -526,6 +540,13 @@ func (m *KeyAwareMergingIterator) Read() (key []byte, minTime int64, maxTime int
 	if data == nil {
 		return nil, 0, 0, nil, nil
 	}
+
+	// Nil-fy buffer elements to break references to StringValue and other
+	// reference-type values, allowing GC to reclaim the underlying data.
+	for i := range m.buf {
+		m.buf[i] = nil
+	}
+	m.buf = m.buf[:0]
 
 	return key, minTime, maxTime, data, nil
 }
@@ -850,7 +871,12 @@ func (m *KeyAwareMergingIterator) moveToNextKey() bool {
 func (m *KeyAwareMergingIterator) encodeValues(typ byte, values []Value) ([]byte, error) {
 	switch typ {
 	case BlockFloat64:
-		arr := tsdb.NewFloatArrayLen(0)
+		if m.floatArr == nil {
+			m.floatArr = &tsdb.FloatArray{}
+		}
+		arr := m.floatArr
+		arr.Timestamps = arr.Timestamps[:0]
+		arr.Values = arr.Values[:0]
 		for _, v := range values {
 			fv, ok := v.(FloatValue)
 			if !ok {
@@ -866,7 +892,12 @@ func (m *KeyAwareMergingIterator) encodeValues(typ byte, values []Value) ([]byte
 		return EncodeFloatArrayBlock(arr, nil)
 
 	case BlockInteger:
-		arr := tsdb.NewIntegerArrayLen(0)
+		if m.integerArr == nil {
+			m.integerArr = &tsdb.IntegerArray{}
+		}
+		arr := m.integerArr
+		arr.Timestamps = arr.Timestamps[:0]
+		arr.Values = arr.Values[:0]
 		for _, v := range values {
 			iv, ok := v.(IntegerValue)
 			if !ok {
@@ -882,7 +913,12 @@ func (m *KeyAwareMergingIterator) encodeValues(typ byte, values []Value) ([]byte
 		return EncodeIntegerArrayBlock(arr, nil)
 
 	case BlockUnsigned:
-		arr := tsdb.NewUnsignedArrayLen(0)
+		if m.unsignedArr == nil {
+			m.unsignedArr = &tsdb.UnsignedArray{}
+		}
+		arr := m.unsignedArr
+		arr.Timestamps = arr.Timestamps[:0]
+		arr.Values = arr.Values[:0]
 		for _, v := range values {
 			uv, ok := v.(UnsignedValue)
 			if !ok {
@@ -898,7 +934,12 @@ func (m *KeyAwareMergingIterator) encodeValues(typ byte, values []Value) ([]byte
 		return EncodeUnsignedArrayBlock(arr, nil)
 
 	case BlockBoolean:
-		arr := tsdb.NewBooleanArrayLen(0)
+		if m.booleanArr == nil {
+			m.booleanArr = &tsdb.BooleanArray{}
+		}
+		arr := m.booleanArr
+		arr.Timestamps = arr.Timestamps[:0]
+		arr.Values = arr.Values[:0]
 		for _, v := range values {
 			bv, ok := v.(BooleanValue)
 			if !ok {
@@ -914,7 +955,12 @@ func (m *KeyAwareMergingIterator) encodeValues(typ byte, values []Value) ([]byte
 		return EncodeBooleanArrayBlock(arr, nil)
 
 	case BlockString:
-		arr := tsdb.NewStringArrayLen(0)
+		if m.stringArr == nil {
+			m.stringArr = &tsdb.StringArray{}
+		}
+		arr := m.stringArr
+		arr.Timestamps = arr.Timestamps[:0]
+		arr.Values = arr.Values[:0]
 		for _, v := range values {
 			sv, ok := v.(StringValue)
 			if !ok {
@@ -957,6 +1003,7 @@ type streamingKeyIterator struct {
 	mergeIter *KeyAwareMergingIterator
 	tsmFiles  []string
 	key       []byte
+	keyBuf    []byte
 	minTime   int64
 	maxTime   int64
 	data      []byte
@@ -983,7 +1030,15 @@ func (s *streamingKeyIterator) Next() bool {
 			continue
 		}
 
-		s.key = key
+		// Copy key into our own buffer. The merge iterator reuses its
+		// keyBuf on each Read(), so we need an independent copy.
+		if cap(s.keyBuf) < len(key) {
+			s.keyBuf = make([]byte, len(key))
+		} else {
+			s.keyBuf = s.keyBuf[:len(key)]
+		}
+		copy(s.keyBuf, key)
+		s.key = s.keyBuf
 		s.minTime = minTime
 		s.maxTime = maxTime
 		s.data = data
@@ -992,9 +1047,7 @@ func (s *streamingKeyIterator) Next() bool {
 }
 
 func (s *streamingKeyIterator) Read() (key []byte, minTime int64, maxTime int64, data []byte, err error) {
-	keyCopy := make([]byte, len(s.key))
-	copy(keyCopy, s.key)
-	return keyCopy, s.minTime, s.maxTime, s.data, nil
+	return s.key, s.minTime, s.maxTime, s.data, nil
 }
 
 func (s *streamingKeyIterator) Close() error {
