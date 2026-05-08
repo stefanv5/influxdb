@@ -422,10 +422,13 @@ func (m *KeyAwareMergingIterator) Next() bool {
 			// but double-check to prevent any stale entry from contaminating
 			// the buffer (which would cause type mismatch errors).
 			if !bytes.Equal(entry.key, currentKeyForBlock) {
-				heap.Push(&m.heap, entry)
-				break
+				// Advance the stale iterator without pushing — moveToNextKey
+				// will re-activate it when its key becomes current.
+				m.advanceOnly(entry.iterator)
+				continue
 			}
-			// Set currentType for first value
+			// Set currentType for first value AFTER key check passes,
+			// so stale entries cannot corrupt the encoding type.
 			if m.currentType == blockTypeUnset {
 				m.currentType = blockTypeForValue(entry.value)
 			}
@@ -666,17 +669,19 @@ func (m *KeyAwareMergingIterator) activateIteratorForBlock(iter *BlockValueItera
 
 // popAndDedup pops the top entry for the current key and consumes all
 // same-timestamp entries for the same key, keeping the value from the
-// highest fileIdx. Stale entries from different keys are discarded.
+// highest fileIdx. Stale entries from different keys are discarded after
+// advancing their iterators so the consumed value is not re-pushed.
 // The winner's iterator is advanced after dedup completes to prevent
 // cross-key value mixing in the heap during the dedup loop.
 func (m *KeyAwareMergingIterator) popAndDedup() *valueEntry {
 	for m.heap.Len() > 0 {
 		top := heap.Pop(&m.heap).(*valueEntry)
 
-		// Discard stale entries from previous keys. Their iterators are not
-		// advanced here — moveToNextKey will reactivate them when their key
-		// becomes current.
+		// Discard stale entries from previous keys and advance their
+		// iterators so the consumed value is not re-pushed when
+		// moveToNextKey re-activates the iterator.
 		if !bytes.Equal(top.key, m.currentKey) {
+			m.advanceOnly(top.iterator)
 			continue
 		}
 
@@ -753,6 +758,23 @@ func (m *KeyAwareMergingIterator) advanceAndPush(iter *BlockValueIterator) {
 		// Fall through - block exhausted or all tombstoned
 	}
 	// Either key changed (hasNextBlock now set) or iterator exhausted
+	iter.exhausted = true
+}
+
+// advanceOnly advances the iterator by one value WITHOUT pushing to the heap.
+// Used when discarding stale entries from popAndDedup or Next() key check,
+// so the consumed value is not re-pushed when the iterator is re-activated.
+func (m *KeyAwareMergingIterator) advanceOnly(iter *BlockValueIterator) {
+	if iter.Next() {
+		return
+	}
+	// Current block exhausted — pre-fetch next block
+	if iter.NextBlock() {
+		// Same key, new block — nothing more to do; the iterator
+		// is now positioned at the start of the next block.
+		return
+	}
+	// Key changed (hasNextBlock now set) or iterator exhausted
 	iter.exhausted = true
 }
 

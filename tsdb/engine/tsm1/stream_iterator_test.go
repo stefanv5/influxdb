@@ -2327,3 +2327,112 @@ func TestKeyAwareMergingIterator_StaleHeapEntryIsolation(t *testing.T) {
 		t.Fatalf("unexpected error: %v", mergeIter.Err())
 	}
 }
+
+// TestKeyAwareMergingIterator_StaleEntryDifferentTypes verifies that stale
+// heap entries with a DIFFERENT type (e.g. StringValue) do not corrupt
+// m.currentType when the current key uses FloatValue. This is the exact
+// production scenario: "type mismatch: expected StringValue, got FloatValue".
+func TestKeyAwareMergingIterator_StaleEntryDifferentTypes(t *testing.T) {
+	dir := MustTempDir()
+	defer os.RemoveAll(dir)
+
+	// File 0: key "cpu" (FloatValue) at timestamps 10, 11
+	file0Vals := map[string][]tsm1.Value{
+		"cpu#!~#value": {
+			tsm1.NewValue(10, 1.0),
+			tsm1.NewValue(11, 2.0),
+		},
+	}
+	f0 := MustWriteTSM(dir, 1, file0Vals)
+	r0 := MustOpenTSMReader(f0)
+	defer r0.Close()
+
+	// File 1: key "cpu" (FloatValue) at timestamp 10, key "host" (StringValue) at ts 5
+	// When processing "cpu", file 1 wins dedup at ts=10 (newer file), then
+	// advances to "host" and pushes a stale StringValue entry into the heap.
+	// The fix must ensure this StringValue does NOT set m.currentType.
+	file1Vals := map[string][]tsm1.Value{
+		"cpu#!~#value":  {tsm1.NewValue(10, 10.0)},
+		"host#!~#value": {tsm1.NewValue(5, "server1")},
+	}
+	f1 := MustWriteTSM(dir, 2, file1Vals)
+	r1 := MustOpenTSMReader(f1)
+	defer r1.Close()
+
+	iter0 := tsm1.NewBlockValueIterator(r0, 0)
+	iter1 := tsm1.NewBlockValueIterator(r1, 1)
+
+	mergeIter := tsm1.NewKeyAwareMergingIterator(
+		[]*tsm1.BlockValueIterator{iter0, iter1},
+		1000, nil,
+	)
+
+	// First block: key "cpu" — must be FloatValue, not StringValue
+	if !mergeIter.Next() {
+		t.Fatal("expected first Next() to return true")
+	}
+	key, _, _, data, err := mergeIter.Read()
+	if err != nil {
+		t.Fatalf("first Read error: %v", err)
+	}
+	if string(key) != "cpu#!~#value" {
+		t.Fatalf("expected key 'cpu#!~#value', got '%s'", string(key))
+	}
+
+	block1Values, err := tsm1.DecodeBlock(data, nil)
+	if err != nil {
+		t.Fatalf("decode block 1 error: %v", err)
+	}
+	if len(block1Values) != 2 {
+		t.Fatalf("expected 2 values for key cpu, got %d", len(block1Values))
+	}
+	for _, v := range block1Values {
+		if _, ok := v.(tsm1.FloatValue); !ok {
+			t.Errorf("expected FloatValue for key cpu, got %T (type mismatch!)", v)
+		}
+	}
+	// Verify dedup: timestamp 10 should use file 1's value (10.0)
+	for _, v := range block1Values {
+		if v.UnixNano() == 10 {
+			fv := v.(tsm1.FloatValue)
+			if fv.Value() != 10.0 {
+				t.Errorf("expected dedup value 10.0 at ts=10, got %v", fv.Value())
+			}
+		}
+	}
+
+	// Second block: key "host" — must be StringValue
+	if !mergeIter.Next() {
+		t.Fatal("expected second Next() to return true")
+	}
+	key, _, _, data, err = mergeIter.Read()
+	if err != nil {
+		t.Fatalf("second Read error: %v", err)
+	}
+	if string(key) != "host#!~#value" {
+		t.Fatalf("expected key 'host#!~#value', got '%s'", string(key))
+	}
+
+	block2Values, err := tsm1.DecodeBlock(data, nil)
+	if err != nil {
+		t.Fatalf("decode block 2 error: %v", err)
+	}
+	if len(block2Values) != 1 {
+		t.Fatalf("expected 1 value for key host, got %d", len(block2Values))
+	}
+	sv, ok := block2Values[0].(tsm1.StringValue)
+	if !ok {
+		t.Fatalf("expected StringValue for key host, got %T", block2Values[0])
+	}
+	if sv.Value() != "server1" {
+		t.Errorf("expected value 'server1' for key host, got '%v'", sv.Value())
+	}
+
+	// No more blocks
+	if mergeIter.Next() {
+		t.Error("expected no more blocks")
+	}
+	if mergeIter.Err() != nil {
+		t.Fatalf("unexpected error: %v", mergeIter.Err())
+	}
+}
