@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"container/heap"
 	"fmt"
+	"sort"
 
 	"github.com/influxdata/influxdb/tsdb"
 )
@@ -459,6 +460,15 @@ func (m *KeyAwareMergingIterator) Read() (key []byte, minTime int64, maxTime int
 	keyCopy := make([]byte, len(m.blockKey))
 	copy(keyCopy, m.blockKey)
 	key = keyCopy
+
+	// Sort buffer by timestamp before encoding. The heap merge can produce
+	// unsorted output when an iterator advances across block boundaries
+	// (NextBlock) and pushes a value with an earlier timestamp than values
+	// already popped from other iterators.
+	sort.Slice(m.buf, func(i, j int) bool {
+		return m.buf[i].UnixNano() < m.buf[j].UnixNano()
+	})
+
 	minTime = m.buf[0].UnixNano()
 	maxTime = m.buf[len(m.buf)-1].UnixNano()
 
