@@ -459,8 +459,11 @@ func (m *KeyAwareMergingIterator) processCurrentKey() {
 		// Collect all blocks for this key from this iterator
 		for {
 			tombstones := iter.TombstoneRange(m.currentKey)
+			raw := iter.RawBlock()
+			rawCopy := make([]byte, len(raw))
+			copy(rawCopy, raw)
 			m.keyBlocks = append(m.keyBlocks, rawBlockEntry{
-				rawBlock:   iter.RawBlock(),
+				rawBlock:   rawCopy,
 				typ:        iter.Type(),
 				tombstones: tombstones,
 			})
