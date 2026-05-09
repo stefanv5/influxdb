@@ -31,17 +31,17 @@ func TestBlockValueIterator_Basic(t *testing.T) {
 		t.Fatal("expected Init to return true")
 	}
 
-	// Read all values
-	var got []tsm1.Value
-	for iter.Next() {
-		got = append(got, iter.Read())
+	// Decode the raw block
+	decoded, err := tsm1.DecodeBlock(iter.RawBlock(), nil)
+	if err != nil {
+		t.Fatalf("unexpected error decoding block: %v", err)
 	}
 
-	if len(got) != len(vals) {
-		t.Fatalf("expected %d values, got %d", len(vals), len(got))
+	if len(decoded) != len(vals) {
+		t.Fatalf("expected %d values, got %d", len(vals), len(decoded))
 	}
 
-	for i, v := range got {
+	for i, v := range decoded {
 		if v.UnixNano() != vals[i].UnixNano() {
 			t.Errorf("value %d: expected ts=%d, got %d", i, vals[i].UnixNano(), v.UnixNano())
 		}
@@ -82,14 +82,13 @@ func TestBlockValueIterator_KeyBoundary(t *testing.T) {
 		t.Fatalf("expected key 'cpu,host=A#!~#value', got '%s'", string(iter.Key()))
 	}
 
-	// Read all values for first key
-	var got []tsm1.Value
-	for iter.Next() {
-		got = append(got, iter.Read())
+	// Decode block for first key
+	decoded, err := tsm1.DecodeBlock(iter.RawBlock(), nil)
+	if err != nil {
+		t.Fatalf("unexpected error decoding block: %v", err)
 	}
-
-	if len(got) != len(vals1) {
-		t.Fatalf("expected %d values for first key, got %d", len(vals1), len(got))
+	if len(decoded) != len(vals1) {
+		t.Fatalf("expected %d values for first key, got %d", len(vals1), len(decoded))
 	}
 
 	// NextBlock should detect key change
@@ -112,7 +111,6 @@ func TestBlockValueIterator_MultiBlock(t *testing.T) {
 	defer os.RemoveAll(dir)
 
 	// Create a TSM file with many values for same key (multiple blocks)
-	// TSM writer may split into multiple blocks based on internal logic
 	var vals []tsm1.Value
 	for i := int64(1); i <= 2000; i++ {
 		vals = append(vals, tsm1.NewValue(i, float64(i)))
@@ -124,7 +122,6 @@ func TestBlockValueIterator_MultiBlock(t *testing.T) {
 	r := MustOpenTSMReader(f)
 	defer r.Close()
 
-	// Check how many blocks exist for this key
 	entries := r.Entries([]byte("cpu,host=A#!~#value"))
 	t.Logf("Number of blocks: %d", len(entries))
 
@@ -133,18 +130,17 @@ func TestBlockValueIterator_MultiBlock(t *testing.T) {
 		t.Fatal("expected Init to return true")
 	}
 
-	// Read all values across all blocks
+	// Decode all values across all blocks for this key
 	var count int
-	for iter.Next() {
-		count++
-	}
+	for {
+		decoded, err := tsm1.DecodeBlock(iter.RawBlock(), nil)
+		if err != nil {
+			t.Fatalf("unexpected error decoding block: %v", err)
+		}
+		count += len(decoded)
 
-	// If there are multiple blocks, try advancing
-	if len(entries) > 1 {
-		for iter.NextBlock() {
-			for iter.Next() {
-				count++
-			}
+		if !iter.NextBlock() {
+			break
 		}
 	}
 
@@ -169,8 +165,6 @@ func TestBlockValueIterator_Tombstone(t *testing.T) {
 	f := MustWriteTSM(dir, 1, writes)
 
 	// Add tombstone covering entire range
-	// When tombstone covers full time range (MinInt64, MaxInt64), the key is
-	// completely removed from the index, so Init() returns false
 	ts := tsm1.NewTombstoner(f, nil)
 	ts.AddRange([][]byte{[]byte("cpu,host=A#!~#value")}, math.MinInt64, math.MaxInt64)
 	if err := ts.Flush(); err != nil {
@@ -184,9 +178,10 @@ func TestBlockValueIterator_Tombstone(t *testing.T) {
 	// When entire key is tombstoned with full time range, the key is removed from index
 	// so Init() returns false (no blocks to iterate)
 	if iter.Init() {
-		// If Init returns true, all values should be tombstoned
-		if iter.Next() {
-			t.Fatal("expected Next to return false (all tombstoned)")
+		// If Init returns true, verify tombstone range is reported
+		tr := iter.TombstoneRange(iter.Key())
+		if len(tr) == 0 {
+			t.Fatal("expected tombstone ranges to be non-empty")
 		}
 	}
 	// It's also acceptable for Init to return false when key is fully deleted
@@ -222,21 +217,19 @@ func TestBlockValueIterator_TombstonePartial(t *testing.T) {
 		t.Fatal("expected Init to return true")
 	}
 
-	// Should get ts=1 and ts=3
-	var got []tsm1.Value
-	for iter.Next() {
-		got = append(got, iter.Read())
+	// Verify tombstone range is reported
+	tr := iter.TombstoneRange(iter.Key())
+	if len(tr) == 0 {
+		t.Fatal("expected tombstone ranges to be non-empty")
 	}
 
-	if len(got) != 2 {
-		t.Fatalf("expected 2 values, got %d", len(got))
+	// Block still contains all 3 values; tombstones are applied at merge time
+	decoded, err := tsm1.DecodeBlock(iter.RawBlock(), nil)
+	if err != nil {
+		t.Fatalf("unexpected error decoding block: %v", err)
 	}
-
-	if got[0].UnixNano() != 1 {
-		t.Errorf("expected first value ts=1, got %d", got[0].UnixNano())
-	}
-	if got[1].UnixNano() != 3 {
-		t.Errorf("expected second value ts=3, got %d", got[1].UnixNano())
+	if len(decoded) != 3 {
+		t.Fatalf("expected 3 raw values (tombstones applied at merge), got %d", len(decoded))
 	}
 }
 
@@ -273,21 +266,19 @@ func TestBlockValueIterator_TombstoneMultiple(t *testing.T) {
 		t.Fatal("expected Init to return true")
 	}
 
-	// Should get ts=1, 3, 5
-	var got []tsm1.Value
-	for iter.Next() {
-		got = append(got, iter.Read())
+	// Verify tombstone ranges are reported
+	tr := iter.TombstoneRange(iter.Key())
+	if len(tr) < 2 {
+		t.Fatalf("expected at least 2 tombstone ranges, got %d", len(tr))
 	}
 
-	if len(got) != 3 {
-		t.Fatalf("expected 3 values, got %d", len(got))
+	// Block still contains all 5 values; tombstones are applied at merge time
+	decoded, err := tsm1.DecodeBlock(iter.RawBlock(), nil)
+	if err != nil {
+		t.Fatalf("unexpected error decoding block: %v", err)
 	}
-
-	expected := []int64{1, 3, 5}
-	for i, v := range got {
-		if v.UnixNano() != expected[i] {
-			t.Errorf("value %d: expected ts=%d, got %d", i, expected[i], v.UnixNano())
-		}
+	if len(decoded) != 5 {
+		t.Fatalf("expected 5 raw values (tombstones applied at merge), got %d", len(decoded))
 	}
 }
 
@@ -309,7 +300,6 @@ func TestBlockValueIterator_TombstoneFullKey(t *testing.T) {
 	f := MustWriteTSM(dir, 1, writes)
 
 	// Tombstone entire key A with full time range
-	// This removes key A from the index completely
 	ts := tsm1.NewTombstoner(f, nil)
 	ts.AddRange([][]byte{[]byte("cpu,host=A#!~#value")}, math.MinInt64, math.MaxInt64)
 	if err := ts.Flush(); err != nil {
@@ -321,7 +311,6 @@ func TestBlockValueIterator_TombstoneFullKey(t *testing.T) {
 
 	iter := tsm1.NewBlockValueIterator(r, 0)
 	// Since key A is fully tombstoned, Init() should start at key B
-	// (key A is removed from index)
 	if !iter.Init() {
 		t.Fatal("expected Init to return true (should start at key B)")
 	}
@@ -331,13 +320,15 @@ func TestBlockValueIterator_TombstoneFullKey(t *testing.T) {
 		t.Fatalf("expected key 'cpu,host=B#!~#value', got '%s'", string(iter.Key()))
 	}
 
-	if !iter.Next() {
-		t.Fatal("expected Next to return true for key B")
+	decoded, err := tsm1.DecodeBlock(iter.RawBlock(), nil)
+	if err != nil {
+		t.Fatalf("unexpected error decoding block: %v", err)
 	}
-
-	v := iter.Read()
-	if v.UnixNano() != 2 {
-		t.Errorf("expected ts=2, got %d", v.UnixNano())
+	if len(decoded) != 1 {
+		t.Fatalf("expected 1 value for key B, got %d", len(decoded))
+	}
+	if decoded[0].UnixNano() != 2 {
+		t.Errorf("expected ts=2, got %d", decoded[0].UnixNano())
 	}
 }
 
@@ -368,13 +359,13 @@ func TestBlockValueIterator_TombstoneAllDeleted(t *testing.T) {
 	iter := tsm1.NewBlockValueIterator(r, 0)
 	if !iter.Init() {
 		// If Init returns false, the key was fully deleted from index
-		// This is expected when tombstone covers the entire time range of the key
 		return
 	}
 
-	// All values should be filtered
-	if iter.Next() {
-		t.Fatal("expected Next to return false (all values tombstoned)")
+	// Verify tombstone range covers the full block
+	tr := iter.TombstoneRange(iter.Key())
+	if len(tr) == 0 {
+		t.Fatal("expected tombstone ranges to be non-empty")
 	}
 }
 
@@ -392,8 +383,7 @@ func TestBlockValueIterator_TombstoneMultipleBlocks(t *testing.T) {
 	}
 	f := MustWriteTSM(dir, 1, writes)
 
-	// Tombstone first 1000 values (first block)
-	// This creates a tombstone range, not a full key deletion
+	// Tombstone first 1000 values
 	ts := tsm1.NewTombstoner(f, nil)
 	ts.AddRange([][]byte{[]byte("cpu,host=A#!~#value")}, 1, 1000)
 	if err := ts.Flush(); err != nil {
@@ -408,31 +398,29 @@ func TestBlockValueIterator_TombstoneMultipleBlocks(t *testing.T) {
 		t.Fatal("expected Init to return true")
 	}
 
-	// First block values (1-1000) are tombstoned
-	// But Init reads the first block, so we need to check
-	// if there are any non-tombstoned values
-	if iter.Next() {
-		// If we get a value, it should be from the second block
-		// (after first block is exhausted)
-		v := iter.Read()
-		if v.UnixNano() <= 1000 {
-			t.Errorf("expected value > 1000, got %d", v.UnixNano())
+	// Verify tombstone range is reported
+	tr := iter.TombstoneRange(iter.Key())
+	if len(tr) == 0 {
+		t.Fatal("expected tombstone ranges to be non-empty")
+	}
+
+	// Iterate through all blocks for this key, decoding raw blocks
+	var totalCount int
+	for {
+		decoded, err := tsm1.DecodeBlock(iter.RawBlock(), nil)
+		if err != nil {
+			t.Fatalf("unexpected error decoding block: %v", err)
 		}
-	} else {
-		// First block is fully tombstoned, advance to second block
+		totalCount += len(decoded)
+
 		if !iter.NextBlock() {
-			t.Fatal("expected NextBlock to return true")
+			break
 		}
+	}
 
-		// Should get values from second block (1001-2000)
-		var count int
-		for iter.Next() {
-			count++
-		}
-
-		if count != 1000 {
-			t.Fatalf("expected 1000 values from second block, got %d", count)
-		}
+	// Raw blocks still contain all values; tombstones applied at merge time
+	if totalCount != 2000 {
+		t.Fatalf("expected 2000 raw values across all blocks, got %d", totalCount)
 	}
 }
 
@@ -1452,12 +1440,12 @@ func TestBlockValueIterator_Close(t *testing.T) {
 		t.Fatal("expected Init to return true")
 	}
 
-	// Close should release resources
+	// Close should release resources (no panic)
 	iter.Close()
 
-	// Next should return false after Close
-	if iter.Next() {
-		t.Fatal("expected Next to return false after Close")
+	// RawBlock should return nil after Close
+	if iter.RawBlock() != nil {
+		t.Fatal("expected RawBlock to return nil after Close")
 	}
 }
 
@@ -1484,10 +1472,6 @@ func TestBlockValueIterator_CloseIdempotent(t *testing.T) {
 	iter.Close()
 	iter.Close()
 	iter.Close()
-
-	if iter.Next() {
-		t.Fatal("expected Next to return false after Close")
-	}
 }
 
 func TestKeyAwareMergingIterator_CloseReleasesIterators(t *testing.T) {
@@ -2509,4 +2493,205 @@ func TestKeyAwareMergingIterator_DebugTypeMismatch(t *testing.T) {
 		t.Fatalf("iterator error: %v", mergeIter.Err())
 	}
 	t.Logf("total blocks: %d", blockCount)
+}
+
+// TestCompactionMemoryComparison asserts that the streaming path's allocs/op
+// and bytes/op are within 2x of the batch path.
+func TestCompactionMemoryComparison(t *testing.T) {
+	dir := MustTempDir()
+	defer os.RemoveAll(dir)
+
+	numFiles := 3
+	valuesPerBlock := 1000
+	numBlocks := 5
+
+	var readers []*tsm1.TSMReader
+	var tsmFiles []string
+
+	for i := 0; i < numFiles; i++ {
+		vals := make(map[string][]tsm1.Value)
+		var cpuVals []tsm1.Value
+		for j := 0; j < numBlocks*valuesPerBlock; j++ {
+			ts := int64(j + 1)
+			cpuVals = append(cpuVals, tsm1.NewValue(ts, float64(i*1000+j)))
+		}
+		vals["cpu,host=A#!~#value"] = cpuVals
+
+		f := MustWriteTSM(dir, i+1, vals)
+		tsmFiles = append(tsmFiles, f)
+		r := MustOpenTSMReader(f)
+		readers = append(readers, r)
+		defer r.Close()
+	}
+
+	// Benchmark streaming path
+	streamResult := testing.Benchmark(func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			iter := tsm1.NewStreamingKeyIterator(tsmFiles, readers, 1000, nil)
+			for iter.Next() {
+				_, _, _, _, _ = iter.Read()
+			}
+			if iter.Err() != nil {
+				b.Fatalf("streaming error: %v", iter.Err())
+			}
+		}
+	})
+
+	// Benchmark batch path
+	batchResult := testing.Benchmark(func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			iter, err := tsm1.NewTSMBatchKeyIterator(1000, false, nil, tsmFiles, readers...)
+			if err != nil {
+				b.Fatalf("batch error: %v", err)
+			}
+			for iter.Next() {
+				_, _, _, _, _ = iter.Read()
+			}
+			if iter.Err() != nil {
+				b.Fatalf("batch error: %v", iter.Err())
+			}
+		}
+	})
+
+	streamAllocs := streamResult.AllocsPerOp()
+	streamBytes := streamResult.AllocedBytesPerOp()
+	batchAllocs := batchResult.AllocsPerOp()
+	batchBytes := batchResult.AllocedBytesPerOp()
+
+	t.Logf("Streaming: %d allocs/op, %d bytes/op", streamAllocs, streamBytes)
+	t.Logf("Batch:     %d allocs/op, %d bytes/op", batchAllocs, batchBytes)
+
+	if batchAllocs > 0 && streamAllocs > 2*batchAllocs {
+		t.Errorf("streaming allocs/op (%d) exceeds 2x batch allocs/op (%d)", streamAllocs, batchAllocs)
+	}
+	if batchBytes > 0 && streamBytes > 2*batchBytes {
+		t.Errorf("streaming bytes/op (%d) exceeds 2x batch bytes/op (%d)", streamBytes, batchBytes)
+	}
+}
+
+// TestCompactionOutputEquivalence asserts that the streaming and batch paths
+// produce identical output blocks (same keys, same timestamps, same values).
+func TestCompactionOutputEquivalence(t *testing.T) {
+	dir := MustTempDir()
+	defer os.RemoveAll(dir)
+
+	numFiles := 3
+	numKeys := 2
+
+	var readers []*tsm1.TSMReader
+	var tsmFiles []string
+
+	for i := 0; i < numFiles; i++ {
+		vals := make(map[string][]tsm1.Value)
+		for k := 0; k < numKeys; k++ {
+			key := fmt.Sprintf("cpu,host=%c#!~#value", 'A'+k)
+			var keyVals []tsm1.Value
+			for j := int64(1); j <= 100; j++ {
+				keyVals = append(keyVals, tsm1.NewValue(j, float64(i*1000+int(j))))
+			}
+			vals[key] = keyVals
+		}
+		f := MustWriteTSM(dir, i+1, vals)
+		tsmFiles = append(tsmFiles, f)
+		r := MustOpenTSMReader(f)
+		readers = append(readers, r)
+		defer r.Close()
+	}
+
+	// Collect streaming output
+	type block struct {
+		key     string
+		minTime int64
+		maxTime int64
+		data    []byte
+	}
+	var streamBlocks []block
+	streamIter := tsm1.NewStreamingKeyIterator(tsmFiles, readers, 1000, nil)
+	for streamIter.Next() {
+		key, minTime, maxTime, data, err := streamIter.Read()
+		if err != nil {
+			t.Fatalf("streaming read error: %v", err)
+		}
+		k := make([]byte, len(key))
+		copy(k, key)
+		d := make([]byte, len(data))
+		copy(d, data)
+		streamBlocks = append(streamBlocks, block{string(k), minTime, maxTime, d})
+	}
+	if streamIter.Err() != nil {
+		t.Fatalf("streaming error: %v", streamIter.Err())
+	}
+
+	// Collect batch output
+	var batchBlocks []block
+	batchIter, err := tsm1.NewTSMBatchKeyIterator(1000, false, nil, tsmFiles, readers...)
+	if err != nil {
+		t.Fatalf("batch error: %v", err)
+	}
+	for batchIter.Next() {
+		key, minTime, maxTime, data, err := batchIter.Read()
+		if err != nil {
+			t.Fatalf("batch read error: %v", err)
+		}
+		k := make([]byte, len(key))
+		copy(k, key)
+		d := make([]byte, len(data))
+		copy(d, data)
+		batchBlocks = append(batchBlocks, block{string(k), minTime, maxTime, d})
+	}
+	if batchIter.Err() != nil {
+		t.Fatalf("batch error: %v", batchIter.Err())
+	}
+
+	// Compare block counts
+	if len(streamBlocks) != len(batchBlocks) {
+		t.Fatalf("block count mismatch: streaming=%d, batch=%d", len(streamBlocks), len(batchBlocks))
+	}
+
+	// Compare each block
+	for i := range streamBlocks {
+		sb := streamBlocks[i]
+		bb := batchBlocks[i]
+
+		if sb.key != bb.key {
+			t.Errorf("block %d: key mismatch: streaming=%q, batch=%q", i, sb.key, bb.key)
+		}
+		if sb.minTime != bb.minTime {
+			t.Errorf("block %d: minTime mismatch: streaming=%d, batch=%d", i, sb.minTime, bb.minTime)
+		}
+		if sb.maxTime != bb.maxTime {
+			// Debug: decode and show timestamps
+			sVals, _ := tsm1.DecodeBlock(sb.data, nil)
+			bVals, _ := tsm1.DecodeBlock(bb.data, nil)
+			t.Logf("block %d: streaming maxTime=%d (decoded %d values, first=%d last=%d)", i, sb.maxTime, len(sVals), sVals[0].UnixNano(), sVals[len(sVals)-1].UnixNano())
+			t.Logf("block %d: batch     maxTime=%d (decoded %d values, first=%d last=%d)", i, bb.maxTime, len(bVals), bVals[0].UnixNano(), bVals[len(bVals)-1].UnixNano())
+			t.Errorf("block %d: maxTime mismatch: streaming=%d, batch=%d", i, sb.maxTime, bb.maxTime)
+		}
+
+		// Decode and compare values
+		sVals, err := tsm1.DecodeBlock(sb.data, nil)
+		if err != nil {
+			t.Fatalf("block %d: streaming decode error: %v", i, err)
+		}
+		bVals, err := tsm1.DecodeBlock(bb.data, nil)
+		if err != nil {
+			t.Fatalf("block %d: batch decode error: %v", i, err)
+		}
+
+		if len(sVals) != len(bVals) {
+			t.Errorf("block %d: value count mismatch: streaming=%d, batch=%d", i, len(sVals), len(bVals))
+			continue
+		}
+
+		for j := range sVals {
+			if sVals[j].UnixNano() != bVals[j].UnixNano() {
+				t.Errorf("block %d value %d: timestamp mismatch: streaming=%d, batch=%d", i, j, sVals[j].UnixNano(), bVals[j].UnixNano())
+			}
+			if fmt.Sprintf("%v", sVals[j].Value()) != fmt.Sprintf("%v", bVals[j].Value()) {
+				t.Errorf("block %d value %d: value mismatch: streaming=%v, batch=%v", i, j, sVals[j].Value(), bVals[j].Value())
+			}
+		}
+	}
 }

@@ -8,9 +8,19 @@ package tsm1
 import (
 	"fmt"
 	"sort"
+	"sync"
 
 	"github.com/influxdata/influxdb/tsdb"
 )
+
+// encodeBufPool pools byte slices used as intermediate buffers in Encode*ArrayBlock
+// functions, reducing per-block allocation overhead.
+var encodeBufPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 0, 4096)
+		return &b
+	},
+}
 
 // Values represents a slice of  values.
 type Values []Value
@@ -459,22 +469,30 @@ func EncodeFloatArrayBlock(a *tsdb.FloatArray, b []byte) ([]byte, error) {
 		return nil, nil
 	}
 
-	// TODO(edd): These need to be pooled.
-	var vb []byte
-	var tb []byte
+	vbPtr := encodeBufPool.Get().(*[]byte)
+	tbPtr := encodeBufPool.Get().(*[]byte)
+	vb := (*vbPtr)[:0]
+	tb := (*tbPtr)[:0]
 	var err error
 
 	if vb, err = FloatArrayEncodeAll(a.Values, vb); err != nil {
+		encodeBufPool.Put(vbPtr)
+		encodeBufPool.Put(tbPtr)
 		return nil, err
 	}
 
 	if tb, err = TimeArrayEncodeAll(a.Timestamps, tb); err != nil {
+		encodeBufPool.Put(vbPtr)
+		encodeBufPool.Put(tbPtr)
 		return nil, err
 	}
 
-	// Prepend the first timestamp of the block in the first 8 bytes and the block
-	// in the next byte, followed by the block
-	return packBlock(b, BlockFloat64, tb, vb), nil
+	result := packBlock(b, BlockFloat64, tb, vb)
+	*vbPtr = vb
+	*tbPtr = tb
+	encodeBufPool.Put(vbPtr)
+	encodeBufPool.Put(tbPtr)
+	return result, nil
 }
 
 func encodeFloatValuesBlock(buf []byte, values []FloatValue) ([]byte, error) {
@@ -752,22 +770,30 @@ func EncodeIntegerArrayBlock(a *tsdb.IntegerArray, b []byte) ([]byte, error) {
 		return nil, nil
 	}
 
-	// TODO(edd): These need to be pooled.
-	var vb []byte
-	var tb []byte
+	vbPtr := encodeBufPool.Get().(*[]byte)
+	tbPtr := encodeBufPool.Get().(*[]byte)
+	vb := (*vbPtr)[:0]
+	tb := (*tbPtr)[:0]
 	var err error
 
 	if vb, err = IntegerArrayEncodeAll(a.Values, vb); err != nil {
+		encodeBufPool.Put(vbPtr)
+		encodeBufPool.Put(tbPtr)
 		return nil, err
 	}
 
 	if tb, err = TimeArrayEncodeAll(a.Timestamps, tb); err != nil {
+		encodeBufPool.Put(vbPtr)
+		encodeBufPool.Put(tbPtr)
 		return nil, err
 	}
 
-	// Prepend the first timestamp of the block in the first 8 bytes and the block
-	// in the next byte, followed by the block
-	return packBlock(b, BlockInteger, tb, vb), nil
+	result := packBlock(b, BlockInteger, tb, vb)
+	*vbPtr = vb
+	*tbPtr = tb
+	encodeBufPool.Put(vbPtr)
+	encodeBufPool.Put(tbPtr)
+	return result, nil
 }
 
 func encodeIntegerValuesBlock(buf []byte, values []IntegerValue) ([]byte, error) {
@@ -1045,22 +1071,30 @@ func EncodeUnsignedArrayBlock(a *tsdb.UnsignedArray, b []byte) ([]byte, error) {
 		return nil, nil
 	}
 
-	// TODO(edd): These need to be pooled.
-	var vb []byte
-	var tb []byte
+	vbPtr := encodeBufPool.Get().(*[]byte)
+	tbPtr := encodeBufPool.Get().(*[]byte)
+	vb := (*vbPtr)[:0]
+	tb := (*tbPtr)[:0]
 	var err error
 
 	if vb, err = UnsignedArrayEncodeAll(a.Values, vb); err != nil {
+		encodeBufPool.Put(vbPtr)
+		encodeBufPool.Put(tbPtr)
 		return nil, err
 	}
 
 	if tb, err = TimeArrayEncodeAll(a.Timestamps, tb); err != nil {
+		encodeBufPool.Put(vbPtr)
+		encodeBufPool.Put(tbPtr)
 		return nil, err
 	}
 
-	// Prepend the first timestamp of the block in the first 8 bytes and the block
-	// in the next byte, followed by the block
-	return packBlock(b, BlockUnsigned, tb, vb), nil
+	result := packBlock(b, BlockUnsigned, tb, vb)
+	*vbPtr = vb
+	*tbPtr = tb
+	encodeBufPool.Put(vbPtr)
+	encodeBufPool.Put(tbPtr)
+	return result, nil
 }
 
 func encodeUnsignedValuesBlock(buf []byte, values []UnsignedValue) ([]byte, error) {
@@ -1338,22 +1372,30 @@ func EncodeStringArrayBlock(a *tsdb.StringArray, b []byte) ([]byte, error) {
 		return nil, nil
 	}
 
-	// TODO(edd): These need to be pooled.
-	var vb []byte
-	var tb []byte
+	vbPtr := encodeBufPool.Get().(*[]byte)
+	tbPtr := encodeBufPool.Get().(*[]byte)
+	vb := (*vbPtr)[:0]
+	tb := (*tbPtr)[:0]
 	var err error
 
 	if vb, err = StringArrayEncodeAll(a.Values, vb); err != nil {
+		encodeBufPool.Put(vbPtr)
+		encodeBufPool.Put(tbPtr)
 		return nil, err
 	}
 
 	if tb, err = TimeArrayEncodeAll(a.Timestamps, tb); err != nil {
+		encodeBufPool.Put(vbPtr)
+		encodeBufPool.Put(tbPtr)
 		return nil, err
 	}
 
-	// Prepend the first timestamp of the block in the first 8 bytes and the block
-	// in the next byte, followed by the block
-	return packBlock(b, BlockString, tb, vb), nil
+	result := packBlock(b, BlockString, tb, vb)
+	*vbPtr = vb
+	*tbPtr = tb
+	encodeBufPool.Put(vbPtr)
+	encodeBufPool.Put(tbPtr)
+	return result, nil
 }
 
 func encodeStringValuesBlock(buf []byte, values []StringValue) ([]byte, error) {
@@ -1631,22 +1673,30 @@ func EncodeBooleanArrayBlock(a *tsdb.BooleanArray, b []byte) ([]byte, error) {
 		return nil, nil
 	}
 
-	// TODO(edd): These need to be pooled.
-	var vb []byte
-	var tb []byte
+	vbPtr := encodeBufPool.Get().(*[]byte)
+	tbPtr := encodeBufPool.Get().(*[]byte)
+	vb := (*vbPtr)[:0]
+	tb := (*tbPtr)[:0]
 	var err error
 
 	if vb, err = BooleanArrayEncodeAll(a.Values, vb); err != nil {
+		encodeBufPool.Put(vbPtr)
+		encodeBufPool.Put(tbPtr)
 		return nil, err
 	}
 
 	if tb, err = TimeArrayEncodeAll(a.Timestamps, tb); err != nil {
+		encodeBufPool.Put(vbPtr)
+		encodeBufPool.Put(tbPtr)
 		return nil, err
 	}
 
-	// Prepend the first timestamp of the block in the first 8 bytes and the block
-	// in the next byte, followed by the block
-	return packBlock(b, BlockBoolean, tb, vb), nil
+	result := packBlock(b, BlockBoolean, tb, vb)
+	*vbPtr = vb
+	*tbPtr = tb
+	encodeBufPool.Put(vbPtr)
+	encodeBufPool.Put(tbPtr)
+	return result, nil
 }
 
 func encodeBooleanValuesBlock(buf []byte, values []BooleanValue) ([]byte, error) {

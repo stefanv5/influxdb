@@ -2,78 +2,41 @@ package tsm1
 
 import (
 	"bytes"
-	"container/heap"
 	"fmt"
-	"log"
-	"sort"
 
 	"github.com/influxdata/influxdb/tsdb"
 )
 
-// blockTypeName returns a human-readable name for a block type byte.
-func blockTypeName(typ byte) string {
-	switch typ {
-	case BlockFloat64:
-		return "float"
-	case BlockInteger:
-		return "integer"
-	case BlockUnsigned:
-		return "unsigned"
-	case BlockBoolean:
-		return "boolean"
-	case BlockString:
-		return "string"
-	default:
-		return fmt.Sprintf("unknown(%d)", typ)
-	}
-}
+// blockTypeUnset is a sentinel value for currentType that does not collide
+// with any valid block type (BlockFloat64=0 through BlockUnsigned=4).
+const blockTypeUnset = byte(0xFF)
 
-// blockTypeForValue returns the block type byte for a given Value.
-func blockTypeForValue(v Value) byte {
-	switch v.(type) {
-	case FloatValue:
-		return BlockFloat64
-	case IntegerValue:
-		return BlockInteger
-	case UnsignedValue:
-		return BlockUnsigned
-	case BooleanValue:
-		return BlockBoolean
-	case StringValue:
-		return BlockString
-	default:
-		return 0
-	}
-}
-
-// BlockValueIterator iterates over values within a single TSM block.
-// It holds at most one decoded block in memory at any time.
-// When the current block is exhausted, Next() returns false without
-// automatically advancing to the next block. The upper layer
-// (KeyAwareMergingIterator) controls block advancement via NextBlock().
+// BlockValueIterator iterates over raw blocks within a single TSM file.
+// It yields raw (encoded) blocks rather than decoded values, allowing the
+// upper layer to perform batch decode/merge without per-value interface boxing.
 type BlockValueIterator struct {
 	r       *TSMReader
 	iter    *BlockIterator
 	fileIdx int
 
-	// Current block state
+	// Current block state (raw)
 	currentKey  []byte
 	currentType byte
-	tombstones  []TimeRange
-	decoded     []Value
-	pos         int
+	rawBlock    []byte
+	rawMinTime  int64
+	rawMaxTime  int64
 
 	// Pending state from NextBlock when key changes
-	nextRaw  []byte
-	nextKey  []byte
-	nextType byte
-	nextMin  int64
-	nextMax  int64
+	nextKey     []byte
+	nextType    byte
+	nextRaw     []byte
+	nextMinTime int64
+	nextMaxTime int64
+	hasNext     bool
 
-	hasNextBlock bool
-	initialized  bool   // true if Init() has been called
-	exhausted    bool   // true when iterator has no more blocks
-	err          error
+	initialized bool
+	exhausted   bool
+	err         error
 }
 
 // NewBlockValueIterator creates a new BlockValueIterator for the given TSM reader.
@@ -86,12 +49,12 @@ func NewBlockValueIterator(r *TSMReader, fileIdx int) *BlockValueIterator {
 }
 
 // Init reads the first block and prepares the iterator for iteration.
-// Returns true if there is at least one block to iterate.
 func (it *BlockValueIterator) Init() bool {
 	if !it.iter.Next() {
 		if it.iter.Err() != nil {
 			it.err = it.iter.Err()
 		}
+		it.exhausted = true
 		return false
 	}
 
@@ -103,50 +66,22 @@ func (it *BlockValueIterator) Init() bool {
 
 	it.currentKey = append([]byte(nil), key...)
 	it.currentType = typ
-	it.tombstones = it.r.TombstoneRange(key)
-
-	decoded, err := DecodeBlock(buf, it.decoded[:0])
-	if err != nil {
-		it.err = fmt.Errorf("decode error: unable to decompress block type %s for key '%s': %v", blockTypeName(typ), key, err)
-		return false
-	}
-	it.decoded = decoded
-	it.pos = 0
+	it.rawBlock = buf
+	it.rawMinTime = minTime
+	it.rawMaxTime = maxTime
 	it.initialized = true
-
-	// Cache block metadata for NextBlock detection
-	it.nextMin = minTime
-	it.nextMax = maxTime
-
 	return true
 }
 
-// Next advances to the next value within the current block.
-// Returns false when the current block is exhausted or all remaining values
-// are tombstoned. Does NOT advance to the next block automatically.
-func (it *BlockValueIterator) Next() bool {
-	for it.pos < len(it.decoded) {
-		v := it.decoded[it.pos]
-		if !it.isDeleted(v) {
-			it.pos++
-			return true
-		}
-		it.pos++
-	}
-	return false
-}
-
 // NextBlock reads the next block from the underlying TSM iterator.
-// If the key changes, the new key is cached in nextKey/nextType and the
-// method returns false. The caller should use ActivatePending() to
-// start iterating the new key's block.
-// If the key is the same, the new block replaces the current one and
-// returns true.
+// If the key changes, the new key is cached and the method returns false.
+// If the key is the same, the new block replaces the current one and returns true.
 func (it *BlockValueIterator) NextBlock() bool {
 	if !it.iter.Next() {
 		if it.iter.Err() != nil {
 			it.err = it.iter.Err()
 		}
+		it.exhausted = true
 		return false
 	}
 
@@ -156,77 +91,42 @@ func (it *BlockValueIterator) NextBlock() bool {
 		return false
 	}
 
-	// Key changed - cache the new block info
 	if !bytes.Equal(key, it.currentKey) {
-		it.nextKey = append([]byte(nil), key...)
+		it.nextKey = append(it.nextKey[:0], key...)
 		it.nextType = typ
 		it.nextRaw = buf
-		it.nextMin = minTime
-		it.nextMax = maxTime
-		it.hasNextBlock = true
+		it.nextMinTime = minTime
+		it.nextMaxTime = maxTime
+		it.hasNext = true
 		return false
 	}
 
-	// Same key - decode and replace current block
-	it.tombstones = it.r.TombstoneRange(key)
-	decoded, err := DecodeBlock(buf, it.decoded[:0])
-	if err != nil {
-		it.err = fmt.Errorf("decode error: unable to decompress block type %s for key '%s': %v", blockTypeName(typ), key, err)
-		return false
-	}
-	it.decoded = decoded
-	it.pos = 0
-	it.nextMin = minTime
-	it.nextMax = maxTime
+	// Same key - replace current block
+	it.rawBlock = buf
+	it.rawMinTime = minTime
+	it.rawMaxTime = maxTime
 	return true
 }
 
-// ActivatePending activates the pending block that was cached by NextBlock
-// when the key changed. After calling this, the iterator is positioned at
-// the new key's first block.
+// ActivatePending activates the pending block cached by NextBlock.
 func (it *BlockValueIterator) ActivatePending() bool {
-	if !it.hasNextBlock {
+	if !it.hasNext {
 		return false
 	}
 
-	it.currentKey = it.nextKey
+	it.currentKey = append(it.currentKey[:0], it.nextKey...)
 	it.currentType = it.nextType
-	it.tombstones = it.r.TombstoneRange(it.currentKey)
+	it.rawBlock = it.nextRaw
+	it.rawMinTime = it.nextMinTime
+	it.rawMaxTime = it.nextMaxTime
 
-	decoded, err := DecodeBlock(it.nextRaw, it.decoded[:0])
-	if err != nil {
-		it.err = fmt.Errorf("decode error: unable to decompress block type %s for key '%s': %v", blockTypeName(it.nextType), it.nextKey, err)
-		return false
-	}
-	it.decoded = decoded
-	it.pos = 0
-
-	// Clear pending state
 	it.nextKey = nil
 	it.nextRaw = nil
-	it.hasNextBlock = false
-
+	it.hasNext = false
 	return true
-}
-
-// isDeleted checks if a value's timestamp falls within any tombstone range.
-func (it *BlockValueIterator) isDeleted(v Value) bool {
-	ts := v.UnixNano()
-	for _, tr := range it.tombstones {
-		if tr.Min <= ts && tr.Max >= ts {
-			return true
-		}
-	}
-	return false
-}
-
-// Read returns the current value. Should be called after Next() returns true.
-func (it *BlockValueIterator) Read() Value {
-	return it.decoded[it.pos-1]
 }
 
 // Key returns the current key being iterated.
-// Returns nil if Init() has not been called yet.
 func (it *BlockValueIterator) Key() []byte {
 	if !it.initialized {
 		return nil
@@ -239,6 +139,21 @@ func (it *BlockValueIterator) Type() byte {
 	return it.currentType
 }
 
+// RawBlock returns the raw encoded block bytes.
+func (it *BlockValueIterator) RawBlock() []byte {
+	return it.rawBlock
+}
+
+// MinTime returns the minimum time of the current block.
+func (it *BlockValueIterator) MinTime() int64 {
+	return it.rawMinTime
+}
+
+// MaxTime returns the maximum time of the current block.
+func (it *BlockValueIterator) MaxTime() int64 {
+	return it.rawMaxTime
+}
+
 // Err returns any error encountered during iteration.
 func (it *BlockValueIterator) Err() error {
 	return it.err
@@ -249,92 +164,61 @@ func (it *BlockValueIterator) FileIdx() int {
 	return it.fileIdx
 }
 
-// Close releases all slice resources held by this iterator.
-// After Close, Next() returns false. Close is idempotent.
+// TombstoneRange returns the tombstone ranges for the given key.
+func (it *BlockValueIterator) TombstoneRange(key []byte) []TimeRange {
+	return it.r.TombstoneRange(key)
+}
+
+// Close releases resources held by this iterator.
 func (it *BlockValueIterator) Close() {
 	if it.exhausted {
 		return
 	}
 	it.exhausted = true
-	it.decoded = nil
+	it.rawBlock = nil
 	it.nextRaw = nil
-	it.tombstones = nil
 	it.currentKey = nil
 	it.nextKey = nil
-	it.pos = 0
 }
 
-// blockTypeUnset is a sentinel value for currentType that does not collide
-// with any valid block type (BlockFloat64=0 through BlockUnsigned=4).
-const blockTypeUnset = byte(0xFF)
-
-// valueEntry represents an entry in the value heap.
-type valueEntry struct {
-	value     Value
-	iterator  *BlockValueIterator
-	key       []byte // snapshot of the key at entry creation time
-	timestamp int64
-	fileIdx   int
+// rawBlockEntry holds a raw block's data along with its tombstone ranges.
+type rawBlockEntry struct {
+	rawBlock   []byte
+	typ        byte
+	tombstones []TimeRange
 }
 
-// valueHeap implements heap.Interface and sorts entries by (timestamp, fileIdx) ascending.
-type valueHeap struct {
-	entries []*valueEntry
-}
-
-func (h valueHeap) Len() int { return len(h.entries) }
-
-func (h valueHeap) Less(i, j int) bool {
-	if h.entries[i].timestamp != h.entries[j].timestamp {
-		return h.entries[i].timestamp < h.entries[j].timestamp
-	}
-	// For same timestamp, newer file (higher fileIdx) should be "less" to win the heap top
-	// Since heap.Pop gets the smallest, we need to invert here so higher fileIdx wins
-	return h.entries[i].fileIdx > h.entries[j].fileIdx
-}
-
-func (h valueHeap) Swap(i, j int) {
-	h.entries[i], h.entries[j] = h.entries[j], h.entries[i]
-}
-
-func (h *valueHeap) Push(x interface{}) {
-	h.entries = append(h.entries, x.(*valueEntry))
-}
-
-func (h *valueHeap) Pop() interface{} {
-	old := h.entries
-	n := len(old)
-	item := old[n-1]
-	old[n-1] = nil
-	h.entries = old[:n-1]
-	return item
-}
-
-func (h valueHeap) Peek() *valueEntry {
-	return h.entries[0]
+// chunkEntry holds an encoded output block along with its time range.
+type chunkEntry struct {
+	data    []byte
+	minTime int64
+	maxTime int64
 }
 
 // KeyAwareMergingIterator merges multiple BlockValueIterators into a single
-// stream of blocks, ensuring each output block contains values from exactly
-// one key. It uses a heap to merge values by (timestamp, fileIdx) and
-// deduplicates same-timestamp values keeping the newest file's value.
+// stream of blocks using batch-style key-level merge. For each key, it collects
+// all blocks from all readers, decodes into typed arrays, applies tombstones,
+// merges sorted arrays, and chunks the output. This avoids per-value interface
+// boxing and per-value heap allocations.
 type KeyAwareMergingIterator struct {
 	iterators []*BlockValueIterator
-	heap      valueHeap
 	currentKey []byte
 	currentType byte
-	blockKey    []byte  // key for the current output block
+	blockKey    []byte
 
-	// Output buffer
-	buf     []Value
-	bufSize int
+	// Batch merge state: collected blocks for current key
+	keyBlocks []rawBlockEntry
 
-	// Reusable typed arrays for encodeValues (avoids allocation per block)
-	floatArr    *tsdb.FloatArray
-	integerArr  *tsdb.IntegerArray
-	unsignedArr *tsdb.UnsignedArray
-	booleanArr  *tsdb.BooleanArray
-	stringArr   *tsdb.StringArray
+	// Merged typed arrays (one per type, reused across keys)
+	mergedFloat    tsdb.FloatArray
+	mergedInteger  tsdb.IntegerArray
+	mergedUnsigned tsdb.UnsignedArray
+	mergedBoolean  tsdb.BooleanArray
+	mergedString   tsdb.StringArray
+
+	// Output chunks from the merged array
+	chunks    []chunkEntry
+	chunkIdx  int
 
 	// Reusable key buffer for Read()
 	keyBuf []byte
@@ -350,17 +234,14 @@ type KeyAwareMergingIterator struct {
 
 	// For tracking estimated index size
 	estimatedIndexSize int
+
+	bufSize int
 }
 
-// NewKeyAwareMergingIterator creates a new merging iterator from the given
-// BlockValueIterators. bufSize controls the maximum number of values per
-// output block (typically DefaultMaxPointsPerBlock = 1000).
-// interrupt is an optional channel for cancellation; closing it will cause
-// Next() to return false with an error. Pass nil to disable interruption.
+// NewKeyAwareMergingIterator creates a new batch-merge iterator.
 func NewKeyAwareMergingIterator(iters []*BlockValueIterator, bufSize int, interrupt chan struct{}) *KeyAwareMergingIterator {
 	return &KeyAwareMergingIterator{
 		iterators: iters,
-		buf:       make([]Value, 0, bufSize),
 		bufSize:   bufSize,
 		interrupt: interrupt,
 	}
@@ -372,7 +253,6 @@ func (m *KeyAwareMergingIterator) Next() bool {
 		return false
 	}
 
-	// Check for cancellation
 	if m.interrupted() {
 		m.err = fmt.Errorf("compaction interrupted")
 		m.exhausted = true
@@ -388,99 +268,81 @@ func (m *KeyAwareMergingIterator) Next() bool {
 		}
 	}
 
-	// Clear output buffer
-	m.buf = m.buf[:0]
-
-	// Safety limit to prevent infinite loops
-	iterations := 0
-	maxIterations := 10000
-
-	// Track the key for this output block
-	currentKeyForBlock := m.currentKey
-
-	// Fill output buffer from heap
-	for len(m.buf) < m.bufSize && iterations < maxIterations {
-		iterations++
-		// Check for cancellation on each iteration
-		if m.interrupted() {
-			m.err = fmt.Errorf("compaction interrupted")
-			m.exhausted = true
-			break
-		}
-
-		if m.heap.Len() == 0 {
-			// Current key exhausted, find next key
-			if len(m.buf) > 0 {
-				// We have values from previous key, return them
-				break
-			}
-			if !m.moveToNextKey() {
-				m.exhausted = true
-				break
-			}
-			// Update currentKeyForBlock to the new key
-			currentKeyForBlock = m.currentKey
-			// Check if we got any values in the heap
-			if m.heap.Len() == 0 {
-				// No values for the new key, continue to find next key
-				continue
-			}
-		}
-
-		entry := m.popAndDedup()
-		if entry != nil {
-			// Defense-in-depth: popAndDedup already filters by currentKey,
-			// but double-check to prevent any stale entry from contaminating
-			// the buffer (which would cause type mismatch errors).
-			if !bytes.Equal(entry.key, currentKeyForBlock) {
-				// Advance the stale iterator without pushing — moveToNextKey
-				// will re-activate it when its key becomes current.
-				m.advanceOnly(entry.iterator)
-				continue
-			}
-			// Set currentType for first value AFTER key check passes,
-			// so stale entries cannot corrupt the encoding type.
-			if m.currentType == blockTypeUnset {
-				m.currentType = blockTypeForValue(entry.value)
-			}
-			// Verify type consistency before appending to buffer.
-			entryType := blockTypeForValue(entry.value)
-			if entryType != m.currentType {
-				log.Printf("[stream-iter] TYPE MISMATCH in Next(): key=%s currentType=%s entryType=%s valueType=%T ts=%d fIdx=%d bufLen=%d heap=%s",
-					currentKeyForBlock, blockTypeName(m.currentType), blockTypeName(entryType),
-					entry.value, entry.value.UnixNano(), entry.fileIdx, len(m.buf), m.heapDump())
-				m.err = fmt.Errorf("type mismatch at buffer insertion: currentType=%s, valueType=%T for key %s (ts=%d, fIdx=%d, bufLen=%d)",
-					blockTypeName(m.currentType), entry.value, entry.key, entry.value.UnixNano(), entry.fileIdx, len(m.buf))
-				return len(m.buf) > 0
-			}
-			m.buf = append(m.buf, entry.value)
-		}
+	// If we have buffered chunks from the current key, yield the next one
+	if m.chunkIdx < len(m.chunks) {
+		return true
 	}
 
-	// Save the block key for Read()
-	if len(m.buf) > 0 {
-		m.blockKey = currentKeyForBlock
-	} else {
-		m.blockKey = nil
+	// Current key fully consumed, move to next key
+	m.chunks = nil
+	m.chunkIdx = 0
+
+	if !m.moveToNextKey() {
+		m.exhausted = true
+		return false
 	}
 
-	return len(m.buf) > 0
+	// Process the new key: collect blocks, merge, chunk
+	m.processCurrentKey()
+
+	if len(m.chunks) == 0 {
+		// All values tombstoned or empty, try next key
+		return m.Next()
+	}
+
+	return true
 }
 
-// heapDump returns a string representation of the heap for debugging.
-func (m *KeyAwareMergingIterator) heapDump() string {
-	if len(m.heap.entries) == 0 {
-		return "[]"
+// Read returns the current block's key, time range, and encoded data.
+func (m *KeyAwareMergingIterator) Read() (key []byte, minTime int64, maxTime int64, data []byte, err error) {
+	if m.chunkIdx >= len(m.chunks) {
+		return nil, 0, 0, nil, fmt.Errorf("no values in buffer")
 	}
-	s := "["
-	for i, e := range m.heap.entries {
-		if i > 0 {
-			s += ", "
-		}
-		s += fmt.Sprintf("{key=%s ts=%d fIdx=%d valType=%T}", e.key, e.timestamp, e.fileIdx, e.value)
+
+	// Copy key into reusable buffer
+	if cap(m.keyBuf) < len(m.blockKey) {
+		m.keyBuf = make([]byte, len(m.blockKey))
+	} else {
+		m.keyBuf = m.keyBuf[:len(m.blockKey)]
 	}
-	s += "]"
-	return s
+	copy(m.keyBuf, m.blockKey)
+	key = m.keyBuf
+
+	entry := &m.chunks[m.chunkIdx]
+	m.chunkIdx++
+
+	return key, entry.minTime, entry.maxTime, entry.data, nil
+}
+
+// Close closes all underlying iterators and releases resources.
+func (m *KeyAwareMergingIterator) Close() error {
+	if m.closed {
+		return nil
+	}
+	m.closed = true
+	m.exhausted = true
+	for _, iter := range m.iterators {
+		iter.Close()
+	}
+	m.iterators = nil
+	m.chunks = nil
+	m.keyBlocks = nil
+	m.mergedFloat = tsdb.FloatArray{}
+	m.mergedInteger = tsdb.IntegerArray{}
+	m.mergedUnsigned = tsdb.UnsignedArray{}
+	m.mergedBoolean = tsdb.BooleanArray{}
+	m.mergedString = tsdb.StringArray{}
+	return nil
+}
+
+// Err returns any error encountered during iteration.
+func (m *KeyAwareMergingIterator) Err() error {
+	return m.err
+}
+
+// EstimatedIndexSize returns the estimated index size.
+func (m *KeyAwareMergingIterator) EstimatedIndexSize() int {
+	return m.estimatedIndexSize
 }
 
 // interrupted returns true if the interrupt channel has been closed.
@@ -496,92 +358,9 @@ func (m *KeyAwareMergingIterator) interrupted() bool {
 	}
 }
 
-// Read returns the current block's key, time range, and encoded data.
-func (m *KeyAwareMergingIterator) Read() (key []byte, minTime int64, maxTime int64, data []byte, err error) {
-	if len(m.buf) == 0 {
-		return nil, 0, 0, nil, fmt.Errorf("no values in buffer")
-	}
-
-	// Return the key that was set when this block was started
-	// (m.blockKey tracks the key for the current block being returned)
-	if cap(m.keyBuf) < len(m.blockKey) {
-		m.keyBuf = make([]byte, len(m.blockKey))
-	} else {
-		m.keyBuf = m.keyBuf[:len(m.blockKey)]
-	}
-	copy(m.keyBuf, m.blockKey)
-	key = m.keyBuf
-
-	// Sort buffer by timestamp before encoding. The heap merge can produce
-	// unsorted output when an iterator advances across block boundaries
-	// (NextBlock) and pushes a value with an earlier timestamp than values
-	// already popped from other iterators.
-	sort.Slice(m.buf, func(i, j int) bool {
-		return m.buf[i].UnixNano() < m.buf[j].UnixNano()
-	})
-
-	minTime = m.buf[0].UnixNano()
-	maxTime = m.buf[len(m.buf)-1].UnixNano()
-
-	data, err = m.encodeValues(m.currentType, m.buf)
-	if err != nil {
-		// Log full diagnostic on type mismatch
-		typeMap := make(map[string]int)
-		for _, v := range m.buf {
-			typeMap[fmt.Sprintf("%T", v)]++
-		}
-		log.Printf("[stream-iter] *** TYPE MISMATCH in Read() *** key=%s currentType=%d(%s) bufLen=%d types=%v err=%v heap=%s",
-			m.blockKey, m.currentType, blockTypeName(m.currentType), len(m.buf), typeMap, err, m.heapDump())
-		return nil, 0, 0, nil, err
-	}
-
-	// If all values were skipped due to type mismatch, data is nil.
-	// Return nil data without error — the caller should skip this block.
-	if data == nil {
-		return nil, 0, 0, nil, nil
-	}
-
-	// Nil-fy buffer elements to break references to StringValue and other
-	// reference-type values, allowing GC to reclaim the underlying data.
-	for i := range m.buf {
-		m.buf[i] = nil
-	}
-	m.buf = m.buf[:0]
-
-	return key, minTime, maxTime, data, nil
-}
-
-// Close closes all underlying iterators and releases resources.
-func (m *KeyAwareMergingIterator) Close() error {
-	if m.closed {
-		return nil
-	}
-	m.closed = true
-	m.exhausted = true
-	for _, iter := range m.iterators {
-		iter.Close()
-	}
-	m.iterators = nil
-	m.buf = nil
-	m.heap.entries = nil
-	return nil
-}
-
-// Err returns any error encountered during iteration.
-func (m *KeyAwareMergingIterator) Err() error {
-	return m.err
-}
-
-// EstimatedIndexSize returns the estimated index size.
-func (m *KeyAwareMergingIterator) EstimatedIndexSize() int {
-	return m.estimatedIndexSize
-}
-
 // initIterators initializes all iterators and finds the first key.
 func (m *KeyAwareMergingIterator) initIterators() bool {
-	// Initialize all iterators that haven't been initialized yet
 	for _, iter := range m.iterators {
-		// Skip if already initialized
 		if iter.initialized {
 			continue
 		}
@@ -590,400 +369,440 @@ func (m *KeyAwareMergingIterator) initIterators() bool {
 				m.err = iter.Err()
 				return false
 			}
-			// Iterator has no blocks, skip it
 		}
 	}
 
-	// Find minimum key and activate matching iterators
 	minKey := m.findMinKey()
 	if minKey == nil {
 		return false
 	}
 
-	m.currentKey = minKey
-	// Initialize blockKey for first block
-	m.blockKey = minKey
+	m.currentKey = append(m.currentKey[:0], minKey...)
+	m.blockKey = append(m.blockKey[:0], minKey...)
 	m.currentType = blockTypeUnset
-	m.activateIteratorsForKey(minKey)
 	return true
 }
 
 // findMinKey scans all iterators and returns the lexicographically smallest key.
-// It considers both the current key and any pending (next) key from NextBlock.
-// Exhausted iterators are skipped.
 func (m *KeyAwareMergingIterator) findMinKey() []byte {
 	var minKey []byte
 	for _, iter := range m.iterators {
-		if iter.Err() != nil {
-			continue
-		}
-		// Skip exhausted iterators
-		if iter.exhausted {
+		if iter.Err() != nil || iter.exhausted {
 			continue
 		}
 		key := iter.Key()
 		if key == nil {
 			continue
 		}
-		if minKey == nil {
-			minKey = append([]byte(nil), key...)
-		} else if bytes.Compare(key, minKey) < 0 {
-			minKey = append([]byte(nil), key...)
+		if minKey == nil || bytes.Compare(key, minKey) < 0 {
+			minKey = append(minKey[:0], key...)
 		}
 	}
 	return minKey
 }
 
-// activateIteratorsForKey activates all iterators whose current key matches
-// the given key. For each matching iterator, it skips tombstoned blocks until
-// a valid value is found, then pushes it to the heap.
-func (m *KeyAwareMergingIterator) activateIteratorsForKey(key []byte) {
-	for _, iter := range m.iterators {
-		if iter.Err() != nil {
-			continue
-		}
-
-		// Check if iterator has pending block for target key
-		if iter.hasNextBlock && bytes.Equal(iter.nextKey, key) {
-			if !iter.ActivatePending() {
-				if iter.Err() != nil {
-					m.err = iter.Err()
-				}
-				continue
-			}
-		}
-
-		// Check if iterator is already on target key
-		if bytes.Equal(iter.Key(), key) {
-			m.activateIteratorForBlock(iter, key)
-			continue
-		}
-
-		// Iterator is on a different key - try to advance to next block
-		if !iter.NextBlock() {
-			if iter.hasNextBlock && bytes.Equal(iter.nextKey, key) {
-				if !iter.ActivatePending() {
-					if iter.Err() != nil {
-						m.err = iter.Err()
-					}
-				} else {
-					m.activateIteratorForBlock(iter, key)
-				}
-			}
-			continue
-		}
-
-		// Now check if we reached target key
-		if bytes.Equal(iter.Key(), key) {
-			m.activateIteratorForBlock(iter, key)
-		}
-	}
-}
-
-// activateIteratorForBlock pushes the first valid value from the iterator's
-// current block into the heap. If the block is fully tombstoned, it advances
-// to the next block for the same key.
-func (m *KeyAwareMergingIterator) activateIteratorForBlock(iter *BlockValueIterator, targetKey []byte) {
-	for {
-		if iter.Next() {
-			v := iter.Read()
-			entry := &valueEntry{
-				value:     v,
-				iterator:  iter,
-				key:       append([]byte(nil), iter.currentKey...),
-				timestamp: v.UnixNano(),
-				fileIdx:   iter.FileIdx(),
-			}
-			heap.Push(&m.heap, entry)
-			return
-		}
-
-		// Current block exhausted, try next block
-		if !iter.NextBlock() {
-			// If there's a pending block for target key, activate it
-			if iter.hasNextBlock && bytes.Equal(iter.nextKey, targetKey) {
-				if !iter.ActivatePending() {
-					if iter.Err() != nil {
-						m.err = iter.Err()
-					}
-					return
-				}
-				// Now on target key, continue to push value
-				continue
-			}
-			return
-		}
-
-		// Check if key changed
-		if !bytes.Equal(iter.Key(), targetKey) {
-			return
-		}
-		// Same key, new block - continue loop to call Next() again
-	}
-}
-
-// popAndDedup pops the top entry for the current key and consumes all
-// same-timestamp entries for the same key, keeping the value from the
-// highest fileIdx. Stale entries from different keys are discarded after
-// advancing their iterators so the consumed value is not re-pushed.
-// The winner's iterator is advanced after dedup completes to prevent
-// cross-key value mixing in the heap during the dedup loop.
-func (m *KeyAwareMergingIterator) popAndDedup() *valueEntry {
-	for m.heap.Len() > 0 {
-		top := heap.Pop(&m.heap).(*valueEntry)
-
-		// Discard stale entries from previous keys and advance their
-		// iterators so the consumed value is not re-pushed when
-		// moveToNextKey re-activates the iterator.
-		if !bytes.Equal(top.key, m.currentKey) {
-			m.advanceOnly(top.iterator)
-			continue
-		}
-
-		// Collect losers for deferred advancement
-		var losers []*valueEntry
-
-		// Consume all same-timestamp entries for the same key
-		for m.heap.Len() > 0 {
-			next := m.heap.Peek()
-			if next.timestamp != top.timestamp {
-				break
-			}
-			if !bytes.Equal(next.key, top.key) {
-				break
-			}
-			popped := heap.Pop(&m.heap).(*valueEntry)
-
-			// Newer file wins (higher fileIdx)
-			if popped.fileIdx > top.fileIdx {
-				losers = append(losers, top)
-				top = popped
-			} else {
-				losers = append(losers, popped)
-			}
-		}
-
-		// Advance losers' iterators and push their next values if still on the same key
-		for _, loser := range losers {
-			m.advanceAndPush(loser.iterator)
-		}
-
-		// Advance winner's iterator last
-		m.advanceAndPush(top.iterator)
-
-		return top
-	}
-
-	return nil
-}
-
-// advanceAndPush advances the iterator and pushes the next valid value to the heap.
-// It loops through blocks for the same key until a non-tombstoned value is found,
-// the key changes, or the iterator is exhausted.
-func (m *KeyAwareMergingIterator) advanceAndPush(iter *BlockValueIterator) {
-	if iter.Next() {
-		v := iter.Read()
-		entry := &valueEntry{
-			value:     v,
-			iterator:  iter,
-			key:       append([]byte(nil), iter.currentKey...),
-			timestamp: v.UnixNano(),
-			fileIdx:   iter.FileIdx(),
-		}
-		heap.Push(&m.heap, entry)
-		return
-	}
-
-	// Current block exhausted - call NextBlock() to pre-fetch next key's block
-	// This populates hasNextBlock/nextKey for the next key transition
-	if iter.NextBlock() {
-		// Same key, new block - get next value
-		if iter.Next() {
-			v := iter.Read()
-			entry := &valueEntry{
-				value:     v,
-				iterator:  iter,
-				key:       append([]byte(nil), iter.currentKey...),
-				timestamp: v.UnixNano(),
-				fileIdx:   iter.FileIdx(),
-			}
-			heap.Push(&m.heap, entry)
-			return
-		}
-		// Fall through - block exhausted or all tombstoned
-	}
-	// Either key changed (hasNextBlock now set) or iterator exhausted
-	iter.exhausted = true
-}
-
-// advanceOnly advances the iterator by one value WITHOUT pushing to the heap.
-// Used when discarding stale entries from popAndDedup or Next() key check,
-// so the consumed value is not re-pushed when the iterator is re-activated.
-func (m *KeyAwareMergingIterator) advanceOnly(iter *BlockValueIterator) {
-	if iter.Next() {
-		return
-	}
-	// Current block exhausted — pre-fetch next block
-	if iter.NextBlock() {
-		return
-	}
-	// Key changed (hasNextBlock now set) or iterator exhausted
-	iter.exhausted = true
-}
-
 // moveToNextKey moves to the next key after the current one is exhausted.
 func (m *KeyAwareMergingIterator) moveToNextKey() bool {
-	// First, activate ALL pending blocks for all iterators.
-	// This ensures all iterators are at their next keys before we determine
-	// the minimum key to process.
+	// Activate all pending blocks first
 	for _, iter := range m.iterators {
 		if iter.Err() != nil {
 			continue
 		}
-		if iter.hasNextBlock && len(iter.nextKey) > 0 {
+		if iter.hasNext {
 			if !iter.ActivatePending() {
 				if iter.Err() != nil {
 					m.err = iter.Err()
 				}
 			} else {
-				// Successfully activated a pending block - iterator is no longer exhausted
 				iter.exhausted = false
 			}
 		}
 	}
 
-	// Now find minimum key among all iterators
 	minKey := m.findMinKey()
 	if minKey == nil {
 		return false
 	}
 
-	// Set currentKey and activate iterators for minKey
-	m.currentKey = minKey
+	m.currentKey = append(m.currentKey[:0], minKey...)
+	m.blockKey = append(m.blockKey[:0], minKey...)
 	m.currentType = blockTypeUnset
-	m.activateIteratorsForKey(minKey)
 	return true
 }
 
-// encodeValues encodes a slice of values into a TSM block.
-// On type mismatch, the mismatched value is skipped and the error is recorded
-// in m.err. This prevents a single corrupted value from aborting compaction.
-func (m *KeyAwareMergingIterator) encodeValues(typ byte, values []Value) ([]byte, error) {
-	switch typ {
-	case BlockFloat64:
-		if m.floatArr == nil {
-			m.floatArr = &tsdb.FloatArray{}
+// processCurrentKey collects all blocks for the current key from all readers,
+// decodes them into typed arrays, applies tombstones, merges, and chunks.
+func (m *KeyAwareMergingIterator) processCurrentKey() {
+	m.keyBlocks = m.keyBlocks[:0]
+
+	// Phase 1: Collect all blocks for the current key from all readers
+	for _, iter := range m.iterators {
+		if iter.Err() != nil || iter.exhausted {
+			continue
 		}
-		arr := m.floatArr
-		arr.Timestamps = arr.Timestamps[:0]
-		arr.Values = arr.Values[:0]
-		for _, v := range values {
-			fv, ok := v.(FloatValue)
-			if !ok {
-				m.err = fmt.Errorf("type mismatch: expected FloatValue, got %T for key %s", v, m.blockKey)
+
+		// Check if iterator is on the target key
+		if !bytes.Equal(iter.Key(), m.currentKey) {
+			// Try pending block
+			if iter.hasNext && bytes.Equal(iter.nextKey, m.currentKey) {
+				if !iter.ActivatePending() {
+					if iter.Err() != nil {
+						m.err = iter.Err()
+					}
+					continue
+				}
+			} else {
 				continue
 			}
-			arr.Timestamps = append(arr.Timestamps, v.UnixNano())
-			arr.Values = append(arr.Values, fv.value)
 		}
-		if arr.Len() == 0 {
-			return nil, nil
-		}
-		return EncodeFloatArrayBlock(arr, nil)
 
-	case BlockInteger:
-		if m.integerArr == nil {
-			m.integerArr = &tsdb.IntegerArray{}
-		}
-		arr := m.integerArr
-		arr.Timestamps = arr.Timestamps[:0]
-		arr.Values = arr.Values[:0]
-		for _, v := range values {
-			iv, ok := v.(IntegerValue)
-			if !ok {
-				m.err = fmt.Errorf("type mismatch: expected IntegerValue, got %T for key %s", v, m.blockKey)
-				continue
+		// Collect all blocks for this key from this iterator
+		for {
+			tombstones := iter.TombstoneRange(m.currentKey)
+			m.keyBlocks = append(m.keyBlocks, rawBlockEntry{
+				rawBlock:   iter.RawBlock(),
+				typ:        iter.Type(),
+				tombstones: tombstones,
+			})
+
+			if !iter.NextBlock() {
+				// Key changed or exhausted - hasNext is set if key changed
+				break
 			}
-			arr.Timestamps = append(arr.Timestamps, v.UnixNano())
-			arr.Values = append(arr.Values, iv.value)
+			// Same key, more blocks - continue collecting
 		}
-		if arr.Len() == 0 {
-			return nil, nil
-		}
-		return EncodeIntegerArrayBlock(arr, nil)
+	}
 
-	case BlockUnsigned:
-		if m.unsignedArr == nil {
-			m.unsignedArr = &tsdb.UnsignedArray{}
-		}
-		arr := m.unsignedArr
-		arr.Timestamps = arr.Timestamps[:0]
-		arr.Values = arr.Values[:0]
-		for _, v := range values {
-			uv, ok := v.(UnsignedValue)
-			if !ok {
-				m.err = fmt.Errorf("type mismatch: expected UnsignedValue, got %T for key %s", v, m.blockKey)
-				continue
+	if len(m.keyBlocks) == 0 {
+		return
+	}
+
+	// Phase 2: Set currentType from first block
+	if m.currentType == blockTypeUnset {
+		m.currentType = m.keyBlocks[0].typ
+	}
+
+	// Phase 3: Decode, apply tombstones, and merge
+	m.decodeAndMerge()
+	if m.err != nil {
+		return
+	}
+
+	// Phase 4: Chunk the merged array into encoded blocks
+	m.chunkMergedArray()
+}
+
+// decodeAndMerge decodes all collected blocks into typed arrays, applies
+// tombstones, and merges them.
+func (m *KeyAwareMergingIterator) decodeAndMerge() {
+	// Reset merged arrays
+	m.mergedFloat = tsdb.FloatArray{}
+	m.mergedInteger = tsdb.IntegerArray{}
+	m.mergedUnsigned = tsdb.UnsignedArray{}
+	m.mergedBoolean = tsdb.BooleanArray{}
+	m.mergedString = tsdb.StringArray{}
+
+	for _, entry := range m.keyBlocks {
+		raw := entry.rawBlock
+		typ := entry.typ
+
+		switch typ {
+		case BlockFloat64:
+			v := &tsdb.FloatArray{}
+			if err := DecodeFloatArrayBlock(raw, v); err != nil {
+				m.err = fmt.Errorf("decode error: float key=%s: %v", m.currentKey, err)
+				return
 			}
-			arr.Timestamps = append(arr.Timestamps, v.UnixNano())
-			arr.Values = append(arr.Values, uv.value)
-		}
-		if arr.Len() == 0 {
-			return nil, nil
-		}
-		return EncodeUnsignedArrayBlock(arr, nil)
-
-	case BlockBoolean:
-		if m.booleanArr == nil {
-			m.booleanArr = &tsdb.BooleanArray{}
-		}
-		arr := m.booleanArr
-		arr.Timestamps = arr.Timestamps[:0]
-		arr.Values = arr.Values[:0]
-		for _, v := range values {
-			bv, ok := v.(BooleanValue)
-			if !ok {
-				m.err = fmt.Errorf("type mismatch: expected BooleanValue, got %T for key %s", v, m.blockKey)
-				continue
+			for _, ts := range entry.tombstones {
+				v.Exclude(ts.Min, ts.Max)
 			}
-			arr.Timestamps = append(arr.Timestamps, v.UnixNano())
-			arr.Values = append(arr.Values, bv.value)
-		}
-		if arr.Len() == 0 {
-			return nil, nil
-		}
-		return EncodeBooleanArrayBlock(arr, nil)
-
-	case BlockString:
-		if m.stringArr == nil {
-			m.stringArr = &tsdb.StringArray{}
-		}
-		arr := m.stringArr
-		arr.Timestamps = arr.Timestamps[:0]
-		arr.Values = arr.Values[:0]
-		for _, v := range values {
-			sv, ok := v.(StringValue)
-			if !ok {
-				m.err = fmt.Errorf("type mismatch: expected StringValue, got %T for key %s", v, m.blockKey)
-				continue
+			if v.Len() > 0 {
+				if m.mergedFloat.Len() == 0 {
+					m.mergedFloat.Timestamps = append(m.mergedFloat.Timestamps[:0], v.Timestamps...)
+					m.mergedFloat.Values = append(m.mergedFloat.Values[:0], v.Values...)
+				} else {
+					m.mergedFloat.Merge(v)
+				}
 			}
-			arr.Timestamps = append(arr.Timestamps, v.UnixNano())
-			arr.Values = append(arr.Values, sv.value)
-		}
-		if arr.Len() == 0 {
-			return nil, nil
-		}
-		return EncodeStringArrayBlock(arr, nil)
 
-	default:
-		return nil, fmt.Errorf("unknown block type: %d", typ)
+		case BlockInteger:
+			v := &tsdb.IntegerArray{}
+			if err := DecodeIntegerArrayBlock(raw, v); err != nil {
+				m.err = fmt.Errorf("decode error: integer key=%s: %v", m.currentKey, err)
+				return
+			}
+			for _, ts := range entry.tombstones {
+				v.Exclude(ts.Min, ts.Max)
+			}
+			if v.Len() > 0 {
+				if m.mergedInteger.Len() == 0 {
+					m.mergedInteger.Timestamps = append(m.mergedInteger.Timestamps[:0], v.Timestamps...)
+					m.mergedInteger.Values = append(m.mergedInteger.Values[:0], v.Values...)
+				} else {
+					m.mergedInteger.Merge(v)
+				}
+			}
+
+		case BlockUnsigned:
+			v := &tsdb.UnsignedArray{}
+			if err := DecodeUnsignedArrayBlock(raw, v); err != nil {
+				m.err = fmt.Errorf("decode error: unsigned key=%s: %v", m.currentKey, err)
+				return
+			}
+			for _, ts := range entry.tombstones {
+				v.Exclude(ts.Min, ts.Max)
+			}
+			if v.Len() > 0 {
+				if m.mergedUnsigned.Len() == 0 {
+					m.mergedUnsigned.Timestamps = append(m.mergedUnsigned.Timestamps[:0], v.Timestamps...)
+					m.mergedUnsigned.Values = append(m.mergedUnsigned.Values[:0], v.Values...)
+				} else {
+					m.mergedUnsigned.Merge(v)
+				}
+			}
+
+		case BlockBoolean:
+			v := &tsdb.BooleanArray{}
+			if err := DecodeBooleanArrayBlock(raw, v); err != nil {
+				m.err = fmt.Errorf("decode error: boolean key=%s: %v", m.currentKey, err)
+				return
+			}
+			for _, ts := range entry.tombstones {
+				v.Exclude(ts.Min, ts.Max)
+			}
+			if v.Len() > 0 {
+				if m.mergedBoolean.Len() == 0 {
+					m.mergedBoolean.Timestamps = append(m.mergedBoolean.Timestamps[:0], v.Timestamps...)
+					m.mergedBoolean.Values = append(m.mergedBoolean.Values[:0], v.Values...)
+				} else {
+					m.mergedBoolean.Merge(v)
+				}
+			}
+
+		case BlockString:
+			v := &tsdb.StringArray{}
+			if err := DecodeStringArrayBlock(raw, v); err != nil {
+				m.err = fmt.Errorf("decode error: string key=%s: %v", m.currentKey, err)
+				return
+			}
+			for _, ts := range entry.tombstones {
+				v.Exclude(ts.Min, ts.Max)
+			}
+			if v.Len() > 0 {
+				if m.mergedString.Len() == 0 {
+					m.mergedString.Timestamps = append(m.mergedString.Timestamps[:0], v.Timestamps...)
+					m.mergedString.Values = append(m.mergedString.Values[:0], v.Values...)
+				} else {
+					m.mergedString.Merge(v)
+				}
+			}
+
+		default:
+			m.err = fmt.Errorf("unknown block type: %d for key %s", typ, m.currentKey)
+			return
+		}
 	}
 }
 
+// chunkMergedArray splits the merged typed array into encoded blocks of at most
+// bufSize values each.
+func (m *KeyAwareMergingIterator) chunkMergedArray() {
+	m.chunks = nil
+
+	switch m.currentType {
+	case BlockFloat64:
+		m.chunkFloat()
+	case BlockInteger:
+		m.chunkInteger()
+	case BlockUnsigned:
+		m.chunkUnsigned()
+	case BlockBoolean:
+		m.chunkBoolean()
+	case BlockString:
+		m.chunkString()
+	}
+}
+
+func (m *KeyAwareMergingIterator) chunkFloat() {
+	arr := &m.mergedFloat
+	for arr.Len() > 0 {
+		sz := m.bufSize
+		if sz > arr.Len() {
+			sz = arr.Len()
+		}
+
+		// Capture time range before encoding — EncodeFloatArrayBlock mutates
+		// timestamps in-place (converts to deltas).
+		minTime := arr.Timestamps[0]
+		maxTime := arr.Timestamps[sz-1]
+
+		enc := tsdb.FloatArray{
+			Timestamps: arr.Timestamps[:sz],
+			Values:     arr.Values[:sz],
+		}
+
+		data, err := EncodeFloatArrayBlock(&enc, nil)
+		if err != nil {
+			m.err = fmt.Errorf("encode error: float key=%s: %v", m.currentKey, err)
+			return
+		}
+		if data != nil {
+			m.chunks = append(m.chunks, chunkEntry{
+				data:    data,
+				minTime: minTime,
+				maxTime: maxTime,
+			})
+		}
+
+		arr.Timestamps = arr.Timestamps[sz:]
+		arr.Values = arr.Values[sz:]
+	}
+	// Reset merged array for GC
+	m.mergedFloat = tsdb.FloatArray{}
+}
+
+func (m *KeyAwareMergingIterator) chunkInteger() {
+	arr := &m.mergedInteger
+	for arr.Len() > 0 {
+		sz := m.bufSize
+		if sz > arr.Len() {
+			sz = arr.Len()
+		}
+
+		minTime := arr.Timestamps[0]
+		maxTime := arr.Timestamps[sz-1]
+
+		enc := tsdb.IntegerArray{
+			Timestamps: arr.Timestamps[:sz],
+			Values:     arr.Values[:sz],
+		}
+
+		data, err := EncodeIntegerArrayBlock(&enc, nil)
+		if err != nil {
+			m.err = fmt.Errorf("encode error: integer key=%s: %v", m.currentKey, err)
+			return
+		}
+		if data != nil {
+			m.chunks = append(m.chunks, chunkEntry{
+				data:    data,
+				minTime: minTime,
+				maxTime: maxTime,
+			})
+		}
+
+		arr.Timestamps = arr.Timestamps[sz:]
+		arr.Values = arr.Values[sz:]
+	}
+	m.mergedInteger = tsdb.IntegerArray{}
+}
+
+func (m *KeyAwareMergingIterator) chunkUnsigned() {
+	arr := &m.mergedUnsigned
+	for arr.Len() > 0 {
+		sz := m.bufSize
+		if sz > arr.Len() {
+			sz = arr.Len()
+		}
+
+		minTime := arr.Timestamps[0]
+		maxTime := arr.Timestamps[sz-1]
+
+		enc := tsdb.UnsignedArray{
+			Timestamps: arr.Timestamps[:sz],
+			Values:     arr.Values[:sz],
+		}
+
+		data, err := EncodeUnsignedArrayBlock(&enc, nil)
+		if err != nil {
+			m.err = fmt.Errorf("encode error: unsigned key=%s: %v", m.currentKey, err)
+			return
+		}
+		if data != nil {
+			m.chunks = append(m.chunks, chunkEntry{
+				data:    data,
+				minTime: minTime,
+				maxTime: maxTime,
+			})
+		}
+
+		arr.Timestamps = arr.Timestamps[sz:]
+		arr.Values = arr.Values[sz:]
+	}
+	m.mergedUnsigned = tsdb.UnsignedArray{}
+}
+
+func (m *KeyAwareMergingIterator) chunkBoolean() {
+	arr := &m.mergedBoolean
+	for arr.Len() > 0 {
+		sz := m.bufSize
+		if sz > arr.Len() {
+			sz = arr.Len()
+		}
+
+		minTime := arr.Timestamps[0]
+		maxTime := arr.Timestamps[sz-1]
+
+		enc := tsdb.BooleanArray{
+			Timestamps: arr.Timestamps[:sz],
+			Values:     arr.Values[:sz],
+		}
+
+		data, err := EncodeBooleanArrayBlock(&enc, nil)
+		if err != nil {
+			m.err = fmt.Errorf("encode error: boolean key=%s: %v", m.currentKey, err)
+			return
+		}
+		if data != nil {
+			m.chunks = append(m.chunks, chunkEntry{
+				data:    data,
+				minTime: minTime,
+				maxTime: maxTime,
+			})
+		}
+
+		arr.Timestamps = arr.Timestamps[sz:]
+		arr.Values = arr.Values[sz:]
+	}
+	m.mergedBoolean = tsdb.BooleanArray{}
+}
+
+func (m *KeyAwareMergingIterator) chunkString() {
+	arr := &m.mergedString
+	for arr.Len() > 0 {
+		sz := m.bufSize
+		if sz > arr.Len() {
+			sz = arr.Len()
+		}
+
+		minTime := arr.Timestamps[0]
+		maxTime := arr.Timestamps[sz-1]
+
+		enc := tsdb.StringArray{
+			Timestamps: arr.Timestamps[:sz],
+			Values:     arr.Values[:sz],
+		}
+
+		data, err := EncodeStringArrayBlock(&enc, nil)
+		if err != nil {
+			m.err = fmt.Errorf("encode error: string key=%s: %v", m.currentKey, err)
+			return
+		}
+		if data != nil {
+			m.chunks = append(m.chunks, chunkEntry{
+				data:    data,
+				minTime: minTime,
+				maxTime: maxTime,
+			})
+		}
+
+		arr.Timestamps = arr.Timestamps[sz:]
+		arr.Values = arr.Values[sz:]
+	}
+	m.mergedString = tsdb.StringArray{}
+}
+
 // NewStreamingKeyIterator creates a new KeyIterator that uses the streaming
-// merge approach for full compaction. This is the entry point for integrating
-// with the Compactor. interrupt is an optional channel for cancellation;
-// closing it will cause iteration to stop with an error. Pass nil to disable.
+// merge approach for full compaction.
 func NewStreamingKeyIterator(tsmFiles []string, readers []*TSMReader, size int, interrupt chan struct{}) KeyIterator {
 	iters := make([]*BlockValueIterator, len(readers))
 	for i, r := range readers {
@@ -1025,13 +844,10 @@ func (s *streamingKeyIterator) Next() bool {
 			return false
 		}
 
-		// Skip blocks where all values were skipped due to type mismatch
 		if data == nil {
 			continue
 		}
 
-		// Copy key into our own buffer. The merge iterator reuses its
-		// keyBuf on each Read(), so we need an independent copy.
 		if cap(s.keyBuf) < len(key) {
 			s.keyBuf = make([]byte, len(key))
 		} else {

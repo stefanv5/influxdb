@@ -955,6 +955,7 @@ func (c *Compactor) compact(fast bool, tsmFiles []string) ([]string, error) {
 	} else {
 		tsm = NewStreamingKeyIterator(tsmFiles, trs, size, intC)
 	}
+	defer tsm.Close()
 
 	return c.writeNewFiles(maxGeneration, maxSequence, tsmFiles, tsm, true)
 }
