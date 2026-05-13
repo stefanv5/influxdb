@@ -197,6 +197,11 @@ func (it *BlockValueIterator) TombstoneRange(key []byte) []TimeRange {
 	return it.r.TombstoneRange(key)
 }
 
+// Reader returns the underlying TSMReader.
+func (it *BlockValueIterator) Reader() *TSMReader {
+	return it.r
+}
+
 // Close releases resources held by this iterator.
 func (it *BlockValueIterator) Close() {
 	if it.exhausted {
@@ -255,8 +260,7 @@ type KeyAwareMergingIterator struct {
 	// Interrupt channel for cancellation
 	interrupt chan struct{}
 
-	estimatedIndexSize int
-	bufSize            int
+	bufSize int
 }
 
 // NewKeyAwareMergingIterator creates a new overlap-aware merge iterator.
@@ -361,9 +365,13 @@ func (m *KeyAwareMergingIterator) Err() error {
 	return m.err
 }
 
-// EstimatedIndexSize returns the estimated index size.
+// EstimatedIndexSize returns the estimated index size based on the input readers.
 func (m *KeyAwareMergingIterator) EstimatedIndexSize() int {
-	return m.estimatedIndexSize
+	var size uint32
+	for _, iter := range m.iterators {
+		size += iter.Reader().IndexSize()
+	}
+	return int(size) / len(m.iterators)
 }
 
 // interrupted returns true if the interrupt channel has been closed.
