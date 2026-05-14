@@ -19,7 +19,27 @@ type streamBlock struct {
 	b                      []byte
 	tombstones             []TimeRange
 	readMin, readMax       int64
+	fileIdx                int // source file index, -1 = not poolable
 }
+
+// maxPoolPerFile caps the per-file block pool to prevent unbounded growth.
+// Matches the batch path's k.buf[i] which holds ~1-5 blocks per file per key.
+const maxPoolPerFile = 8
+
+// outputBlock is a lightweight struct for the output pipeline.
+// It holds only what the TSM writer needs, decoupling the streamBlock
+// lifecycle from the chunks slice so streamBlocks can be pooled immediately.
+type outputBlock struct {
+	key              []byte
+	minTime, maxTime int64
+	b                []byte
+}
+
+type outputBlocks []outputBlock
+
+func (a outputBlocks) Len() int           { return len(a) }
+func (a outputBlocks) Less(i, j int) bool { return a[i].minTime < a[j].minTime }
+func (a outputBlocks) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 
 func (bl *streamBlock) overlapsTimeRange(min, max int64) bool {
 	return bl.minTime <= max && bl.maxTime >= min
@@ -234,14 +254,20 @@ type KeyAwareMergingIterator struct {
 	// Per-file block buffers: buf[i] holds unread blocks from iterators[i]
 	buf [][]*streamBlock
 
+	// Per-file reusable block pool (capped at maxPoolPerFile)
+	blockPool [][]*streamBlock
+
 	// Collected blocks for current key (across all files)
 	blocks streamBlocks
 
 	// Pending blocks that may overlap with each other
 	pending streamBlocks
 
-	// Output chunks for current key (raw pass-through or encoded)
-	chunks   streamBlocks
+	// Raw non-overlapping blocks from readBlocksIncrementally (before conversion to outputBlock)
+	rawChunks streamBlocks
+
+	// Output chunks for current key (lightweight, decoupled from streamBlock lifecycle)
+	chunks   []outputBlock
 	chunkIdx int
 
 	// Merged typed arrays (for overlapping blocks, reused across keys)
@@ -266,6 +292,50 @@ type KeyAwareMergingIterator struct {
 	bufSize int
 }
 
+// getBlock returns a streamBlock from the per-file pool or allocates a new one.
+func (m *KeyAwareMergingIterator) getBlock(fileIdx int, typ byte) *streamBlock {
+	pool := m.blockPool[fileIdx]
+	if n := len(pool); n > 0 {
+		blk := pool[n-1]
+		m.blockPool[fileIdx] = pool[:n-1]
+		blk.typ = typ
+		blk.fileIdx = fileIdx
+		blk.readMin = math.MaxInt64
+		blk.readMax = math.MinInt64
+		blk.tombstones = blk.tombstones[:0]
+		return blk
+	}
+	return &streamBlock{
+		typ:     typ,
+		fileIdx: fileIdx,
+		readMin: math.MaxInt64,
+		readMax: math.MinInt64,
+	}
+}
+
+// returnBlock returns a single block to its per-file pool if under cap.
+func (m *KeyAwareMergingIterator) returnBlock(blk *streamBlock) {
+	fi := blk.fileIdx
+	if fi < 0 || fi >= len(m.blockPool) {
+		return
+	}
+	if len(m.blockPool[fi]) >= maxPoolPerFile {
+		return
+	}
+	blk.key = nil
+	blk.b = nil
+	m.blockPool[fi] = append(m.blockPool[fi], blk)
+}
+
+// returnBlocks returns all poolable blocks in the slice to their per-file pools.
+func (m *KeyAwareMergingIterator) returnBlocks(blocks streamBlocks) {
+	for _, blk := range blocks {
+		if blk != nil {
+			m.returnBlock(blk)
+		}
+	}
+}
+
 // NewKeyAwareMergingIterator creates a new overlap-aware merge iterator.
 func NewKeyAwareMergingIterator(iters []*BlockValueIterator, bufSize int, interrupt chan struct{}) *KeyAwareMergingIterator {
 	return &KeyAwareMergingIterator{
@@ -273,6 +343,7 @@ func NewKeyAwareMergingIterator(iters []*BlockValueIterator, bufSize int, interr
 		bufSize:   bufSize,
 		interrupt: interrupt,
 		buf:       make([][]*streamBlock, len(iters)),
+		blockPool: make([][]*streamBlock, len(iters)),
 	}
 }
 
@@ -302,7 +373,7 @@ func (m *KeyAwareMergingIterator) Next() bool {
 		return true
 	}
 
-	// Current key fully consumed, move to next key
+	// Current key fully consumed, outputBlocks are lightweight (no pool needed).
 	m.chunks = nil
 	m.chunkIdx = 0
 
@@ -353,8 +424,10 @@ func (m *KeyAwareMergingIterator) Close() error {
 	}
 	m.iterators = nil
 	m.buf = nil
+	m.blockPool = nil
 	m.blocks = nil
 	m.pending = nil
+	m.rawChunks = nil
 	m.chunks = nil
 	m.mergedFloat = tsdb.FloatArray{}
 	m.mergedInteger = tsdb.IntegerArray{}
@@ -495,7 +568,7 @@ func (m *KeyAwareMergingIterator) readBlocksIncrementally() {
 				blk := m.buf[i][0]
 				m.buf[i] = m.buf[i][1:]
 				if blk.minTime > maxTimeSeen {
-					m.chunks = append(m.chunks, blk)
+					m.rawChunks = append(m.rawChunks, blk)
 				} else {
 					m.pending = append(m.pending, blk)
 				}
@@ -532,19 +605,15 @@ func (m *KeyAwareMergingIterator) readBlocksIncrementally() {
 			blockKey := iter.Key()
 			for {
 				tombstones := iter.TombstoneRange(m.currentKey)
-				blk := &streamBlock{
-					key:        blockKey,
-					minTime:    iter.MinTime(),
-					maxTime:    iter.MaxTime(),
-					typ:        iter.Type(),
-					b:          iter.RawBlock(),
-					tombstones: tombstones,
-					readMin:    math.MaxInt64,
-					readMax:    math.MinInt64,
-				}
+				blk := m.getBlock(i, iter.Type())
+				blk.key = blockKey
+				blk.minTime = iter.MinTime()
+				blk.maxTime = iter.MaxTime()
+				blk.b = iter.RawBlock()
+				blk.tombstones = tombstones
 
 				if blk.minTime > maxTimeSeen {
-					m.chunks = append(m.chunks, blk)
+					m.rawChunks = append(m.rawChunks, blk)
 				} else {
 					m.pending = append(m.pending, blk)
 				}
@@ -577,51 +646,65 @@ func (m *KeyAwareMergingIterator) readBlocksIncrementally() {
 // maxTimeSeen tracking; only potentially overlapping blocks are buffered.
 func (m *KeyAwareMergingIterator) processCurrentKey() {
 	// Phase 1: Read blocks incrementally (round-robin across files).
-	// This populates m.chunks (non-overlapping) and m.pending (possibly overlapping).
+	// This populates m.rawChunks (non-overlapping streamBlocks) and m.pending (possibly overlapping).
 	m.readBlocksIncrementally()
 
 	// Set currentTyp from first available block
 	if m.currentTyp == blockTypeUnset {
-		if len(m.chunks) > 0 {
-			m.currentTyp = m.chunks[0].typ
+		if len(m.rawChunks) > 0 {
+			m.currentTyp = m.rawChunks[0].typ
 		} else if len(m.pending) > 0 {
 			m.currentTyp = m.pending[0].typ
 		}
 	}
 
-	// Phase 2: If no pending blocks and no tombstones, everything is non-overlapping
-	if len(m.pending) == 0 && !m.chunksHaveTombstones() {
-		// Mark all chunks as read
-		for _, blk := range m.chunks {
-			blk.markRead(blk.minTime, blk.maxTime)
+	// Phase 2: If no pending blocks and no tombstones, everything is non-overlapping.
+	// Convert rawChunks to outputBlocks and return streamBlocks to pool.
+	if len(m.pending) == 0 && !m.rawChunksHaveTombstones() {
+		m.chunks = m.chunks[:0]
+		for _, blk := range m.rawChunks {
+			m.chunks = append(m.chunks, outputBlock{key: blk.key, minTime: blk.minTime, maxTime: blk.maxTime, b: blk.b})
 		}
+		m.returnBlocks(m.rawChunks)
+		m.rawChunks = m.rawChunks[:0]
 		return
 	}
 
 	// Phase 3: Check if we need decode+merge
 	pendingNeedsDedup := m.pendingNeedsDedup()
-	chunkOverlap := m.pendingOverlapsChunks()
-	needMerge := pendingNeedsDedup || chunkOverlap || m.chunksHaveTombstones()
+	chunkOverlap := m.pendingOverlapsRawChunks()
+	needMerge := pendingNeedsDedup || chunkOverlap || m.rawChunksHaveTombstones()
 
 	if needMerge {
-		// Overlapping: decode ALL blocks (chunks + pending), merge, chunk
-		m.blocks = append(m.blocks[:0], m.chunks...)
+		// Overlapping: decode ALL blocks (rawChunks + pending), merge, chunk
+		m.blocks = append(m.blocks[:0], m.rawChunks...)
 		m.blocks = append(m.blocks, m.pending...)
-		m.chunks = m.chunks[:0]
+		m.pending = m.pending[:0]
+		m.rawChunks = m.rawChunks[:0]
 		m.decodeAndMerge()
 		if m.err != nil {
 			return
 		}
 		m.chunkMergedArray()
+		// Return decoded input blocks to pool
+		m.returnBlocks(m.blocks)
+		m.blocks = m.blocks[:0]
 	} else {
-		// Pending blocks don't overlap with anything: pass through as raw data
-		for _, blk := range m.pending {
-			blk.markRead(blk.minTime, blk.maxTime)
-			m.chunks = append(m.chunks, blk)
+		// Pending blocks don't overlap: pass through as raw data
+		m.chunks = m.chunks[:0]
+		for _, blk := range m.rawChunks {
+			m.chunks = append(m.chunks, outputBlock{key: blk.key, minTime: blk.minTime, maxTime: blk.maxTime, b: blk.b})
 		}
+		m.returnBlocks(m.rawChunks)
+		m.rawChunks = m.rawChunks[:0]
+		for _, blk := range m.pending {
+			m.chunks = append(m.chunks, outputBlock{key: blk.key, minTime: blk.minTime, maxTime: blk.maxTime, b: blk.b})
+		}
+		m.returnBlocks(m.pending)
+		m.pending = m.pending[:0]
 		// Sort chunks by minTime (round-robin reading may interleave blocks)
 		if len(m.chunks) > 1 {
-			sort.Stable(m.chunks)
+			sort.Stable(outputBlocks(m.chunks))
 		}
 	}
 }
@@ -645,17 +728,17 @@ func (m *KeyAwareMergingIterator) pendingNeedsDedup() bool {
 	return false
 }
 
-// pendingOverlapsChunks checks whether the earliest pending block overlaps
+// pendingOverlapsRawChunks checks whether the earliest pending block overlaps
 // with the latest chunk block. This catches the case where blocks from
 // different files have overlapping time ranges but were classified into
 // different buffers by the incremental maxTimeSeen tracking.
-func (m *KeyAwareMergingIterator) pendingOverlapsChunks() bool {
-	if len(m.chunks) == 0 || len(m.pending) == 0 {
+func (m *KeyAwareMergingIterator) pendingOverlapsRawChunks() bool {
+	if len(m.rawChunks) == 0 || len(m.pending) == 0 {
 		return false
 	}
-	// Find the max maxTime in chunks and min minTime in pending
+	// Find the max maxTime in rawChunks and min minTime in pending
 	var maxChunkTime int64
-	for _, blk := range m.chunks {
+	for _, blk := range m.rawChunks {
 		if blk.maxTime > maxChunkTime {
 			maxChunkTime = blk.maxTime
 		}
@@ -669,9 +752,9 @@ func (m *KeyAwareMergingIterator) pendingOverlapsChunks() bool {
 	return minPendingTime <= maxChunkTime
 }
 
-// chunksHaveTombstones checks whether any chunk block has tombstones.
-func (m *KeyAwareMergingIterator) chunksHaveTombstones() bool {
-	for _, blk := range m.chunks {
+// rawChunksHaveTombstones checks whether any raw chunk block has tombstones.
+func (m *KeyAwareMergingIterator) rawChunksHaveTombstones() bool {
+	for _, blk := range m.rawChunks {
 		if len(blk.tombstones) > 0 {
 			return true
 		}
@@ -682,11 +765,17 @@ func (m *KeyAwareMergingIterator) chunksHaveTombstones() bool {
 // decodeAndMerge decodes overlapping blocks into typed arrays, applies
 // tombstones, and merges them (same algorithm as tsmBatchKeyIterator).
 func (m *KeyAwareMergingIterator) decodeAndMerge() {
-	m.mergedFloat = tsdb.FloatArray{}
-	m.mergedInteger = tsdb.IntegerArray{}
-	m.mergedUnsigned = tsdb.UnsignedArray{}
-	m.mergedBoolean = tsdb.BooleanArray{}
-	m.mergedString = tsdb.StringArray{}
+	// Reset merged arrays while keeping backing capacity.
+	m.mergedFloat.Timestamps = m.mergedFloat.Timestamps[:0]
+	m.mergedFloat.Values = m.mergedFloat.Values[:0]
+	m.mergedInteger.Timestamps = m.mergedInteger.Timestamps[:0]
+	m.mergedInteger.Values = m.mergedInteger.Values[:0]
+	m.mergedUnsigned.Timestamps = m.mergedUnsigned.Timestamps[:0]
+	m.mergedUnsigned.Values = m.mergedUnsigned.Values[:0]
+	m.mergedBoolean.Timestamps = m.mergedBoolean.Timestamps[:0]
+	m.mergedBoolean.Values = m.mergedBoolean.Values[:0]
+	m.mergedString.Timestamps = m.mergedString.Timestamps[:0]
+	m.mergedString.Values = m.mergedString.Values[:0]
 
 	for _, blk := range m.blocks {
 		if blk.read() {
@@ -843,7 +932,7 @@ func (m *KeyAwareMergingIterator) chunkFloat() {
 				m.err = fmt.Errorf("encode error: float key=%s: %v", m.currentKey, err)
 				return
 			}
-			m.chunks = append(m.chunks, &streamBlock{
+			m.chunks = append(m.chunks, outputBlock{
 				key:     m.blockKey,
 				minTime: minTime,
 				maxTime: maxTime,
@@ -861,13 +950,14 @@ func (m *KeyAwareMergingIterator) chunkFloat() {
 			m.err = fmt.Errorf("encode error: float key=%s: %v", m.currentKey, err)
 			return
 		}
-		m.chunks = append(m.chunks, &streamBlock{
+		m.chunks = append(m.chunks, outputBlock{
 			key:     m.blockKey,
 			minTime: minTime,
 			maxTime: maxTime,
 			b:       cb,
 		})
-		m.mergedFloat = tsdb.FloatArray{}
+		m.mergedFloat.Timestamps = m.mergedFloat.Timestamps[:0]
+		m.mergedFloat.Values = m.mergedFloat.Values[:0]
 	}
 }
 
@@ -884,7 +974,7 @@ func (m *KeyAwareMergingIterator) chunkInteger() {
 				m.err = fmt.Errorf("encode error: integer key=%s: %v", m.currentKey, err)
 				return
 			}
-			m.chunks = append(m.chunks, &streamBlock{
+			m.chunks = append(m.chunks, outputBlock{
 				key:     m.blockKey,
 				minTime: minTime,
 				maxTime: maxTime,
@@ -902,13 +992,14 @@ func (m *KeyAwareMergingIterator) chunkInteger() {
 			m.err = fmt.Errorf("encode error: integer key=%s: %v", m.currentKey, err)
 			return
 		}
-		m.chunks = append(m.chunks, &streamBlock{
+		m.chunks = append(m.chunks, outputBlock{
 			key:     m.blockKey,
 			minTime: minTime,
 			maxTime: maxTime,
 			b:       cb,
 		})
-		m.mergedInteger = tsdb.IntegerArray{}
+		m.mergedInteger.Timestamps = m.mergedInteger.Timestamps[:0]
+		m.mergedInteger.Values = m.mergedInteger.Values[:0]
 	}
 }
 
@@ -925,7 +1016,7 @@ func (m *KeyAwareMergingIterator) chunkUnsigned() {
 				m.err = fmt.Errorf("encode error: unsigned key=%s: %v", m.currentKey, err)
 				return
 			}
-			m.chunks = append(m.chunks, &streamBlock{
+			m.chunks = append(m.chunks, outputBlock{
 				key:     m.blockKey,
 				minTime: minTime,
 				maxTime: maxTime,
@@ -943,13 +1034,14 @@ func (m *KeyAwareMergingIterator) chunkUnsigned() {
 			m.err = fmt.Errorf("encode error: unsigned key=%s: %v", m.currentKey, err)
 			return
 		}
-		m.chunks = append(m.chunks, &streamBlock{
+		m.chunks = append(m.chunks, outputBlock{
 			key:     m.blockKey,
 			minTime: minTime,
 			maxTime: maxTime,
 			b:       cb,
 		})
-		m.mergedUnsigned = tsdb.UnsignedArray{}
+		m.mergedUnsigned.Timestamps = m.mergedUnsigned.Timestamps[:0]
+		m.mergedUnsigned.Values = m.mergedUnsigned.Values[:0]
 	}
 }
 
@@ -966,7 +1058,7 @@ func (m *KeyAwareMergingIterator) chunkBoolean() {
 				m.err = fmt.Errorf("encode error: boolean key=%s: %v", m.currentKey, err)
 				return
 			}
-			m.chunks = append(m.chunks, &streamBlock{
+			m.chunks = append(m.chunks, outputBlock{
 				key:     m.blockKey,
 				minTime: minTime,
 				maxTime: maxTime,
@@ -984,13 +1076,14 @@ func (m *KeyAwareMergingIterator) chunkBoolean() {
 			m.err = fmt.Errorf("encode error: boolean key=%s: %v", m.currentKey, err)
 			return
 		}
-		m.chunks = append(m.chunks, &streamBlock{
+		m.chunks = append(m.chunks, outputBlock{
 			key:     m.blockKey,
 			minTime: minTime,
 			maxTime: maxTime,
 			b:       cb,
 		})
-		m.mergedBoolean = tsdb.BooleanArray{}
+		m.mergedBoolean.Timestamps = m.mergedBoolean.Timestamps[:0]
+		m.mergedBoolean.Values = m.mergedBoolean.Values[:0]
 	}
 }
 
@@ -1007,7 +1100,7 @@ func (m *KeyAwareMergingIterator) chunkString() {
 				m.err = fmt.Errorf("encode error: string key=%s: %v", m.currentKey, err)
 				return
 			}
-			m.chunks = append(m.chunks, &streamBlock{
+			m.chunks = append(m.chunks, outputBlock{
 				key:     m.blockKey,
 				minTime: minTime,
 				maxTime: maxTime,
@@ -1025,13 +1118,14 @@ func (m *KeyAwareMergingIterator) chunkString() {
 			m.err = fmt.Errorf("encode error: string key=%s: %v", m.currentKey, err)
 			return
 		}
-		m.chunks = append(m.chunks, &streamBlock{
+		m.chunks = append(m.chunks, outputBlock{
 			key:     m.blockKey,
 			minTime: minTime,
 			maxTime: maxTime,
 			b:       cb,
 		})
-		m.mergedString = tsdb.StringArray{}
+		m.mergedString.Timestamps = m.mergedString.Timestamps[:0]
+		m.mergedString.Values = m.mergedString.Values[:0]
 	}
 }
 
