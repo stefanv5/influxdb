@@ -237,6 +237,9 @@ type KeyAwareMergingIterator struct {
 	// Collected blocks for current key (across all files)
 	blocks streamBlocks
 
+	// Pending blocks that may overlap with each other
+	pending streamBlocks
+
 	// Output chunks for current key (raw pass-through or encoded)
 	chunks   streamBlocks
 	chunkIdx int
@@ -351,6 +354,7 @@ func (m *KeyAwareMergingIterator) Close() error {
 	m.iterators = nil
 	m.buf = nil
 	m.blocks = nil
+	m.pending = nil
 	m.chunks = nil
 	m.mergedFloat = tsdb.FloatArray{}
 	m.mergedInteger = tsdb.IntegerArray{}
@@ -460,113 +464,219 @@ func (m *KeyAwareMergingIterator) moveToNextKey() bool {
 	return true
 }
 
-// readBlocksForKey reads all blocks for the current key from each file into
-// m.blocks. For each file, it reads from the per-file buffer first, then from
-// the iterator until the key changes (similar to tsmBatchKeyIterator.Next inner loop).
-func (m *KeyAwareMergingIterator) readBlocksForKey() {
-	m.blocks = m.blocks[:0]
+// readBlocksIncrementally reads blocks for the current key one at a time
+// round-robin across files. It tracks maxTimeSeen to classify each block:
+//   - Non-overlapping (minTime > maxTimeSeen) → chunks (output immediately)
+//   - Possibly overlapping → pending (buffered for decode/merge)
+func (m *KeyAwareMergingIterator) readBlocksIncrementally() {
+	m.chunks = m.chunks[:0]
+	m.pending = m.pending[:0]
 
-	for i, iter := range m.iterators {
-		if iter.Err() != nil || iter.exhausted {
-			continue
+	// Ensure per-file buffers are allocated
+	for i := range m.buf {
+		if m.buf[i] == nil {
+			m.buf[i] = make([]*streamBlock, 0, 4)
 		}
+	}
 
-		// Drain per-file buffer for blocks matching current key
-		for len(m.buf[i]) > 0 && bytes.Equal(m.buf[i][0].key, m.currentKey) {
-			m.blocks = append(m.blocks, m.buf[i][0])
-			m.buf[i] = m.buf[i][1:]
-		}
+	var maxTimeSeen int64 = math.MinInt64
 
-		// Check if iterator is on the target key
-		if !bytes.Equal(iter.Key(), m.currentKey) {
-			if iter.hasNext && bytes.Equal(iter.nextKey, m.currentKey) {
-				if !iter.ActivatePending() {
-					if iter.Err() != nil {
-						m.err = iter.Err()
-					}
-					continue
-				}
-			} else {
+	// Round-robin: read one block at a time from each file
+	for {
+		readAny := false
+
+		for i, iter := range m.iterators {
+			if iter.Err() != nil {
 				continue
 			}
-		}
 
-		// Read all blocks for this key from this iterator (like batch inner loop)
-		blockKey := iter.Key()
-		for {
-			tombstones := iter.TombstoneRange(m.currentKey)
-			m.blocks = append(m.blocks, &streamBlock{
-				key:        blockKey,
-				minTime:    iter.MinTime(),
-				maxTime:    iter.MaxTime(),
-				typ:        iter.Type(),
-				b:          iter.RawBlock(),
-				tombstones: tombstones,
-				readMin:    math.MaxInt64,
-				readMax:    math.MinInt64,
-			})
+			// Drain per-file buffer for blocks matching current key
+			for len(m.buf[i]) > 0 && bytes.Equal(m.buf[i][0].key, m.currentKey) {
+				blk := m.buf[i][0]
+				m.buf[i] = m.buf[i][1:]
+				if blk.minTime > maxTimeSeen {
+					m.chunks = append(m.chunks, blk)
+				} else {
+					m.pending = append(m.pending, blk)
+				}
+				if blk.maxTime > maxTimeSeen {
+					maxTimeSeen = blk.maxTime
+				}
+				readAny = true
+			}
 
-			if !iter.NextBlock() {
-				break
+			// Check if iterator has blocks for current key
+			if iter.exhausted {
+				continue
+			}
+			// If the iterator already consumed all blocks for currentKey and
+			// NextBlock cached a different key, don't re-read stale block data.
+			// (iter.Key() still returns the old key until ActivatePending is called.)
+			if iter.hasNext && !bytes.Equal(iter.nextKey, m.currentKey) {
+				continue
+			}
+			if !bytes.Equal(iter.Key(), m.currentKey) {
+				if iter.hasNext && bytes.Equal(iter.nextKey, m.currentKey) {
+					if !iter.ActivatePending() {
+						if iter.Err() != nil {
+							m.err = iter.Err()
+						}
+						continue
+					}
+				} else {
+					continue
+				}
+			}
+
+			// Read one block at a time from this file
+			blockKey := iter.Key()
+			for {
+				tombstones := iter.TombstoneRange(m.currentKey)
+				blk := &streamBlock{
+					key:        blockKey,
+					minTime:    iter.MinTime(),
+					maxTime:    iter.MaxTime(),
+					typ:        iter.Type(),
+					b:          iter.RawBlock(),
+					tombstones: tombstones,
+					readMin:    math.MaxInt64,
+					readMax:    math.MinInt64,
+				}
+
+				if blk.minTime > maxTimeSeen {
+					m.chunks = append(m.chunks, blk)
+				} else {
+					m.pending = append(m.pending, blk)
+				}
+				if blk.maxTime > maxTimeSeen {
+					maxTimeSeen = blk.maxTime
+				}
+				readAny = true
+
+				if !iter.NextBlock() {
+					break
+				}
 			}
 		}
+
+		if !readAny {
+			break
+		}
+	}
+
+	// Clear any remaining buffered blocks (they have keys > currentKey,
+	// will be re-read by moveToNextKey → ActivatePending)
+	for i := range m.buf {
+		m.buf[i] = m.buf[i][:0]
 	}
 }
 
-// needsDedup checks whether the collected blocks require deduplication.
-// Returns true if blocks overlap in time or have tombstones.
-func (m *KeyAwareMergingIterator) needsDedup() bool {
-	if len(m.blocks) <= 1 {
-		// Single block: only needs dedup if it has tombstones
-		return len(m.blocks) == 1 && len(m.blocks[0].tombstones) > 0
-	}
-
-	sort.Stable(m.blocks)
-
-	for i := 0; i < len(m.blocks); i++ {
-		if len(m.blocks[i].tombstones) > 0 {
-			return true
-		}
-		if i > 0 && m.blocks[i].overlapsTimeRange(m.blocks[i-1].minTime, m.blocks[i-1].maxTime) {
-			return true
-		}
-	}
-	return false
-}
-
-// processCurrentKey collects blocks for the current key, detects overlaps,
-// and either passes non-overlapping blocks through or merges overlapping ones.
+// processCurrentKey reads blocks incrementally for the current key, detects
+// overlaps, and either passes non-overlapping blocks through or merges
+// overlapping ones. Non-overlapping blocks are classified during reading via
+// maxTimeSeen tracking; only potentially overlapping blocks are buffered.
 func (m *KeyAwareMergingIterator) processCurrentKey() {
-	m.chunks = nil
+	// Phase 1: Read blocks incrementally (round-robin across files).
+	// This populates m.chunks (non-overlapping) and m.pending (possibly overlapping).
+	m.readBlocksIncrementally()
 
-	// Phase 1: Collect all blocks for the current key from all files
-	m.readBlocksForKey()
+	// Set currentTyp from first available block
+	if m.currentTyp == blockTypeUnset {
+		if len(m.chunks) > 0 {
+			m.currentTyp = m.chunks[0].typ
+		} else if len(m.pending) > 0 {
+			m.currentTyp = m.pending[0].typ
+		}
+	}
 
-	if len(m.blocks) == 0 {
+	// Phase 2: If no pending blocks and no tombstones, everything is non-overlapping
+	if len(m.pending) == 0 && !m.chunksHaveTombstones() {
+		// Mark all chunks as read
+		for _, blk := range m.chunks {
+			blk.markRead(blk.minTime, blk.maxTime)
+		}
 		return
 	}
 
-	// Phase 2: Set currentTyp from first block
-	if m.currentTyp == blockTypeUnset {
-		m.currentTyp = m.blocks[0].typ
-	}
+	// Phase 3: Check if we need decode+merge
+	pendingNeedsDedup := m.pendingNeedsDedup()
+	chunkOverlap := m.pendingOverlapsChunks()
+	needMerge := pendingNeedsDedup || chunkOverlap || m.chunksHaveTombstones()
 
-	// Phase 3: Check overlap and dispatch
-	if m.needsDedup() {
-		// Overlapping: decode, merge, chunk
+	if needMerge {
+		// Overlapping: decode ALL blocks (chunks + pending), merge, chunk
+		m.blocks = append(m.blocks[:0], m.chunks...)
+		m.blocks = append(m.blocks, m.pending...)
+		m.chunks = m.chunks[:0]
 		m.decodeAndMerge()
 		if m.err != nil {
 			return
 		}
 		m.chunkMergedArray()
 	} else {
-		// Non-overlapping: pass through as raw data
-		m.chunks = make(streamBlocks, len(m.blocks))
-		copy(m.chunks, m.blocks)
-		for _, blk := range m.chunks {
+		// Pending blocks don't overlap with anything: pass through as raw data
+		for _, blk := range m.pending {
 			blk.markRead(blk.minTime, blk.maxTime)
+			m.chunks = append(m.chunks, blk)
+		}
+		// Sort chunks by minTime (round-robin reading may interleave blocks)
+		if len(m.chunks) > 1 {
+			sort.Stable(m.chunks)
 		}
 	}
+}
+
+// pendingNeedsDedup checks whether pending blocks overlap with each other
+// or have tombstones. Unlike needsDedup(), this does not sort m.blocks.
+func (m *KeyAwareMergingIterator) pendingNeedsDedup() bool {
+	if len(m.pending) <= 1 {
+		return len(m.pending) == 1 && len(m.pending[0].tombstones) > 0
+	}
+	// Sort pending by minTime for overlap check
+	sort.Stable(m.pending)
+	for i := 0; i < len(m.pending); i++ {
+		if len(m.pending[i].tombstones) > 0 {
+			return true
+		}
+		if i > 0 && m.pending[i].overlapsTimeRange(m.pending[i-1].minTime, m.pending[i-1].maxTime) {
+			return true
+		}
+	}
+	return false
+}
+
+// pendingOverlapsChunks checks whether the earliest pending block overlaps
+// with the latest chunk block. This catches the case where blocks from
+// different files have overlapping time ranges but were classified into
+// different buffers by the incremental maxTimeSeen tracking.
+func (m *KeyAwareMergingIterator) pendingOverlapsChunks() bool {
+	if len(m.chunks) == 0 || len(m.pending) == 0 {
+		return false
+	}
+	// Find the max maxTime in chunks and min minTime in pending
+	var maxChunkTime int64
+	for _, blk := range m.chunks {
+		if blk.maxTime > maxChunkTime {
+			maxChunkTime = blk.maxTime
+		}
+	}
+	var minPendingTime int64 = math.MaxInt64
+	for _, blk := range m.pending {
+		if blk.minTime < minPendingTime {
+			minPendingTime = blk.minTime
+		}
+	}
+	return minPendingTime <= maxChunkTime
+}
+
+// chunksHaveTombstones checks whether any chunk block has tombstones.
+func (m *KeyAwareMergingIterator) chunksHaveTombstones() bool {
+	for _, blk := range m.chunks {
+		if len(blk.tombstones) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // decodeAndMerge decodes overlapping blocks into typed arrays, applies

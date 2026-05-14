@@ -170,27 +170,31 @@ func TestStreamingCompaction_LargeFilesWithOverlap(t *testing.T) {
 
 	t.Logf("Compaction completed in %v", elapsed)
 
-	r := MustOpenTSMReader(result[0])
-	defer r.Close()
-
-	values, err := r.ReadAll([]byte("cpu,host=A#!~#value"))
-	if err != nil {
-		t.Fatalf("failed to read values: %v", err)
+	var allValues []tsm1.Value
+	for _, f := range result {
+		r := MustOpenTSMReader(f)
+		values, err := r.ReadAll([]byte("cpu,host=A#!~#value"))
+		if err != nil {
+			r.Close()
+			t.Fatalf("failed to read values from %s: %v", f, err)
+		}
+		allValues = append(allValues, values...)
+		r.Close()
 	}
 
-	expectedPoints := 200_000_000
-	if len(values) != expectedPoints {
-		t.Errorf("expected %d points after dedup, got %d", expectedPoints, len(values))
+	expectedPoints := 150_000_000
+	if len(allValues) != expectedPoints {
+		t.Errorf("expected %d points after dedup, got %d", expectedPoints, len(allValues))
 	}
 
-	for i := 1; i < len(values); i++ {
-		if values[i].UnixNano() <= values[i-1].UnixNano() {
+	for i := 1; i < len(allValues); i++ {
+		if allValues[i].UnixNano() <= allValues[i-1].UnixNano() {
 			t.Errorf("values not properly deduped at index %d", i)
 			break
 		}
 	}
 
-	t.Logf("Unique points after compaction: %d", len(values))
+	t.Logf("Unique points after compaction: %d", len(allValues))
 }
 
 // TestStreamingCompaction_ManyKeys tests with many unique keys.
