@@ -1894,11 +1894,7 @@ func (k *tsmBatchKeyIterator) Close() error {
 	k.values = nil
 	k.pos = nil
 	k.iterators = nil
-	for _, r := range k.readers {
-		if err := r.Close(); err != nil {
-			return err
-		}
-	}
+	k.readers = nil
 	return nil
 }
 
