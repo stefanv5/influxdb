@@ -1227,6 +1227,127 @@ func TestCompaction_100KKeys_StreamingVsBatch(t *testing.T) {
 	t.Log("=== Comparison complete. See metrics above. ===")
 }
 
+// TestCompaction_Overlapping_StreamingVsBatch compares streaming vs batch compaction
+// on overlapping data where all files cover the same time range for each key.
+// This is the worst case for memory: every block from every file overlaps,
+// forcing full decode+merge. The streaming path should buffer less memory
+// because it can flush non-overlapping blocks incrementally.
+func TestCompaction_Overlapping_StreamingVsBatch(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping overlapping comparison in short mode")
+	}
+
+	numKeys := 10_000
+	pointsPerKey := 5_000
+	numFiles := 4
+
+	// All files cover the same time range [0, pointsPerKey) for each key.
+	// This means every block from every file overlaps with every other block.
+	// The streaming path must buffer ALL blocks for each key (same as batch),
+	// but the incremental reading still provides different memory dynamics.
+	t.Logf("=== Streaming vs Batch Compaction Comparison (OVERLAPPING) ===")
+	t.Logf("Config: %d keys × %d points/key × %d files = %d total points (all overlapping)",
+		numKeys, pointsPerKey, numFiles, numKeys*pointsPerKey*numFiles)
+
+	// --- Streaming mode ---
+	dirStream := MustTempDir()
+	defer os.RemoveAll(dirStream)
+
+	t.Log("--- Generating overlapping files for streaming test ---")
+	tsmFilesStream := make([]string, numFiles)
+	for i := 0; i < numFiles; i++ {
+		fname, _ := generateLargeTSMFile(t, dirStream, i+1, numKeys, pointsPerKey)
+		tsmFilesStream[i] = fname
+	}
+
+	compactorStream := tsm1.NewCompactor()
+	compactorStream.Dir = dirStream
+	compactorStream.FileStore = &fakeFileStore{}
+	compactorStream.Open()
+
+	runCompactionWithMetrics(t, compactorStream, tsmFilesStream, "streaming-overlap")
+
+	// --- Batch mode ---
+	dirBatch := MustTempDir()
+	defer os.RemoveAll(dirBatch)
+
+	t.Log("--- Generating overlapping files for batch test ---")
+	tsmFilesBatch := make([]string, numFiles)
+	for i := 0; i < numFiles; i++ {
+		fname, _ := generateLargeTSMFile(t, dirBatch, i+1, numKeys, pointsPerKey)
+		tsmFilesBatch[i] = fname
+	}
+
+	compactorBatch := tsm1.NewCompactor()
+	compactorBatch.Dir = dirBatch
+	compactorBatch.FileStore = &fakeFileStore{}
+	compactorBatch.Open()
+
+	runCompactionWithMetrics(t, compactorBatch, tsmFilesBatch, "batch-overlap")
+
+	t.Log("=== Overlapping comparison complete. See metrics above. ===")
+}
+
+// TestCompaction_PartialOverlap_StreamingVsBatch compares streaming vs batch
+// on partially overlapping data. Each file covers a shifted time range so that
+// adjacent files overlap by 50%. This tests the streaming path's key advantage:
+// it can flush the non-overlapping prefix of each key immediately.
+func TestCompaction_PartialOverlap_StreamingVsBatch(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping partial overlap comparison in short mode")
+	}
+
+	numKeys := 10_000
+	pointsPerKey := 5_000
+	numFiles := 4
+
+	// Time ranges: [0,5000), [2500,7500), [5000,10000), [7500,12500)
+	// Adjacent files overlap by 50%. Non-adjacent files may or may not overlap.
+	// The streaming path should have lower peak memory because it can flush
+	// the non-overlapping prefix of each file's blocks immediately.
+	t.Logf("=== Streaming vs Batch Compaction Comparison (PARTIAL OVERLAP) ===")
+	t.Logf("Config: %d keys × %d points/key × %d files, shifted by %d = %d total points",
+		numKeys, pointsPerKey, numFiles, pointsPerKey/2, numKeys*pointsPerKey*numFiles)
+
+	// --- Streaming mode ---
+	dirStream := MustTempDir()
+	defer os.RemoveAll(dirStream)
+
+	t.Log("--- Generating partially overlapping files for streaming test ---")
+	tsmFilesStream := make([]string, numFiles)
+	for i := 0; i < numFiles; i++ {
+		fname, _ := generateLargeTSMFileWithOffset(t, dirStream, i+1, numKeys, pointsPerKey, i*pointsPerKey/2)
+		tsmFilesStream[i] = fname
+	}
+
+	compactorStream := tsm1.NewCompactor()
+	compactorStream.Dir = dirStream
+	compactorStream.FileStore = &fakeFileStore{}
+	compactorStream.Open()
+
+	runCompactionWithMetrics(t, compactorStream, tsmFilesStream, "streaming-partial")
+
+	// --- Batch mode ---
+	dirBatch := MustTempDir()
+	defer os.RemoveAll(dirBatch)
+
+	t.Log("--- Generating partially overlapping files for batch test ---")
+	tsmFilesBatch := make([]string, numFiles)
+	for i := 0; i < numFiles; i++ {
+		fname, _ := generateLargeTSMFileWithOffset(t, dirBatch, i+1, numKeys, pointsPerKey, i*pointsPerKey/2)
+		tsmFilesBatch[i] = fname
+	}
+
+	compactorBatch := tsm1.NewCompactor()
+	compactorBatch.Dir = dirBatch
+	compactorBatch.FileStore = &fakeFileStore{}
+	compactorBatch.Open()
+
+	runCompactionWithMetrics(t, compactorBatch, tsmFilesBatch, "batch-partial")
+
+	t.Log("=== Partial overlap comparison complete. See metrics above. ===")
+}
+
 // BenchmarkCompaction_100KKeys benchmarks streaming compaction with 100K keys × 5000 points.
 func BenchmarkCompaction_100KKeys(b *testing.B) {
 	if testing.Short() {
