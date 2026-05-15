@@ -41,10 +41,6 @@ func (a outputBlocks) Len() int           { return len(a) }
 func (a outputBlocks) Less(i, j int) bool { return a[i].minTime < a[j].minTime }
 func (a outputBlocks) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 
-func (bl *streamBlock) overlapsTimeRange(min, max int64) bool {
-	return bl.minTime <= max && bl.maxTime >= min
-}
-
 func (bl *streamBlock) read() bool {
 	return bl.readMin <= bl.minTime && bl.readMax >= bl.maxTime
 }
@@ -56,6 +52,10 @@ func (bl *streamBlock) markRead(min, max int64) {
 	if max > bl.readMax {
 		bl.readMax = max
 	}
+}
+
+func (bl *streamBlock) overlapsTimeRange(min, max int64) bool {
+	return bl.minTime <= max && bl.maxTime >= min
 }
 
 // blockTypeUnset is a sentinel value for currentType that does not collide
@@ -265,6 +265,9 @@ type KeyAwareMergingIterator struct {
 
 	// Raw non-overlapping blocks from readBlocksIncrementally (before conversion to outputBlock)
 	rawChunks streamBlocks
+
+	// Reusable buffer for processGroups (avoids per-key allocation)
+	allBlocks streamBlocks
 
 	// Output chunks for current key (lightweight, decoupled from streamBlock lifecycle)
 	chunks   []outputBlock
@@ -538,8 +541,10 @@ func (m *KeyAwareMergingIterator) moveToNextKey() bool {
 }
 
 // readBlocksIncrementally reads blocks for the current key one at a time
-// round-robin across files. It tracks maxTimeSeen to classify each block:
-//   - Non-overlapping (minTime > maxTimeSeen) → chunks (output immediately)
+// round-robin across files. Each pass reads at most one block per file,
+// ensuring incremental progress across all files. It tracks maxTimeSeen
+// to classify each block:
+//   - Non-overlapping (minTime > maxTimeSeen) → rawChunks (output immediately)
 //   - Possibly overlapping → pending (buffered for decode/merge)
 func (m *KeyAwareMergingIterator) readBlocksIncrementally() {
 	m.chunks = m.chunks[:0]
@@ -554,7 +559,9 @@ func (m *KeyAwareMergingIterator) readBlocksIncrementally() {
 
 	var maxTimeSeen int64 = math.MinInt64
 
-	// Round-robin: read one block at a time from each file
+	// Round-robin: each outer pass reads at most one block per file.
+	// This ensures we see blocks from all files early, enabling
+	// incremental overlap detection and early output of non-overlapping blocks.
 	for {
 		readAny := false
 
@@ -563,31 +570,38 @@ func (m *KeyAwareMergingIterator) readBlocksIncrementally() {
 				continue
 			}
 
-			// Drain per-file buffer for blocks matching current key
-			for len(m.buf[i]) > 0 && bytes.Equal(m.buf[i][0].key, m.currentKey) {
+			// Drain one buffered block per file per pass (true round-robin).
+			// buf[i] holds blocks with keys > currentKey from prior key changes.
+			if len(m.buf[i]) > 0 {
 				blk := m.buf[i][0]
-				m.buf[i] = m.buf[i][1:]
-				if blk.minTime > maxTimeSeen {
-					m.rawChunks = append(m.rawChunks, blk)
-				} else {
-					m.pending = append(m.pending, blk)
+				if bytes.Equal(blk.key, m.currentKey) {
+					m.buf[i] = m.buf[i][1:]
+					if blk.minTime > maxTimeSeen {
+						m.rawChunks = append(m.rawChunks, blk)
+					} else {
+						m.pending = append(m.pending, blk)
+					}
+					if blk.maxTime > maxTimeSeen {
+						maxTimeSeen = blk.maxTime
+					}
+					readAny = true
+					continue
 				}
-				if blk.maxTime > maxTimeSeen {
-					maxTimeSeen = blk.maxTime
-				}
-				readAny = true
+				// Buffer has a block with key != currentKey; skip this file.
+				continue
 			}
 
-			// Check if iterator has blocks for current key
+			// No buffered block; try reading from the iterator.
 			if iter.exhausted {
 				continue
 			}
-			// If the iterator already consumed all blocks for currentKey and
-			// NextBlock cached a different key, don't re-read stale block data.
-			// (iter.Key() still returns the old key until ActivatePending is called.)
+
+			// If the iterator cached a different key in NextBlock, skip.
 			if iter.hasNext && !bytes.Equal(iter.nextKey, m.currentKey) {
 				continue
 			}
+
+			// Try to position the iterator at the current key.
 			if !bytes.Equal(iter.Key(), m.currentKey) {
 				if iter.hasNext && bytes.Equal(iter.nextKey, m.currentKey) {
 					if !iter.ActivatePending() {
@@ -601,31 +615,28 @@ func (m *KeyAwareMergingIterator) readBlocksIncrementally() {
 				}
 			}
 
-			// Read one block at a time from this file
-			blockKey := iter.Key()
-			for {
-				tombstones := iter.TombstoneRange(m.currentKey)
-				blk := m.getBlock(i, iter.Type())
-				blk.key = blockKey
-				blk.minTime = iter.MinTime()
-				blk.maxTime = iter.MaxTime()
-				blk.b = iter.RawBlock()
-				blk.tombstones = tombstones
+			// Read exactly one block from this file.
+			tombstones := iter.TombstoneRange(m.currentKey)
+			blk := m.getBlock(i, iter.Type())
+			blk.key = iter.Key()
+			blk.minTime = iter.MinTime()
+			blk.maxTime = iter.MaxTime()
+			blk.b = iter.RawBlock()
+			blk.tombstones = tombstones
 
-				if blk.minTime > maxTimeSeen {
-					m.rawChunks = append(m.rawChunks, blk)
-				} else {
-					m.pending = append(m.pending, blk)
-				}
-				if blk.maxTime > maxTimeSeen {
-					maxTimeSeen = blk.maxTime
-				}
-				readAny = true
-
-				if !iter.NextBlock() {
-					break
-				}
+			if blk.minTime > maxTimeSeen {
+				m.rawChunks = append(m.rawChunks, blk)
+			} else {
+				m.pending = append(m.pending, blk)
 			}
+			if blk.maxTime > maxTimeSeen {
+				maxTimeSeen = blk.maxTime
+			}
+			readAny = true
+
+			// Advance the iterator. If the next block has a different key,
+			// NextBlock caches it in iter.hasNext/nextKey and returns false.
+			iter.NextBlock()
 		}
 
 		if !readAny {
@@ -658,109 +669,106 @@ func (m *KeyAwareMergingIterator) processCurrentKey() {
 		}
 	}
 
-	// Phase 2: If no pending blocks and no tombstones, everything is non-overlapping.
-	// Convert rawChunks to outputBlocks and return streamBlocks to pool.
-	if len(m.pending) == 0 && !m.rawChunksHaveTombstones() {
-		m.chunks = m.chunks[:0]
-		for _, blk := range m.rawChunks {
-			m.chunks = append(m.chunks, outputBlock{key: blk.key, minTime: blk.minTime, maxTime: blk.maxTime, b: blk.b})
-		}
-		m.returnBlocks(m.rawChunks)
+	// Phase 2: Fast path for single block with no tombstones — pass through
+	// without decode/re-encode. Multiple blocks always go through processGroups
+	// to ensure deduplication (different files may have duplicate timestamps).
+	if len(m.pending) == 0 && len(m.rawChunks) == 1 && len(m.rawChunks[0].tombstones) == 0 {
+		blk := m.rawChunks[0]
+		m.chunks = append(m.chunks[:0], outputBlock{key: blk.key, minTime: blk.minTime, maxTime: blk.maxTime, b: blk.b})
+		m.returnBlock(blk)
 		m.rawChunks = m.rawChunks[:0]
 		return
 	}
 
-	// Phase 3: Check if we need decode+merge
-	pendingNeedsDedup := m.pendingNeedsDedup()
-	chunkOverlap := m.pendingOverlapsRawChunks()
-	needMerge := pendingNeedsDedup || chunkOverlap || m.rawChunksHaveTombstones()
+	// Phase 3: Group-based processing.
+	// Merge rawChunks + pending into one sorted list and partition into
+	// independent overlap groups. Each group is either pass-through (single
+	// block, no tombstones, non-overlapping) or decode+merge (overlapping or
+	// tombstoned). This avoids decoding non-overlapping blocks that were
+	// misclassified into rawChunks by the incremental maxTimeSeen tracking.
+	m.processGroups()
+	m.rawChunks = m.rawChunks[:0]
+	m.pending = m.pending[:0]
+}
 
-	if needMerge {
-		// Overlapping: decode ALL blocks (rawChunks + pending), merge, chunk
-		m.blocks = append(m.blocks[:0], m.rawChunks...)
-		m.blocks = append(m.blocks, m.pending...)
-		m.pending = m.pending[:0]
-		m.rawChunks = m.rawChunks[:0]
-		m.decodeAndMerge()
-		if m.err != nil {
-			return
+// processGroups merges rawChunks and pending into a sorted list, partitions
+// them into independent overlap groups, and processes each group individually.
+// Non-overlapping singletons pass through as raw mmap data; overlapping groups
+// or blocks with tombstones are decoded, merged, and re-encoded.
+//
+// Correctness: if two blocks have non-overlapping time ranges, their timestamp
+// sets are strictly disjoint (∀ ta ∈ A, tb ∈ B: ta ≤ A.maxTime < B.minTime ≤ tb).
+// Therefore a singleton group with no tombstones can safely pass through without
+// decode/re-encode — there are no duplicate timestamps to deduplicate.
+func (m *KeyAwareMergingIterator) processGroups() {
+	m.allBlocks = append(m.allBlocks[:0], m.rawChunks...)
+	m.allBlocks = append(m.allBlocks, m.pending...)
+
+	if len(m.allBlocks) == 0 {
+		return
+	}
+
+	sort.Stable(m.allBlocks)
+
+	m.chunks = m.chunks[:0]
+	groupStart := 0
+
+	for i := 1; i <= len(m.allBlocks); i++ {
+		// Determine if allBlocks[i] starts a new group.
+		// It starts a new group if it does NOT overlap any block in the current group.
+		startNewGroup := i == len(m.allBlocks)
+		if !startNewGroup {
+			overlaps := false
+			for j := groupStart; j < i && !overlaps; j++ {
+				if m.allBlocks[i].overlapsTimeRange(m.allBlocks[j].minTime, m.allBlocks[j].maxTime) {
+					overlaps = true
+				}
+			}
+			startNewGroup = !overlaps
 		}
-		m.chunkMergedArray()
-		// Return decoded input blocks to pool
-		m.returnBlocks(m.blocks)
-		m.blocks = m.blocks[:0]
-	} else {
-		// Pending blocks don't overlap: pass through as raw data
-		m.chunks = m.chunks[:0]
-		for _, blk := range m.rawChunks {
-			m.chunks = append(m.chunks, outputBlock{key: blk.key, minTime: blk.minTime, maxTime: blk.maxTime, b: blk.b})
+
+		if !startNewGroup {
+			continue
 		}
-		m.returnBlocks(m.rawChunks)
-		m.rawChunks = m.rawChunks[:0]
-		for _, blk := range m.pending {
-			m.chunks = append(m.chunks, outputBlock{key: blk.key, minTime: blk.minTime, maxTime: blk.maxTime, b: blk.b})
+
+		// Process group [groupStart, i).
+		group := m.allBlocks[groupStart:i]
+		groupHasTombstones := false
+		for _, blk := range group {
+			if len(blk.tombstones) > 0 {
+				groupHasTombstones = true
+				break
+			}
 		}
-		m.returnBlocks(m.pending)
-		m.pending = m.pending[:0]
-		// Sort chunks by minTime (round-robin reading may interleave blocks)
-		if len(m.chunks) > 1 {
-			sort.Stable(outputBlocks(m.chunks))
+		groupHasOverlap := i-groupStart > 1
+
+		if groupHasOverlap || groupHasTombstones {
+			m.blocks = append(m.blocks[:0], group...)
+			m.decodeAndMerge()
+			if m.err != nil {
+				return
+			}
+			m.chunkMergedArray()
+			m.returnBlocks(m.blocks)
+			m.blocks = m.blocks[:0]
+		} else {
+			// Singleton, no tombstones, non-overlapping: pass through as raw mmap data.
+			blk := group[0]
+			m.chunks = append(m.chunks, outputBlock{
+				key: blk.key, minTime: blk.minTime, maxTime: blk.maxTime, b: blk.b,
+			})
+			m.returnBlock(blk)
 		}
+
+		groupStart = i
+	}
+
+	// Sort chunks by minTime (merged groups and pass-through blocks may be interleaved).
+	if len(m.chunks) > 1 {
+		sort.Stable(outputBlocks(m.chunks))
 	}
 }
 
-// pendingNeedsDedup checks whether pending blocks overlap with each other
-// or have tombstones. Unlike needsDedup(), this does not sort m.blocks.
-func (m *KeyAwareMergingIterator) pendingNeedsDedup() bool {
-	if len(m.pending) <= 1 {
-		return len(m.pending) == 1 && len(m.pending[0].tombstones) > 0
-	}
-	// Sort pending by minTime for overlap check
-	sort.Stable(m.pending)
-	for i := 0; i < len(m.pending); i++ {
-		if len(m.pending[i].tombstones) > 0 {
-			return true
-		}
-		if i > 0 && m.pending[i].overlapsTimeRange(m.pending[i-1].minTime, m.pending[i-1].maxTime) {
-			return true
-		}
-	}
-	return false
-}
-
-// pendingOverlapsRawChunks checks whether the earliest pending block overlaps
-// with the latest chunk block. This catches the case where blocks from
-// different files have overlapping time ranges but were classified into
-// different buffers by the incremental maxTimeSeen tracking.
-func (m *KeyAwareMergingIterator) pendingOverlapsRawChunks() bool {
-	if len(m.rawChunks) == 0 || len(m.pending) == 0 {
-		return false
-	}
-	// Find the max maxTime in rawChunks and min minTime in pending
-	var maxChunkTime int64
-	for _, blk := range m.rawChunks {
-		if blk.maxTime > maxChunkTime {
-			maxChunkTime = blk.maxTime
-		}
-	}
-	var minPendingTime int64 = math.MaxInt64
-	for _, blk := range m.pending {
-		if blk.minTime < minPendingTime {
-			minPendingTime = blk.minTime
-		}
-	}
-	return minPendingTime <= maxChunkTime
-}
-
-// rawChunksHaveTombstones checks whether any raw chunk block has tombstones.
-func (m *KeyAwareMergingIterator) rawChunksHaveTombstones() bool {
-	for _, blk := range m.rawChunks {
-		if len(blk.tombstones) > 0 {
-			return true
-		}
-	}
-	return false
-}
 
 // decodeAndMerge decodes overlapping blocks into typed arrays, applies
 // tombstones, and merges them (same algorithm as tsmBatchKeyIterator).

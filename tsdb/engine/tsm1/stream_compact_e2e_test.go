@@ -69,7 +69,9 @@ func TestStreamingCompaction_LargeFiles(t *testing.T) {
 	// Run full compaction (triggers streaming path)
 	compactor := tsm1.NewCompactor()
 	compactor.Dir = dir
-	compactor.FileStore = &fakeFileStore{}
+	fs := &fakeFileStore{}
+	compactor.FileStore = fs
+	defer fs.Close()
 	compactor.Open()
 
 	start := time.Now()
@@ -157,7 +159,9 @@ func TestStreamingCompaction_LargeFilesWithOverlap(t *testing.T) {
 
 	compactor := tsm1.NewCompactor()
 	compactor.Dir = dir
-	compactor.FileStore = &fakeFileStore{}
+	fs := &fakeFileStore{}
+	compactor.FileStore = fs
+	defer fs.Close()
 	compactor.Open()
 
 	start := time.Now()
@@ -240,7 +244,9 @@ func TestStreamingCompaction_ManyKeys(t *testing.T) {
 
 	compactor := tsm1.NewCompactor()
 	compactor.Dir = dir
-	compactor.FileStore = &fakeFileStore{}
+	fs := &fakeFileStore{}
+	compactor.FileStore = fs
+	defer fs.Close()
 	compactor.Open()
 
 	start := time.Now()
@@ -333,7 +339,9 @@ func TestStreamingCompaction_Tombstones(t *testing.T) {
 
 	compactor := tsm1.NewCompactor()
 	compactor.Dir = dir
-	compactor.FileStore = &fakeFileStore{}
+	fs := &fakeFileStore{}
+	compactor.FileStore = fs
+	defer fs.Close()
 	compactor.Open()
 
 	result, err := compactor.CompactFull(tsmFiles)
@@ -420,7 +428,9 @@ func TestStreamingCompaction_AllValueTypes(t *testing.T) {
 
 	compactor := tsm1.NewCompactor()
 	compactor.Dir = dir
-	compactor.FileStore = &fakeFileStore{}
+	fs := &fakeFileStore{}
+	compactor.FileStore = fs
+	defer fs.Close()
 	compactor.Open()
 
 	result, err := compactor.CompactFull([]string{f.Name()})
@@ -487,7 +497,9 @@ func TestStreamingCompaction_DedupByTimestamp(t *testing.T) {
 
 	compactor := tsm1.NewCompactor()
 	compactor.Dir = dir
-	compactor.FileStore = &fakeFileStore{}
+	fs := &fakeFileStore{}
+	compactor.FileStore = fs
+	defer fs.Close()
 	compactor.Open()
 
 	result, err := compactor.CompactFull(tsmFiles)
@@ -548,7 +560,9 @@ func TestStreamingCompaction_UnsortedBlocks(t *testing.T) {
 
 	compactor := tsm1.NewCompactor()
 	compactor.Dir = dir
-	compactor.FileStore = &fakeFileStore{}
+	fs := &fakeFileStore{}
+	compactor.FileStore = fs
+	defer fs.Close()
 	compactor.Open()
 
 	result, err := compactor.CompactFull([]string{f.Name()})
@@ -615,7 +629,9 @@ func TestStreamingCompaction_Interrupt(t *testing.T) {
 	// Test that compaction works with single file
 	compactor := tsm1.NewCompactor()
 	compactor.Dir = dir
-	compactor.FileStore = &fakeFileStore{}
+	fs := &fakeFileStore{}
+	compactor.FileStore = fs
+	defer fs.Close()
 	compactor.Open()
 
 	_, err = compactor.CompactFull([]string{f.Name()})
@@ -682,7 +698,9 @@ func BenchmarkStreamingCompactionLarge(b *testing.B) {
 
 	compactor := tsm1.NewCompactor()
 	compactor.Dir = dir
-	compactor.FileStore = &fakeFileStore{}
+	fs := &fakeFileStore{}
+	compactor.FileStore = fs
+	defer fs.Close()
 
 	b.ResetTimer()
 	start := time.Now()
@@ -765,7 +783,9 @@ func TestStreamingCompaction_2GBLargeFile(t *testing.T) {
 	// Run full compaction (triggers streaming path for non-fast mode)
 	compactor := tsm1.NewCompactor()
 	compactor.Dir = dir
-	compactor.FileStore = &fakeFileStore{}
+	fs := &fakeFileStore{}
+	compactor.FileStore = fs
+	defer fs.Close()
 	compactor.Open()
 
 	t.Log("Starting streaming compaction of ~2GB data...")
@@ -1069,7 +1089,9 @@ func TestStreamingCompaction_100KKeys_2GBx4(t *testing.T) {
 
 	compactor := tsm1.NewCompactor()
 	compactor.Dir = dir
-	compactor.FileStore = &fakeFileStore{}
+	fs := &fakeFileStore{}
+	compactor.FileStore = fs
+	defer fs.Close()
 	compactor.Open()
 
 	runCompactionWithMetrics(t, compactor, tsmFiles, "streaming")
@@ -1110,7 +1132,9 @@ func TestStreamingCompaction_100KKeys_2GBx4_Overlap(t *testing.T) {
 
 	compactor := tsm1.NewCompactor()
 	compactor.Dir = dir
-	compactor.FileStore = &fakeFileStore{}
+	fs := &fakeFileStore{}
+	compactor.FileStore = fs
+	defer fs.Close()
 	compactor.Open()
 
 	runtime.GC()
@@ -1201,7 +1225,9 @@ func TestCompaction_100KKeys_StreamingVsBatch(t *testing.T) {
 
 	compactorStream := tsm1.NewCompactor()
 	compactorStream.Dir = dirStream
-	compactorStream.FileStore = &fakeFileStore{}
+	fsStream := &fakeFileStore{}
+	compactorStream.FileStore = fsStream
+	defer fsStream.Close()
 	compactorStream.Open()
 
 	runCompactionWithMetrics(t, compactorStream, tsmFilesStream, "streaming")
@@ -1219,7 +1245,9 @@ func TestCompaction_100KKeys_StreamingVsBatch(t *testing.T) {
 
 	compactorBatch := tsm1.NewCompactor()
 	compactorBatch.Dir = dirBatch
-	compactorBatch.FileStore = &fakeFileStore{}
+	fsBatch := &fakeFileStore{}
+	compactorBatch.FileStore = fsBatch
+	defer fsBatch.Close()
 	compactorBatch.Open()
 
 	runCompactionWithMetrics(t, compactorBatch, tsmFilesBatch, "batch")
@@ -1262,7 +1290,9 @@ func TestCompaction_Overlapping_StreamingVsBatch(t *testing.T) {
 
 	compactorStream := tsm1.NewCompactor()
 	compactorStream.Dir = dirStream
-	compactorStream.FileStore = &fakeFileStore{}
+	fsStream := &fakeFileStore{}
+	compactorStream.FileStore = fsStream
+	defer fsStream.Close()
 	compactorStream.Open()
 
 	runCompactionWithMetrics(t, compactorStream, tsmFilesStream, "streaming-overlap")
@@ -1280,7 +1310,9 @@ func TestCompaction_Overlapping_StreamingVsBatch(t *testing.T) {
 
 	compactorBatch := tsm1.NewCompactor()
 	compactorBatch.Dir = dirBatch
-	compactorBatch.FileStore = &fakeFileStore{}
+	fsBatch := &fakeFileStore{}
+	compactorBatch.FileStore = fsBatch
+	defer fsBatch.Close()
 	compactorBatch.Open()
 
 	runCompactionWithMetrics(t, compactorBatch, tsmFilesBatch, "batch-overlap")
@@ -1322,7 +1354,9 @@ func TestCompaction_PartialOverlap_StreamingVsBatch(t *testing.T) {
 
 	compactorStream := tsm1.NewCompactor()
 	compactorStream.Dir = dirStream
-	compactorStream.FileStore = &fakeFileStore{}
+	fsStream := &fakeFileStore{}
+	compactorStream.FileStore = fsStream
+	defer fsStream.Close()
 	compactorStream.Open()
 
 	runCompactionWithMetrics(t, compactorStream, tsmFilesStream, "streaming-partial")
@@ -1340,7 +1374,9 @@ func TestCompaction_PartialOverlap_StreamingVsBatch(t *testing.T) {
 
 	compactorBatch := tsm1.NewCompactor()
 	compactorBatch.Dir = dirBatch
-	compactorBatch.FileStore = &fakeFileStore{}
+	fsBatch := &fakeFileStore{}
+	compactorBatch.FileStore = fsBatch
+	defer fsBatch.Close()
 	compactorBatch.Open()
 
 	runCompactionWithMetrics(t, compactorBatch, tsmFilesBatch, "batch-partial")
@@ -1370,7 +1406,9 @@ func BenchmarkCompaction_100KKeys(b *testing.B) {
 
 	compactor := tsm1.NewCompactor()
 	compactor.Dir = dir
-	compactor.FileStore = &fakeFileStore{}
+	fs := &fakeFileStore{}
+	compactor.FileStore = fs
+	defer fs.Close()
 	compactor.Open()
 
 	b.ResetTimer()
