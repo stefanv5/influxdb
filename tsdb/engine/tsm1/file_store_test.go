@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -2508,6 +2509,400 @@ func TestFileStore_Replace(t *testing.T) {
 
 }
 
+// TestFileStore_Replace_RejectsPathAlias verifies that a newFiles path that
+// aliases an oldFiles path through dot-segments is rejected as a same-path
+// replacement. Without normalization the string checks would pass, the prune
+// loop would delete the live pathname while the alias reader survived, and
+// Replace would return nil with the file gone after restart.
+func TestFileStore_Replace_RejectsPathAlias(t *testing.T) {
+	dir := MustTempDir()
+	defer os.RemoveAll(dir)
+
+	data := []keyValues{
+		keyValues{"cpu", []tsm1.Value{tsm1.NewValue(0, 1.0)}},
+		keyValues{"cpu", []tsm1.Value{tsm1.NewValue(1, 2.0)}},
+	}
+	files, err := newFileDir(dir, data...)
+	if err != nil {
+		fatal(t, "creating test files", err)
+	}
+
+	fs := tsm1.NewFileStore(dir)
+	if err := fs.Open(); err != nil {
+		fatal(t, "opening file store", err)
+	}
+	defer fs.Close()
+
+	if got, exp := fs.Count(), 2; got != exp {
+		t.Fatalf("file count mismatch: got %v, exp %v", got, exp)
+	}
+
+	// Alias files[0] as dir/./<name>: the same file, a different string.
+	alias := fmt.Sprintf("%s%c.%c%s", dir, os.PathSeparator, os.PathSeparator, filepath.Base(files[0]))
+	err = fs.Replace([]string{files[0]}, []string{alias})
+	if err == nil {
+		t.Fatal("expected replace of an old file through a path alias to fail")
+	}
+	if !strings.Contains(err.Error(), "same-path replacement is not supported") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// The store and the file on disk must be unchanged.
+	if got, exp := fs.Count(), 2; got != exp {
+		t.Fatalf("file count mismatch: got %v, exp %v", got, exp)
+	}
+	if _, err := os.Stat(files[0]); err != nil {
+		t.Fatalf("stat file: %v", err)
+	}
+}
+
+// TestFileStore_Replace_RejectsCaseAlias verifies that on Windows, where
+// paths are case-insensitive, a case-differing alias of an oldFiles path is
+// rejected as a same-path replacement instead of passing the string checks.
+func TestFileStore_Replace_RejectsCaseAlias(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("case-insensitive path semantics are Windows-specific")
+	}
+
+	dir := MustTempDir()
+	defer os.RemoveAll(dir)
+
+	data := []keyValues{
+		keyValues{"cpu", []tsm1.Value{tsm1.NewValue(0, 1.0)}},
+	}
+	files, err := newFileDir(dir, data...)
+	if err != nil {
+		fatal(t, "creating test files", err)
+	}
+
+	fs := tsm1.NewFileStore(dir)
+	if err := fs.Open(); err != nil {
+		fatal(t, "opening file store", err)
+	}
+	defer fs.Close()
+
+	alias := strings.ToUpper(files[0])
+	err = fs.Replace([]string{files[0]}, []string{alias})
+	if err == nil {
+		t.Fatal("expected replace of an old file through a case alias to fail")
+	}
+	if !strings.Contains(err.Error(), "same-path replacement is not supported") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if got, exp := fs.Count(), 1; got != exp {
+		t.Fatalf("file count mismatch: got %v, exp %v", got, exp)
+	}
+	if _, err := os.Stat(files[0]); err != nil {
+		t.Fatalf("stat file: %v", err)
+	}
+}
+
+// TestFileStore_Replace_RejectsDuplicateAliasTarget verifies that two newFiles
+// entries resolving to the same final target through a path alias are rejected
+// in validation, before any rename or reader is created.
+func TestFileStore_Replace_RejectsDuplicateAliasTarget(t *testing.T) {
+	dir := MustTempDir()
+	defer os.RemoveAll(dir)
+
+	data := []keyValues{
+		keyValues{"cpu", []tsm1.Value{tsm1.NewValue(0, 1.0)}},
+	}
+	files, err := newFileDir(dir, data...)
+	if err != nil {
+		fatal(t, "creating test files", err)
+	}
+
+	// Stage the single output as .tsm.tmp like the compactor does.
+	tmp := files[0] + "." + tsm1.TmpTSMFileExtension
+	if err := os.Rename(files[0], tmp); err != nil {
+		fatal(t, "staging tmp file", err)
+	}
+
+	fs := tsm1.NewFileStore(dir)
+	if err := fs.Open(); err != nil {
+		fatal(t, "opening file store", err)
+	}
+	defer fs.Close()
+
+	if got, exp := fs.Count(), 0; got != exp {
+		t.Fatalf("file count mismatch: got %v, exp %v", got, exp)
+	}
+
+	// The same final target expressed twice: once as the .tsm.tmp staging
+	// path, once as a dot-segment alias of the final .tsm path.
+	alias := fmt.Sprintf("%s%c.%c%s", dir, os.PathSeparator, os.PathSeparator, filepath.Base(files[0]))
+	err = fs.Replace(nil, []string{tmp, alias})
+	if err == nil {
+		t.Fatal("expected duplicate new file target via path alias to fail")
+	}
+	if !strings.Contains(err.Error(), "duplicate new file target") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Validation must reject before any side effect: the staged .tmp file is
+	// untouched and no formal .tsm was created.
+	if _, err := os.Stat(tmp); err != nil {
+		t.Fatalf("staged tmp file must be untouched: %v", err)
+	}
+	if _, err := os.Stat(files[0]); !os.IsNotExist(err) {
+		t.Fatalf("no formal file may be created when validation rejects: %v", err)
+	}
+	if got, exp := fs.Count(), 0; got != exp {
+		t.Fatalf("file count mismatch: got %v, exp %v", got, exp)
+	}
+}
+
+// TestFileStore_Replace_MultiOutputRollbackOnExistingTarget verifies that when
+// the second output's formal target already exists, the first output that was
+// already installed is rolled back: its formal file is renamed back to the
+// .tmp staging name and the store stays empty. (The equivalent scenario with
+// valid TSM content is covered by TestFileStore_Replace_MultiOutputRollback;
+// this variant also asserts the no-clobber error is reported.)
+func TestFileStore_Replace_MultiOutputRollbackOnExistingTarget(t *testing.T) {
+	dir := MustTempDir()
+	defer os.RemoveAll(dir)
+
+	// Two compaction outputs staged as .tsm.tmp.
+	f1 := MustWriteTSM(dir, 1, map[string][]tsm1.Value{
+		"cpu,host=A#!~#value": {tsm1.NewValue(1, float64(1.0))},
+	})
+	f2 := MustWriteTSM(dir, 2, map[string][]tsm1.Value{
+		"cpu,host=B#!~#value": {tsm1.NewValue(1, float64(2.0))},
+	})
+
+	tmp1, tmp2 := f1+".tmp", f2+".tmp"
+	if err := os.Rename(f1, tmp1); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(f2, tmp2); err != nil {
+		t.Fatal(err)
+	}
+
+	fs := tsm1.NewFileStore(dir)
+	if err := fs.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer fs.Close()
+
+	if got, exp := fs.Count(), 0; got != exp {
+		t.Fatalf("file count mismatch: got %v, exp %v", got, exp)
+	}
+
+	// Pre-create the formal target of the second output AFTER Open (Open
+	// validates every *.tsm in the dir, so an invalid stub must not exist
+	// yet) so its install fails after the first output already succeeded.
+	if err := os.WriteFile(f2, []byte("pre-existing target"), 0666); err != nil {
+		t.Fatal(err)
+	}
+
+	err := fs.Replace(nil, []string{tmp1, tmp2})
+	if err == nil {
+		t.Fatal("expected replace with pre-existing second target to fail")
+	}
+	if !strings.Contains(err.Error(), "refusing to rename") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// The first output must be rolled back to its .tmp staging name.
+	if _, err := os.Stat(tmp1); err != nil {
+		t.Fatalf("first output must be rolled back to its tmp path: %v", err)
+	}
+	if _, err := os.Stat(f1); !os.IsNotExist(err) {
+		t.Fatalf("first output formal file must be gone: %v", err)
+	}
+	if got, exp := fs.Count(), 0; got != exp {
+		t.Fatalf("file count mismatch: got %v, exp %v", got, exp)
+	}
+}
+
+// TestFileStore_Replace_RollbackOnCorruptOutput verifies that a second output
+// with a valid staging name but corrupt content (NewTSMReader fails after the
+// rename already happened) rolls back the first output that was already
+// installed: its reader is closed, its formal file is renamed back to the .tmp
+// staging name and the corrupt output is renamed back too.
+func TestFileStore_Replace_RollbackOnCorruptOutput(t *testing.T) {
+	dir := MustTempDir()
+	defer os.RemoveAll(dir)
+
+	// Two compaction outputs staged as .tsm.tmp.
+	f1 := MustWriteTSM(dir, 1, map[string][]tsm1.Value{
+		"cpu,host=A#!~#value": {tsm1.NewValue(1, float64(1.0))},
+	})
+	f2 := MustWriteTSM(dir, 2, map[string][]tsm1.Value{
+		"cpu,host=B#!~#value": {tsm1.NewValue(1, float64(2.0))},
+	})
+
+	tmp1, corruptTmp := f1+".tmp", f2+".tmp"
+	if err := os.Rename(f1, tmp1); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(f2, corruptTmp); err != nil {
+		t.Fatal(err)
+	}
+
+	fs := tsm1.NewFileStore(dir)
+	if err := fs.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer fs.Close()
+
+	if got, exp := fs.Count(), 0; got != exp {
+		t.Fatalf("file count mismatch: got %v, exp %v", got, exp)
+	}
+
+	// Corrupt the second output: valid staging name, garbage content, so
+	// NewTSMReader fails on it after it has already been renamed to its
+	// formal name.
+	if err := os.WriteFile(corruptTmp, []byte("not a tsm file"), 0666); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := fs.Replace(nil, []string{tmp1, corruptTmp}); err == nil {
+		t.Fatal("expected replace with corrupt second output to fail")
+	}
+
+	// The first output must be rolled back to its .tmp staging name.
+	if _, err := os.Stat(tmp1); err != nil {
+		t.Fatalf("first output must be rolled back to its tmp path: %v", err)
+	}
+	if _, err := os.Stat(f1); !os.IsNotExist(err) {
+		t.Fatalf("first output formal file must be gone: %v", err)
+	}
+	// The corrupt second output must be renamed back to its staging name too.
+	if _, err := os.Stat(corruptTmp); err != nil {
+		t.Fatalf("corrupt output must be renamed back to its tmp path: %v", err)
+	}
+	if _, err := os.Stat(f2); !os.IsNotExist(err) {
+		t.Fatalf("corrupt output formal file must be gone: %v", err)
+	}
+	if got, exp := fs.Count(), 0; got != exp {
+		t.Fatalf("file count mismatch: got %v, exp %v", got, exp)
+	}
+}
+
+// TestFileStore_Replace_RollbackOnObserverFailure verifies that a FileFinishing
+// failure on the second output rolls back the first output that was already
+// installed: its reader is closed and its formal file renamed back to the .tmp
+// staging name.
+func TestFileStore_Replace_RollbackOnObserverFailure(t *testing.T) {
+	dir := MustTempDir()
+	defer os.RemoveAll(dir)
+
+	data := []keyValues{
+		keyValues{"cpu", []tsm1.Value{tsm1.NewValue(0, 1.0)}},
+		keyValues{"mem", []tsm1.Value{tsm1.NewValue(0, 1.0)}},
+	}
+	files, err := newFileDir(dir, data...)
+	if err != nil {
+		fatal(t, "creating test files", err)
+	}
+
+	tmp1 := files[0] + "." + tsm1.TmpTSMFileExtension
+	tmp2 := files[1] + "." + tsm1.TmpTSMFileExtension
+	if err := os.Rename(files[0], tmp1); err != nil {
+		fatal(t, "staging first tmp file", err)
+	}
+	if err := os.Rename(files[1], tmp2); err != nil {
+		fatal(t, "staging second tmp file", err)
+	}
+
+	fs := tsm1.NewFileStore(dir)
+	fs.WithObserver(mockObserver{
+		fileFinishing: func(path string) error {
+			if path == tmp2 {
+				return fmt.Errorf("injected FileFinishing failure for %s", path)
+			}
+			return nil
+		},
+		fileUnlinking: func(path string) error { return nil },
+	})
+	if err := fs.Open(); err != nil {
+		fatal(t, "opening file store", err)
+	}
+	defer fs.Close()
+
+	if err := fs.Replace(nil, []string{tmp1, tmp2}); err == nil {
+		t.Fatal("expected replace with failing observer to fail")
+	}
+
+	// The first output must be rolled back to its .tmp staging name.
+	if _, err := os.Stat(tmp1); err != nil {
+		t.Fatalf("first output must be rolled back to its tmp path: %v", err)
+	}
+	if _, err := os.Stat(files[0]); !os.IsNotExist(err) {
+		t.Fatalf("first output formal file must be gone: %v", err)
+	}
+	// The second output was never renamed.
+	if _, err := os.Stat(tmp2); err != nil {
+		t.Fatalf("second output tmp file must be untouched: %v", err)
+	}
+	if got, exp := fs.Count(), 0; got != exp {
+		t.Fatalf("file count mismatch: got %v, exp %v", got, exp)
+	}
+}
+
+// TestFileStore_Replace_PruneErrorKeepsStoreLoaded verifies that a
+// FileUnlinking failure while pruning an old file does not abort mid-prune
+// with a stale in-memory state: the failed-to-remove old file stays loaded and
+// usable and the failure is reported as an aggregated error.
+func TestFileStore_Replace_PruneErrorKeepsStoreLoaded(t *testing.T) {
+	dir := MustTempDir()
+	defer os.RemoveAll(dir)
+
+	data := []keyValues{
+		keyValues{"cpu", []tsm1.Value{tsm1.NewValue(0, 1.0)}},
+	}
+	files, err := newFileDir(dir, data...)
+	if err != nil {
+		fatal(t, "creating test files", err)
+	}
+
+	fs := tsm1.NewFileStore(dir)
+	fs.WithObserver(mockObserver{
+		fileFinishing: func(path string) error { return nil },
+		fileUnlinking: func(path string) error {
+			if path == files[0] {
+				return fmt.Errorf("injected FileUnlinking failure for %s", path)
+			}
+			return nil
+		},
+	})
+	if err := fs.Open(); err != nil {
+		fatal(t, "opening file store", err)
+	}
+	defer fs.Close()
+
+	if got, exp := fs.Count(), 1; got != exp {
+		t.Fatalf("file count mismatch: got %v, exp %v", got, exp)
+	}
+
+	// Replace with no new files prunes the old ones; pruning files[0] fails
+	// at the observer.
+	err = fs.Replace(files[:1], nil)
+	if err == nil {
+		t.Fatal("expected replace with failing prune to report an error")
+	}
+	if !strings.Contains(err.Error(), "unable to prune file") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// The failed-to-remove old file must remain loaded and usable.
+	if got, exp := fs.Count(), 1; got != exp {
+		t.Fatalf("file count mismatch: got %v, exp %v", got, exp)
+	}
+	values, err := fs.Read([]byte("cpu"), 0)
+	if err != nil {
+		fatal(t, "reading kept file", err)
+	}
+	if len(values) != 1 {
+		t.Fatalf("value len mismatch: got %v, exp 1", len(values))
+	}
+	if _, err := os.Stat(files[0]); err != nil {
+		t.Fatalf("stat file: %v", err)
+	}
+}
+
 func TestFileStore_Open_Deleted(t *testing.T) {
 	dir := MustTempDir()
 	defer os.RemoveAll(dir)
@@ -2977,5 +3372,251 @@ func BenchmarkFileStore_Stats(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		fsResult = fs.Stats()
+	}
+}
+
+// TestFileStore_Replace_SamePathAndDuplicates is the regression test for
+// round-3 Critical 1: Replace must reject (a) newFiles whose normalized final
+// path intersects oldFiles, (b) duplicate final targets within newFiles
+// (including [.tsm.tmp, .tsm] pairs that normalize to the same path) — before
+// any side effect, leaving the store and disk contents untouched.
+func TestFileStore_Replace_SamePathAndDuplicates(t *testing.T) {
+	dir := MustTempDir()
+	defer os.RemoveAll(dir)
+
+	// A valid TSM file at path P, written BEFORE Open so the store loads it.
+	p := MustWriteTSM(dir, 1, map[string][]tsm1.Value{
+		"cpu,host=A#!~#value": {tsm1.NewValue(1, float64(1.0))},
+	})
+
+	fs := tsm1.NewFileStore(dir)
+	if err := fs.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer fs.Close()
+
+	// (a) final .tsm newFiles equal to an oldFiles path → rejected.
+	if err := fs.Replace([]string{p}, []string{p}); err == nil {
+		t.Fatal("Replace([P],[P]) must be rejected, got nil error")
+	}
+
+	// (b) duplicate final targets within newFiles → rejected.
+	if err := fs.Replace(nil, []string{p, p}); err == nil {
+		t.Fatal("Replace(nil,[P,P]) must be rejected, got nil error")
+	}
+
+	// (c) [.tsm.tmp, .tsm] pair normalizing to the same target → rejected.
+	tmpP := p + ".tmp"
+	if err := os.WriteFile(tmpP, []byte("placeholder"), 0666); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmpP)
+	if err := fs.Replace(nil, []string{tmpP, p}); err == nil {
+		t.Fatal("Replace(nil,[P.tmp,P]) must be rejected, got nil error")
+	}
+
+	// Store must be unchanged: the original file is still readable, count == 1.
+	if got := fs.Count(); got != 1 {
+		t.Fatalf("store count changed after rejections: got %d, want 1", got)
+	}
+	if _, err := os.Stat(p); err != nil {
+		t.Fatalf("original file was removed by rejected Replace: %v", err)
+	}
+}
+
+// TestFileStore_Replace_MultiOutputRollback is the regression test for
+// round-3 Important 5: when a later newFile fails (here: the second output's
+// formal target already exists on disk, tripping the no-clobber guard), all
+// completed earlier iterations must be rolled back in reverse order — readers
+// closed, formal files renamed back to .tmp — and the original error returned.
+// Before the fix, the first output remained as an orphan formal file (loaded
+// again at restart, duplicating data) with a leaked reader holding an fd.
+func TestFileStore_Replace_MultiOutputRollback(t *testing.T) {
+	dir := MustTempDir()
+	defer os.RemoveAll(dir)
+
+	// Two valid TSM files that will become .tmp compaction outputs.
+	f1 := MustWriteTSM(dir, 1, map[string][]tsm1.Value{
+		"cpu,host=A#!~#value": {tsm1.NewValue(1, float64(1.0))},
+	})
+	f2 := MustWriteTSM(dir, 2, map[string][]tsm1.Value{
+		"cpu,host=B#!~#value": {tsm1.NewValue(1, float64(2.0))},
+	})
+
+	// Rename both to .tmp as writeNewFiles would.
+	tmp1, tmp2 := f1+".tmp", f2+".tmp"
+	if err := os.Rename(f1, tmp1); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(f2, tmp2); err != nil {
+		t.Fatal(err)
+	}
+
+	fs := tsm1.NewFileStore(dir)
+	if err := fs.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer fs.Close()
+
+	// Pre-create the formal target of the SECOND output AFTER Open (Open
+	// validates every *.tsm in the dir, so an invalid stub must not exist yet)
+	// so it trips the no-clobber guard mid-loop, after the first output has
+	// been renamed+opened.
+	preExisting := filepath.Join(dir, tsm1.DefaultFormatFileName(2, 1)+".tsm")
+	if err := os.WriteFile(preExisting, []byte("pre-existing"), 0666); err != nil {
+		t.Fatal(err)
+	}
+
+	// The first output's formal path must not pre-exist.
+	formal1 := filepath.Join(dir, tsm1.DefaultFormatFileName(1, 1)+".tsm")
+	os.Remove(formal1)
+
+	err := fs.Replace(nil, []string{tmp1, tmp2})
+	if err == nil {
+		t.Fatal("expected error from the second output's no-clobber guard")
+	}
+
+	// Rollback: the first output's formal file must NOT remain on disk — it must
+	// be renamed back to its .tmp name.
+	if _, statErr := os.Stat(formal1); statErr == nil {
+		t.Fatalf("rollback failed: orphan formal file %s remains on disk", formal1)
+	}
+	if _, statErr := os.Stat(tmp1); statErr != nil {
+		t.Fatalf("rollback failed: %s was not renamed back to .tmp: %v", tmp1, statErr)
+	}
+	if _, statErr := os.Stat(tmp2); statErr != nil {
+		t.Fatalf("second output .tmp missing: %v", statErr)
+	}
+	if _, statErr := os.Stat(preExisting); statErr != nil {
+		t.Fatalf("pre-existing file was clobbered: %v", statErr)
+	}
+	// Store must be empty (no readers leaked into the active set).
+	if got := fs.Count(); got != 0 {
+		t.Fatalf("store count after failed replace: got %d, want 0", got)
+	}
+}
+
+// mustSymlink creates newname as a symlink to oldname, skipping the test when
+// the host does not allow creating symlinks (Windows without developer mode or
+// administrator privileges).
+func mustSymlink(t *testing.T, oldname, newname string) {
+	t.Helper()
+	if err := os.Symlink(oldname, newname); err != nil {
+		t.Skipf("symlinks unavailable on this host: %v", err)
+	}
+}
+
+// TestFileStore_Replace_RejectsSymlinkSource verifies that a newFiles entry
+// whose staged .tsm.tmp path is a symlink to an old file is rejected in
+// validation, before any side effect: the install loop renames the source by
+// pathname, so a symlink source would land as a formal .tsm symlink and the
+// prune loop would delete the real old file while the alias reader survived
+// it. The staging name targets a fresh formal path, so only the source
+// symlink check can reject it.
+func TestFileStore_Replace_RejectsSymlinkSource(t *testing.T) {
+	dir := MustTempDir()
+	defer os.RemoveAll(dir)
+
+	data := []keyValues{
+		keyValues{"cpu", []tsm1.Value{tsm1.NewValue(0, 1.0)}},
+	}
+	files, err := newFileDir(dir, data...)
+	if err != nil {
+		fatal(t, "creating test files", err)
+	}
+
+	fs := tsm1.NewFileStore(dir)
+	if err := fs.Open(); err != nil {
+		fatal(t, "opening file store", err)
+	}
+	defer fs.Close()
+
+	if got, exp := fs.Count(), 1; got != exp {
+		t.Fatalf("file count mismatch: got %v, exp %v", got, exp)
+	}
+
+	// A .tsm.tmp staging path named after a fresh formal target, symlinked to
+	// the old file.
+	formal := filepath.Join(dir, tsm1.DefaultFormatFileName(2, 1)+".tsm")
+	link := formal + "." + tsm1.TmpTSMFileExtension
+	mustSymlink(t, files[0], link)
+
+	err = fs.Replace([]string{files[0]}, []string{link})
+	if err == nil {
+		t.Fatal("expected replace with a symlink .tsm.tmp source to be rejected")
+	}
+	if !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Validation must reject before any side effect: the old file is intact,
+	// nothing was installed at the formal path (checked with Lstat so a
+	// symlink left behind cannot hide) and the store is unchanged.
+	if _, err := os.Stat(files[0]); err != nil {
+		t.Fatalf("old file must be untouched: %v", err)
+	}
+	if _, err := os.Lstat(formal); !os.IsNotExist(err) {
+		t.Fatalf("no formal file may be created when validation rejects: %v", err)
+	}
+	if got, exp := fs.Count(), 1; got != exp {
+		t.Fatalf("file count mismatch: got %v, exp %v", got, exp)
+	}
+}
+
+// TestFileStore_Replace_RejectsDanglingSymlinkSource verifies that a staged
+// .tsm.tmp path that is a dangling symlink is rejected before any side effect
+// and nothing remains at the formal path. Before the Lstat fixes, the install
+// loop renamed such a symlink by pathname, os.Open on the dangling formal path
+// failed, and the Stat-based rollback skipped the rename-back (os.Stat follows
+// the link and reports ENOENT), leaving a dangling formal .tsm that made
+// FileStore.Open fail at restart. Validation now rejects symlink sources
+// outright; the rollback's switch to Lstat stays as defense-in-depth for the
+// residual window between validation and install, which is not
+// deterministically reachable through the public API.
+//
+// Note: the fallback stat-guarded rename (errNoReplaceUnsupported), which also
+// switched to Lstat, is not exercised here: Windows always has MoveFileEx and
+// typical Linux filesystems support renameat2, so reaching that branch would
+// require a platform shim. There Lstat refuses a dangling-symlink target
+// exactly as renameat2 RENAME_NOREPLACE would.
+func TestFileStore_Replace_RejectsDanglingSymlinkSource(t *testing.T) {
+	dir := MustTempDir()
+	defer os.RemoveAll(dir)
+
+	fs := tsm1.NewFileStore(dir)
+	if err := fs.Open(); err != nil {
+		fatal(t, "opening file store", err)
+	}
+	defer fs.Close()
+
+	// A .tsm.tmp staging path that is a dangling symlink.
+	formal := filepath.Join(dir, tsm1.DefaultFormatFileName(1, 1)+".tsm")
+	link := formal + "." + tsm1.TmpTSMFileExtension
+	mustSymlink(t, filepath.Join(dir, "does-not-exist.tsm"), link)
+
+	err := fs.Replace(nil, []string{link})
+	if err == nil {
+		t.Fatal("expected replace with a dangling symlink .tsm.tmp source to be rejected")
+	}
+	if !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Nothing may remain at the formal path (Lstat so a symlink cannot hide),
+	// the staging symlink itself is untouched, and a fresh store over the same
+	// directory still opens — the restart-bricking orphan must not exist.
+	if _, err := os.Lstat(formal); !os.IsNotExist(err) {
+		t.Fatalf("no formal file may remain: %v", err)
+	}
+	if _, err := os.Lstat(link); err != nil {
+		t.Fatalf("staging symlink must be untouched: %v", err)
+	}
+	fs2 := tsm1.NewFileStore(dir)
+	if err := fs2.Open(); err != nil {
+		fatal(t, "reopening file store", err)
+	}
+	defer fs2.Close()
+	if got, exp := fs2.Count(), 0; got != exp {
+		t.Fatalf("file count mismatch: got %v, exp %v", got, exp)
 	}
 }

@@ -26,6 +26,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"go.uber.org/zap"
+
 	"github.com/influxdata/influxdb/pkg/limiter"
 	"github.com/influxdata/influxdb/tsdb"
 )
@@ -131,6 +133,24 @@ type DefaultPlanner struct {
 	// filesInUse is the set of files that have been returned as part of a plan and might
 	// be being compacted.  Two plans should not return the same file at any given time.
 	filesInUse map[string]struct{}
+
+	// maxFullCompactionFiles bounds the number of TSM files opened simultaneously
+	// during a full compaction. A value of 0 disables rolling and preserves the
+	// legacy single-group behavior (all eligible files in one compaction). A
+	// positive value bounds RSS — each open reader pins its mmap + indirectIndex
+	// + offsets table — by splitting a full compaction of N > maxFullCompactionFiles
+	// files into rolling rounds targeting maxFullCompactionFiles files each; the
+	// engine's one-group-per-tick loop re-plans each round. The production default
+	// is set via tsdb.Config.MaxFullCompactionFiles wired in NewEngine. The default
+	// is 0 (rolling disabled, legacy single-group); a positive value opts in.
+	maxFullCompactionFiles int
+
+	// rollingInProgress is true while a rolling full compaction is mid-flight.
+	// When set, Plan skips the compactFullWriteColdDuration gate so the
+	// remaining rounds are scheduled to convergence even if the shard receives
+	// new writes mid-roll. It is cleared once findGenerations yields a single
+	// fully-compacted generation (or no eligible files).
+	rollingInProgress bool
 }
 
 type fileStore interface {
@@ -204,6 +224,35 @@ func (t *tsmGeneration) hasTombstones() bool {
 
 func (c *DefaultPlanner) SetFileStore(fs *FileStore) {
 	c.FileStore = fs
+}
+
+// SetMaxFullCompactionFiles sets the SOFT cap on the number of TSM files opened
+// simultaneously during a full-compaction round. A value <= 0 (the default)
+// disables rolling and uses the legacy single-group full compaction; a positive
+// N opts into rolling, which merges oldest-first in a left fold targeting N
+// files per round. Rounds are selected whole generations at a time, so a large
+// first generation — plus the one extra generation the planner may append to
+// guarantee progress — can exceed N, sometimes by a wide margin; this setting
+// does NOT guarantee a bound on memory usage or RSS (each open reader pins its
+// mmap, indirectIndex, and offsets table). The value comes from
+// tsdb.Config.MaxFullCompactionFiles via NewEngine.
+func (c *DefaultPlanner) SetMaxFullCompactionFiles(n int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if n <= 0 {
+		c.maxFullCompactionFiles = 0
+		return
+	}
+	c.maxFullCompactionFiles = n
+}
+
+// RollingInProgress reports whether a rolling full compaction is mid-flight.
+// The engine uses this to boost level-4 scheduler priority so the rolling
+// rounds converge instead of being starved by sustained level-1 work.
+func (c *DefaultPlanner) RollingInProgress() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.rollingInProgress
 }
 
 func (c *DefaultPlanner) ParseFileName(path string) (int, int, error) {
@@ -418,10 +467,13 @@ func (c *DefaultPlanner) Plan(lastWrite time.Time) []CompactionGroup {
 
 	c.mu.RLock()
 	forceFull := c.forceFull
+	rolling := c.rollingInProgress
 	c.mu.RUnlock()
 
-	// first check if we should be doing a full compaction because nothing has been written in a long time
-	if forceFull || c.compactFullWriteColdDuration > 0 && time.Since(lastWrite) > c.compactFullWriteColdDuration && len(generations) > 1 {
+	// first check if we should be doing a full compaction because nothing has been written in a long time.
+	// If a rolling full compaction is mid-flight (rollingInProgress), skip the cold-duration gate
+	// so the remaining rounds converge even if the shard receives new writes mid-roll.
+	if forceFull || rolling || c.compactFullWriteColdDuration > 0 && time.Since(lastWrite) > c.compactFullWriteColdDuration && len(generations) > 1 {
 
 		// Reset the full schedule if we planned because of it.
 		if forceFull {
@@ -463,7 +515,91 @@ func (c *DefaultPlanner) Plan(lastWrite time.Time) []CompactionGroup {
 
 		// Make sure we have more than 1 file and more than 1 generation
 		if len(tsmFiles) <= 1 || genCount <= 1 {
+			// No full work to do. If a rolling full was in flight, it has converged.
+			if rolling {
+				c.mu.Lock()
+				c.rollingInProgress = false
+				c.mu.Unlock()
+			}
 			return nil
+		}
+
+		// Rolling full compaction: if a simultaneous-open cap is configured
+		// (maxFullCompactionFiles > 0) and the eligible file count exceeds it,
+		// select complete generations (oldest first) up to the cap. The engine's
+		// one-group-per-tick loop re-invokes Plan for each subsequent round after
+		// this round's output lands on disk and findGenerations picks it up.
+		// NOTE on write amplification: because the output inherits the max
+		// selected generation and stays on the oldest side, this is a left
+		// fold — the oldest data is re-merged every round, giving
+		// ceil((N-1)/(K-1)) rounds (NOT log_K(N)). A cap of 0 (the default when
+		// unset) preserves the legacy single-group behavior.
+		maxK := c.maxFullCompactionFiles
+		if maxK > 0 && len(tsmFiles) > maxK {
+			// Mark a rolling full as in flight so subsequent Plan calls skip
+			// the cold-duration gate until convergence.
+			if !rolling {
+				c.mu.Lock()
+				c.rollingInProgress = true
+				c.mu.Unlock()
+			}
+
+			// Generation-atomic selection: never cut mid-generation. compact()
+			// derives the output sequence from the input's max generation, so a
+			// mid-generation cut would make the output filename collide with an
+			// excluded higher-seq file of that generation → os.Rename silently
+			// overwrites it → permanent data loss. Filenames are zero-padded
+			// `%09d-%09d`, so same-generation files are adjacent after sorting.
+			// Build generation boundaries from the sorted list, then greedily
+			// select whole generations up to the cap.
+			type genSpan struct{ start, end int }
+			var spans []genSpan
+			{
+				var start int
+				var prevGen int
+				for i, f := range tsmFiles {
+					g, _, err := c.FileStore.ParseFileName(f)
+					if err != nil {
+						return nil
+					}
+					if i > 0 && g != prevGen {
+						spans = append(spans, genSpan{start: start, end: i})
+						start = i
+					}
+					prevGen = g
+				}
+				spans = append(spans, genSpan{start: start, end: len(tsmFiles)})
+			}
+
+			// Greedily include whole generations while the file count stays <= maxK.
+			// The first generation is always included (a generation must be
+			// compacted atomically), so if it alone exceeds maxK the round
+			// overflows the cap by that one generation. maxK is therefore a SOFT
+			// cap: bounded to the first generation (whole, however large) plus
+			// the convergence extension below — not a hard reader limit.
+			cutIdx := 0
+			selGens := 0
+			for _, sp := range spans {
+				if selGens > 0 && cutIdx+sp.end-sp.start > maxK {
+					break
+				}
+				cutIdx = sp.end
+				selGens++
+			}
+			// A single-generation round cannot converge: the output carries the
+			// input's max generation, and if the inputs are near the 2GB file
+			// limit the output reshapes into a similar file count — the next
+			// round would plan identically forever. Extend the group to include
+			// the next whole generation (over the cap) so the round merges at
+			// least two generations and makes progress. The group is a prefix of
+			// the sorted file list, so spans[1] is the only adjacent candidate —
+			// this bounds the overflow to gen[0] + gen[1]. The pre-check above
+			// guarantees genCount >= 2, so spans[1] exists here.
+			if selGens == 1 && len(spans) > 1 {
+				cutIdx = spans[1].end
+			}
+
+			tsmFiles = tsmFiles[:cutIdx]
 		}
 
 		group := []CompactionGroup{tsmFiles}
@@ -705,6 +841,16 @@ type Compactor struct {
 	// RateLimit is the limit for disk writes for all concurrent compactions.
 	RateLimit limiter.Rate
 
+	// Logger receives hot-key gather warnings (see checkHotKeyGather in
+	// compact_streaming.go). Wired from the engine's logger; a nil logger
+	// suppresses reporting.
+	Logger *zap.Logger
+
+	// UseStreamingIterator, when true, selects streamingBatchKeyIterator
+	// (memory-bounded, byte-identical output) instead of tsmBatchKeyIterator
+	// for CompactFull/CompactFast. Default false; flip after A/B validation.
+	UseStreamingIterator bool
+
 	formatFileName FormatFileNameFunc
 	parseFileName  ParseFileNameFunc
 
@@ -728,6 +874,7 @@ type Compactor struct {
 // NewCompactor returns a new instance of Compactor.
 func NewCompactor() *Compactor {
 	return &Compactor{
+		Logger:         zap.NewNop(),
 		formatFileName: DefaultFormatFileName,
 		parseFileName:  DefaultParseFileName,
 	}
@@ -857,7 +1004,7 @@ func (c *Compactor) WriteSnapshot(cache *Cache) ([]string, error) {
 	for i := 0; i < concurrency; i++ {
 		go func(sp *Cache) {
 			iter := NewCacheKeyIterator(sp, tsdb.DefaultMaxPointsPerBlock, intC)
-			files, err := c.writeNewFiles(c.FileStore.NextGeneration(), 0, nil, iter, throttle)
+			files, err := c.writeNewFiles(c.FileStore.NextGeneration(), 0, nil, iter, throttle, false)
 			resC <- res{files: files, err: err}
 
 		}(splits[i])
@@ -945,12 +1092,36 @@ func (c *Compactor) compact(fast bool, tsmFiles []string) ([]string, error) {
 		return nil, nil
 	}
 
-	tsm, err := NewTSMBatchKeyIterator(size, fast, intC, tsmFiles, trs...)
+	var (
+		tsm KeyIterator
+		err error
+	)
+	if c.UseStreamingIterator {
+		tsm, err = NewStreamingBatchKeyIterator(size, fast, intC, tsmFiles, trs...)
+	} else {
+		tsm, err = NewTSMBatchKeyIterator(size, fast, intC, tsmFiles, trs...)
+	}
 	if err != nil {
 		return nil, err
 	}
 
-	return c.writeNewFiles(maxGeneration, maxSequence, tsmFiles, tsm, true)
+	// Route hot-key gather warnings (see checkHotKeyGather in
+	// compact_streaming.go) through the compactor's logger; both iterators
+	// default to a nil logger, which suppresses reporting.
+	switch it := tsm.(type) {
+	case *tsmBatchKeyIterator:
+		it.logger = c.Logger
+	case *streamingBatchKeyIterator:
+		it.logger = c.Logger
+	}
+
+	// Rely on the EstimatedIndexSize heuristic (now a SUM of input reader index
+	// sizes, not the average) to pick the disk-buffered index writer when the
+	// output index would be large. This lets small level-1 merges (SUM < 64MB)
+	// use the faster in-memory index while large/full compactions (SUM > 64MB)
+	// stream the index to a .idx.tmp sidecar, bounding output index memory.
+	// forceDiskIndex=false here; only the snapshot path also passes false.
+	return c.writeNewFiles(maxGeneration, maxSequence, tsmFiles, tsm, true, false)
 }
 
 // CompactFull writes multiple smaller TSM files into 1 or more larger files.
@@ -1030,8 +1201,10 @@ func (c *Compactor) removeTmpFiles(files []string) error {
 }
 
 // writeNewFiles writes from the iterator into new TSM files, rotating
-// to a new file once it has reached the max TSM file size.
-func (c *Compactor) writeNewFiles(generation, sequence int, src []string, iter KeyIterator, throttle bool) ([]string, error) {
+// to a new file once it has reached the max TSM file size. When forceDiskIndex
+// is true, each output file uses a disk-buffered index (.idx.tmp) to bound
+// output index memory regardless of the EstimatedIndexSize heuristic.
+func (c *Compactor) writeNewFiles(generation, sequence int, src []string, iter KeyIterator, throttle bool, forceDiskIndex bool) ([]string, error) {
 	// These are the new TSM files written
 	var files []string
 
@@ -1042,7 +1215,7 @@ func (c *Compactor) writeNewFiles(generation, sequence int, src []string, iter K
 		fileName := filepath.Join(c.Dir, c.formatFileName(generation, sequence)+"."+TSMFileExtension+"."+TmpTSMFileExtension)
 
 		// Write as much as possible to this file
-		err := c.write(fileName, iter, throttle)
+		err := c.write(fileName, iter, throttle, forceDiskIndex)
 
 		// We've hit the max file limit and there is more to write.  Create a new file
 		// and continue.
@@ -1081,7 +1254,7 @@ func (c *Compactor) writeNewFiles(generation, sequence int, src []string, iter K
 	return files, nil
 }
 
-func (c *Compactor) write(path string, iter KeyIterator, throttle bool) (err error) {
+func (c *Compactor) write(path string, iter KeyIterator, throttle bool, forceDiskIndex bool) (err error) {
 	fd, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_EXCL, 0666)
 	if err != nil {
 		return errCompactionInProgress{err: err}
@@ -1105,9 +1278,14 @@ func (c *Compactor) write(path string, iter KeyIterator, throttle bool) (err err
 		limitWriter = limiter.NewWriterWithRate(fd, c.RateLimit)
 	}
 
-	// Use a disk based TSM buffer if it looks like we might create a big index
-	// in memory.
-	if iter.EstimatedIndexSize() > 64*1024*1024 {
+	// Use a disk-buffered TSM index when the estimated output index is large
+	// (SUM of input reader index sizes > 64MB), or when the caller forces it.
+	// The disk buffer streams the index to a .idx.tmp sidecar (~1MB in memory)
+	// instead of accumulating it in an unbounded in-memory bytes.Buffer. Both
+	// production callers (compact and WriteSnapshot) pass forceDiskIndex=false,
+	// relying on the now-correct SUM heuristic; the parameter is retained for
+	// future forced-disk use.
+	if forceDiskIndex || iter.EstimatedIndexSize() > 64*1024*1024 {
 		w, err = NewTSMWriterWithDiskBuffer(limitWriter)
 		if err != nil {
 			return err
@@ -1628,6 +1806,12 @@ type tsmBatchKeyIterator struct {
 	// currentTsm is the current TSM file being iterated over
 	currentTsm string
 
+	// logger, when non-nil, receives hot-key gather warnings (see
+	// checkHotKeyGather in compact_streaming.go). Wired from Compactor.Logger
+	// in compact(); nil suppresses reporting. streamingBatchKeyIterator
+	// inherits it through embedding.
+	logger *zap.Logger
+
 	iterators []*BlockIterator
 	blocks    blocks
 
@@ -1685,11 +1869,21 @@ func (k *tsmBatchKeyIterator) hasMergedValues() bool {
 }
 
 func (k *tsmBatchKeyIterator) EstimatedIndexSize() int {
-	var size uint32
+	// Sum (not average) of input readers' index sizes: when N small files
+	// merge into one large output, the output index size approximates the
+	// sum of input index sizes (minus dedup savings). Averaging under-estimates
+	// by a factor of N and misfires the 64MB disk-buffer heuristic. Accumulate
+	// in uint64 — a uint32 wraps past 4GiB and could fall below the threshold.
+	var size uint64
 	for _, r := range k.readers {
-		size += r.IndexSize()
+		size += uint64(r.IndexSize())
 	}
-	return int(size) / len(k.readers)
+	// Saturate at MaxInt so 32-bit builds (where int is 32-bit) cannot wrap
+	// negative on sums above ~2GiB and misfire the disk-buffer threshold.
+	if size > uint64(math.MaxInt32) {
+		size = uint64(math.MaxInt32)
+	}
+	return int(size)
 }
 
 // Next returns true if there are any values remaining in the iterator.
@@ -1816,6 +2010,11 @@ RETRY:
 
 	// Now we need to find all blocks that match the min key so we can combine and dedupe
 	// the blocks if necessary
+	//
+	// gatheredStart marks the first block appended for this key so the hot-key
+	// accounting below sums only what this gather pass collected (k.blocks is
+	// normally empty here; blocks can only be left over on decode-error paths).
+	gatheredStart := len(k.blocks)
 	for i, b := range k.buf {
 		if len(b) == 0 {
 			continue
@@ -1829,6 +2028,13 @@ RETRY:
 	if len(k.blocks) == 0 {
 		return false
 	}
+
+	// Hot-key gather accounting: the blocks just gathered for this key are all
+	// resident until merged — fresh heap copies in pread mode, mmap aliases
+	// otherwise — making this the compaction's per-key heap peak (see
+	// checkHotKeyGather in compact_streaming.go). Report keys whose gather
+	// exceeds hotKeyGatherWarnBytes, at most once per key.
+	checkHotKeyGather(k.logger, k.key, k.blocks[gatheredStart:])
 
 	k.merge()
 

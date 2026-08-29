@@ -177,9 +177,10 @@ type FileStore struct {
 	currentGeneration int
 	dir               string
 
-	files           []TSMFile
-	tsmMMAPWillNeed bool          // If true then the kernel will be advised MMAP_WILLNEED for TSM files.
-	openLimiter     limiter.Fixed // limit the number of concurrent opening TSM files.
+	files             []TSMFile
+	tsmMMAPWillNeed   bool          // If true then the kernel will be advised MMAP_WILLNEED for TSM files.
+	maxMmapTSMFileSize int64         // Threshold above which pread is used instead of mmap. -1=mmap always, 0=pread always.
+	openLimiter       limiter.Fixed // limit the number of concurrent opening TSM files.
 
 	logger       *zap.Logger // Logger to be used for important messages
 	traceLogger  *zap.Logger // Logger to be used when trace-logging is on.
@@ -232,12 +233,13 @@ func (f FileStat) ContainsKey(key []byte) bool {
 func NewFileStore(dir string) *FileStore {
 	logger := zap.NewNop()
 	fs := &FileStore{
-		dir:          dir,
-		lastModified: time.Time{},
-		logger:       logger,
-		traceLogger:  logger,
-		openLimiter:  limiter.NewFixed(runtime.GOMAXPROCS(0)),
-		stats:        &FileStoreStatistics{},
+		dir:               dir,
+		lastModified:      time.Time{},
+		logger:            logger,
+		traceLogger:       logger,
+		openLimiter:       limiter.NewFixed(runtime.GOMAXPROCS(0)),
+		stats:             &FileStoreStatistics{},
+		maxMmapTSMFileSize: -1, // default: always mmap (legacy); set 0 for pread (network storage)
 		purger: &purger{
 			files:  map[string]TSMFile{},
 			logger: logger,
@@ -247,6 +249,12 @@ func NewFileStore(dir string) *FileStore {
 	}
 	fs.purger.fileStore = fs
 	return fs
+}
+
+// SetMaxMmapTSMFileSize sets the threshold above which TSM files use pread instead
+// of whole-file mmap. -1 = always mmap (legacy); 0 = always pread (network storage).
+func (f *FileStore) SetMaxMmapTSMFileSize(n int64) {
+	f.maxMmapTSMFileSize = n
 }
 
 // WithObserver sets the observer for the file store.
@@ -540,7 +548,7 @@ func (f *FileStore) Open() error {
 			defer f.openLimiter.Release()
 
 			start := time.Now()
-			df, err := NewTSMReader(file, WithMadviseWillNeed(f.tsmMMAPWillNeed))
+			df, err := NewTSMReader(file, WithMadviseWillNeed(f.tsmMMAPWillNeed), WithMaxMmapFileSize(f.maxMmapTSMFileSize))
 			f.logger.Info("Opened file",
 				zap.String("path", file.Name()),
 				zap.Int("id", idx),
@@ -726,50 +734,284 @@ func (f *FileStore) Replace(oldFiles, newFiles []string) error {
 	return f.replace(oldFiles, newFiles, nil)
 }
 
+// errNoReplaceUnsupported is returned by installNoReplace when the platform or
+// the underlying filesystem cannot perform an atomic no-replace rename;
+// replace() then falls back to its Stat-guarded rename sequence.
+var errNoReplaceUnsupported = errors.New("filestore: atomic no-replace rename unsupported on this platform or filesystem")
+
+// tsmTmpExt is the .tsm.tmp staging extension (without the leading dot).
+const tsmTmpExt = TSMFileExtension + "." + TmpTSMFileExtension
+
+// hasTSMSuffix reports whether path ends in a .tsm or .tsm.tmp extension. On
+// Windows the check is case-insensitive: paths are case-insensitive there, so
+// FILE.TSM names the same file as file.tsm — treating a case alias as a
+// non-TSM path would let it dodge the same-path validation while the prune
+// loop still deletes by pathname. Elsewhere the check is case-sensitive, as
+// before.
+func hasTSMSuffix(path string) bool {
+	if runtime.GOOS == "windows" {
+		path = strings.ToLower(path)
+	}
+	return strings.HasSuffix(path, tsmTmpExt) || strings.HasSuffix(path, TSMFileExtension)
+}
+
+// hasTSMTmpSuffix reports whether path ends in the .tsm.tmp staging extension,
+// case-insensitively on Windows (see hasTSMSuffix).
+func hasTSMTmpSuffix(path string) bool {
+	if runtime.GOOS == "windows" {
+		path = strings.ToLower(path)
+	}
+	return strings.HasSuffix(path, tsmTmpExt)
+}
+
+// normalizeTSMPath canonicalizes a path for identity comparisons in replace:
+// it makes the path absolute (relative to the process cwd — compaction always
+// passes absolute paths, but tests and other callers may not) and lexically
+// cleans it, so aliases such as dir/./file.tsm or dir/sub/../file.tsm compare
+// equal to dir/file.tsm. On Windows, where paths are case-insensitive, the
+// result is also lower-cased so case differences cannot defeat the comparison.
+func normalizeTSMPath(p string) string {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		// filepath.Abs only fails when the working directory cannot be
+		// determined; fall back to a lexical clean so comparisons still work.
+		abs = filepath.Clean(p)
+	}
+	if runtime.GOOS == "windows" {
+		return strings.ToLower(abs)
+	}
+	return abs
+}
+
+// joinPruneErrors folds the errors collected while pruning old files into a
+// single error so Replace reports every failure instead of just the first.
+func joinPruneErrors(errs []error) error {
+	if len(errs) == 0 {
+		return nil
+	}
+	err := errs[0]
+	for _, e := range errs[1:] {
+		err = fmt.Errorf("%v; %w", err, e)
+	}
+	return err
+}
+
 func (f *FileStore) replace(oldFiles, newFiles []string, updatedFn func(r []TSMFile)) error {
 	if len(oldFiles) == 0 && len(newFiles) == 0 {
 		return nil
+	}
+
+	tsmTmpSuffix := "." + TmpTSMFileExtension
+
+	// Input validation BEFORE any side effect (observer, rename, open):
+	// canonicalize every oldFiles entry and every newFiles target (the final
+	// .tsm path a .tsm.tmp input is installed as), then reject (a) newFiles
+	// targets that intersect oldFiles, (b) duplicate final targets within
+	// newFiles, and (c) newFiles targets naming the same on-disk file as an
+	// oldFile through a symlink or hardlink alias. All comparisons run on
+	// paths made absolute and lexically cleaned (case-folded on Windows):
+	// string-only checks let aliases such as dir/./file.tsm or DIR/file.tsm
+	// defeat the same-path protection — the prune loop deletes by pathname,
+	// so the alias reader would survive while the real path was unlinked and
+	// Replace would return nil with the live file gone after restart. The
+	// per-loop no-clobber guard below remains as defense-in-depth for targets
+	// created between this check and the rename.
+	oldSet := make(map[string]string, len(oldFiles)) // normalized old path -> path as given
+	for _, of := range oldFiles {
+		oldSet[normalizeTSMPath(of)] = of
+	}
+
+	// The on-disk identities of the old files, collected once: every newFiles
+	// source and target below is compared against them to catch aliases.
+	oldInfos := make([]os.FileInfo, 0, len(oldFiles))
+	for _, of := range oldFiles {
+		if fi, err := os.Stat(of); err == nil {
+			oldInfos = append(oldInfos, fi)
+		}
+	}
+
+	// newOrdered keeps the caller's paths exactly as given, in order, paired
+	// with the final .tsm target each entry installs as: the renames below
+	// must use the original paths.
+	type newFile struct {
+		path   string
+		target string
+	}
+	newOrdered := make([]newFile, 0, len(newFiles))
+	seen := make(map[string]struct{}, len(newFiles))
+	for _, file := range newFiles {
+		if !hasTSMSuffix(file) {
+			// Not a .tsm or .tsm.tmp file; skipped by the install loop too.
+			continue
+		}
+		target := file
+		if hasTSMTmpSuffix(file) {
+			// Strip the .tmp suffix (it may be spelled .TMP on Windows).
+			target = file[:len(file)-len(tsmTmpSuffix)]
+		}
+		normTarget := normalizeTSMPath(target)
+		if orig, ok := oldSet[normTarget]; ok {
+			return fmt.Errorf("filestore: new file %s targets existing old file %s; same-path replacement is not supported", file, orig)
+		}
+		if _, ok := seen[normTarget]; ok {
+			return fmt.Errorf("filestore: duplicate new file target %s (from %s)", target, file)
+		}
+		seen[normTarget] = struct{}{}
+
+		// The staged source must be a regular compaction output, never a
+		// symlink: the install loop renames it by pathname, so a .tsm.tmp
+		// symlink (dangling or not) would land as a formal .tsm symlink, and
+		// a dangling one would make FileStore.Open fail at restart. Its
+		// identity must not be an oldFile either (hardlink alias).
+		if fi, err := os.Lstat(file); err == nil {
+			if fi.Mode()&os.ModeSymlink != 0 {
+				return fmt.Errorf("filestore: new file %s is a symlink; compaction outputs must be regular files", file)
+			}
+			for _, fiOld := range oldInfos {
+				if os.SameFile(fi, fiOld) {
+					return fmt.Errorf("filestore: new file %s is the same file as an old file being replaced; same-path replacement is not supported", file)
+				}
+			}
+		}
+
+		newOrdered = append(newOrdered, newFile{path: file, target: target})
+	}
+
+	// Paths that normalize differently can still name the same file on disk
+	// through a symlink or hardlink, so compare identities for every target
+	// that already exists on disk: replacing such a file would let the prune
+	// loop unlink the live pathname while the alias reader survived.
+	if len(oldInfos) > 0 {
+		for _, nf := range newOrdered {
+			fiNew, err := os.Stat(nf.target)
+			if err != nil {
+				// Fresh compaction output: nothing to alias yet.
+				continue
+			}
+			for _, fiOld := range oldInfos {
+				if os.SameFile(fiNew, fiOld) {
+					return fmt.Errorf("filestore: new file %s is the same file as an old file being replaced; same-path replacement is not supported", nf.path)
+				}
+			}
+		}
 	}
 
 	f.mu.RLock()
 	maxTime := f.lastModified
 	f.mu.RUnlock()
 
-	updated := make([]TSMFile, 0, len(newFiles))
-	tsmTmpExt := fmt.Sprintf("%s.%s", TSMFileExtension, TmpTSMFileExtension)
+	updated := make([]TSMFile, 0, len(newOrdered))
+
+	// done tracks each completed iteration so that, if a later iteration fails,
+	// the earlier renames can be rolled back in reverse order (close the opened
+	// reader, rename the formal file back to its .tmp name). Without this, a
+	// mid-loop failure leaves orphan formal files (duplicating data at restart)
+	// and leaked readers holding fds/mmaps until process exit.
+	type doneStep struct {
+		reader TSMFile // nil if the reader was not opened
+		formal string  // formal path the file was renamed to
+		tmp    string  // original .tmp path
+	}
+	var done []doneStep
+	// rollback undoes every completed step in reverse order and returns a
+	// combined error identifying any orphan path when an undo itself fails.
+	// Each step is undone at most once: a step whose formal file no longer
+	// exists was already renamed back, so rollback stays idempotent.
+	rollback := func(err error) error {
+		for i := len(done) - 1; i >= 0; i-- {
+			step := done[i]
+			if step.reader != nil {
+				step.reader.Close()
+			}
+			if step.formal != step.tmp {
+				// Lstat, not Stat: a formal path that is itself a dangling
+				// symlink (a staged symlink source that was installed) must
+				// be renamed back too. Stat follows the link, reports ENOENT
+				// and would leave the dangling formal symlink in place —
+				// FileStore.Open then fails at restart.
+				if _, serr := os.Lstat(step.formal); os.IsNotExist(serr) {
+					continue
+				}
+				if err1 := os.Rename(step.formal, step.tmp); err1 != nil {
+					err = fmt.Errorf("%w (rollback failed for %s: %v — orphan formal file remains)", err, step.formal, err1)
+				}
+			}
+		}
+		return err
+	}
+
+	// noReplaceWarned logs the fallback warning below at most once per
+	// replace() call, not once per file.
+	noReplaceWarned := false
 
 	// Rename all the new files to make them live on restart
-	for _, file := range newFiles {
-		if !strings.HasSuffix(file, tsmTmpExt) && !strings.HasSuffix(file, TSMFileExtension) {
-			// This isn't a .tsm or .tsm.tmp file.
-			continue
-		}
+	for _, nf := range newOrdered {
+		file := nf.path
 
 		// give the observer a chance to process the file first.
 		if err := f.obs.FileFinishing(file); err != nil {
-			return err
+			return rollback(err)
 		}
 
 		var oldName, newName = file, file
-		if strings.HasSuffix(oldName, tsmTmpExt) {
+		if hasTSMTmpSuffix(oldName) {
 			// The new TSM files have a tmp extension.  First rename them.
-			newName = file[:len(file)-4]
-			if err := os.Rename(oldName, newName); err != nil {
-				return err
+			newName = oldName[:len(oldName)-len(tsmTmpSuffix)]
+			// No-clobber install: refuse to rename over ANY existing file,
+			// atomically where the platform supports it (renameat2
+			// RENAME_NOREPLACE on Linux, MoveFileEx without
+			// MOVEFILE_REPLACE_EXISTING on Windows). Normal compaction always
+			// targets a fresh path (output sequence is max-input-sequence + 1),
+			// so an existing target means a bug — silently overwriting it would
+			// destroy data (os.Rename replaces on both Unix and Windows, and a
+			// Stat guard leaves a TOCTOU window plus dangling-symlink targets).
+			// There is deliberately no oldFiles exception: same-path
+			// replacement is not a legitimate operation in this design, and
+			// allowing it lets the prune loop delete both the old and the
+			// just-installed new reader (they share a pathname).
+			if err := installNoReplace(oldName, newName); err != nil {
+				switch {
+				case errors.Is(err, os.ErrExist):
+					return rollback(fmt.Errorf("filestore: refusing to rename %s over existing file %s", oldName, newName))
+				case errors.Is(err, errNoReplaceUnsupported):
+					// Platform or filesystem without atomic no-replace
+					// support: fall back to a Stat-guarded rename. A residual
+					// race between Stat and Rename remains only on these
+					// platforms.
+					if !noReplaceWarned {
+						noReplaceWarned = true
+						f.logger.Warn("atomic no-replace rename unsupported on this platform/filesystem; falling back to stat-guarded rename")
+					}
+					// Lstat, not Stat: a dangling-symlink target must be
+					// refused exactly as the atomic no-replace rename would
+					// refuse it; Stat follows the link and reports ENOENT,
+					// letting the rename silently replace the symlink.
+					if _, serr := os.Lstat(newName); serr == nil {
+						return rollback(fmt.Errorf("filestore: refusing to rename %s over existing file %s", oldName, newName))
+					} else if !os.IsNotExist(serr) {
+						return rollback(fmt.Errorf("filestore: unable to stat rename target %s: %w", newName, serr))
+					}
+					if rerr := os.Rename(oldName, newName); rerr != nil {
+						return rollback(rerr)
+					}
+				default:
+					return rollback(err)
+				}
 			}
 		}
+
+		// Record the step so every failure below is undone exactly once by
+		// rollback: for .tmp inputs the rename is undone (formal -> tmp); for
+		// formal .tsm inputs no rename happened and the step (formal == tmp)
+		// only makes rollback close the reader.
+		done = append(done, doneStep{reader: nil, formal: newName, tmp: oldName})
 
 		// Any error after this point should result in the file being bein named
 		// back to the original name. The caller then has the opportunity to
 		// remove it.
 		fd, err := os.Open(newName)
 		if err != nil {
-			if newName != oldName {
-				if err1 := os.Rename(newName, oldName); err1 != nil {
-					return err1
-				}
-			}
-			return err
+			return rollback(err)
 		}
 
 		// Keep track of the new mod time
@@ -779,18 +1021,18 @@ func (f *FileStore) replace(oldFiles, newFiles []string, updatedFn func(r []TSMF
 			}
 		}
 
-		tsm, err := NewTSMReader(fd, WithMadviseWillNeed(f.tsmMMAPWillNeed))
+		tsm, err := NewTSMReader(fd, WithMadviseWillNeed(f.tsmMMAPWillNeed), WithMaxMmapFileSize(f.maxMmapTSMFileSize))
 		if err != nil {
-			if newName != oldName {
-				if err1 := os.Rename(newName, oldName); err1 != nil {
-					return err1
-				}
-			}
-			return err
+			// NewTSMReader takes ownership of fd only when it succeeds, so
+			// close it here (otherwise the fd leaks and, on Windows, blocks
+			// the rename-back) and let rollback undo the rename exactly once.
+			fd.Close()
+			return rollback(err)
 		}
 		tsm.WithObserver(f.obs)
 
 		updated = append(updated, tsm)
+		done[len(done)-1].reader = tsm
 	}
 
 	if updatedFn != nil {
@@ -807,69 +1049,39 @@ func (f *FileStore) replace(oldFiles, newFiles []string, updatedFn func(r []TSMF
 
 	updated = append(updated, f.files...)
 
-	// We need to prune our set of active files now
+	// We need to prune our set of active files now. Failures to prune an old
+	// file are collected instead of aborting mid-prune: an early return left
+	// f.files stale relative to the on-disk changes already made for earlier
+	// files (readers closed or removed but still referenced by the store).
+	// Readers that could not be removed stay loaded, the in-memory state is
+	// always committed, and the aggregated error is returned at the end.
 	var active, inuse []TSMFile
+	var pruneErrs []error
 	for _, file := range updated {
 		keep := true
 		for _, remove := range oldFiles {
-			if remove == file.Path() {
-				keep = false
-
-				// give the observer a chance to process the file first.
-				if err := f.obs.FileUnlinking(file.Path()); err != nil {
-					return err
-				}
-
-				if ts := file.TombstoneStats(); ts.TombstoneExists {
-					if err := f.obs.FileUnlinking(ts.Path); err != nil {
-						return err
-					}
-				}
-
-				// If queries are running against this file, then we need to move it out of the
-				// way and let them complete.  We'll then delete the original file to avoid
-				// blocking callers upstream.  If the process crashes, the temp file is
-				// cleaned up at startup automatically.
-				//
-				// In order to ensure that there are no races with this (file held externally calls Ref
-				// after we check InUse), we need to maintain the invariant that every handle to a file
-				// is handed out in use (Ref'd), and handlers only ever relinquish the file once (call Unref
-				// exactly once, and never use it again). InUse is only valid during a write lock, since
-				// we allow calls to Ref and Unref under the read lock and no lock at all respectively.
-				if file.InUse() {
-					// Copy all the tombstones related to this TSM file
-					var deletes []string
-					if ts := file.TombstoneStats(); ts.TombstoneExists {
-						deletes = append(deletes, ts.Path)
-					}
-
-					// Rename the TSM file used by this reader
-					tempPath := fmt.Sprintf("%s.%s", file.Path(), TmpTSMFileExtension)
-					if err := file.Rename(tempPath); err != nil {
-						return err
-					}
-
-					// Remove the old file and tombstones.  We can't use the normal TSMReader.Remove()
-					// because it now refers to our temp file which we can't remove.
-					for _, f := range deletes {
-						if err := os.Remove(f); err != nil {
-							return err
-						}
-					}
-
-					inuse = append(inuse, file)
-					continue
-				}
-
-				if err := file.Close(); err != nil {
-					return err
-				}
-
-				if err := file.Remove(); err != nil {
-					return err
-				}
-				break
+			if remove != file.Path() {
+				continue
 			}
+
+			res, err := f.pruneOldFile(file)
+			if err != nil {
+				pruneErrs = append(pruneErrs, fmt.Errorf("filestore: unable to prune file %s: %w", file.Path(), err))
+			}
+			switch res {
+			case pruneInUse:
+				// The reader was moved aside so queries can finish; the
+				// purger removes it once unreferenced.
+				inuse = append(inuse, file)
+				keep = false
+			case pruneKeepLoaded:
+				// The reader is still usable and must stay in the active set.
+				keep = true
+			default: // pruneDropped
+				// The reader was closed; it cannot stay in the active set.
+				keep = false
+			}
+			break
 		}
 
 		if keep {
@@ -878,7 +1090,9 @@ func (f *FileStore) replace(oldFiles, newFiles []string, updatedFn func(r []TSMF
 	}
 
 	if err := file.SyncDir(f.dir); err != nil {
-		return err
+		// The on-disk changes are already made; record the durability failure
+		// and still commit the in-memory state that matches the disk.
+		pruneErrs = append(pruneErrs, fmt.Errorf("filestore: unable to sync directory %s: %w", f.dir, err))
 	}
 
 	// Tell the purger about our in-use files we need to remove
@@ -908,7 +1122,87 @@ func (f *FileStore) replace(oldFiles, newFiles []string, updatedFn func(r []TSMF
 	}
 	atomic.StoreInt64(&f.stats.DiskBytes, totalSize)
 
-	return nil
+	return joinPruneErrors(pruneErrs)
+}
+
+// pruneResult describes what the caller of pruneOldFile must do with the file.
+type pruneResult int
+
+const (
+	// pruneDropped means the reader was closed (or handed to the purger) and
+	// must be left out of the active set.
+	pruneDropped pruneResult = iota
+	// pruneKeepLoaded means the reader is still usable and must stay in the
+	// active set because the prune failed before it could be removed.
+	pruneKeepLoaded
+	// pruneInUse means the reader was moved aside for running queries and
+	// must be handed to the purger.
+	pruneInUse
+)
+
+// pruneOldFile unlinks a single old file: it notifies the observer, moves the
+// reader out of the way when it is still in use, or closes and removes it
+// otherwise. It returns what the caller must do with the reader and the error,
+// if any, so the caller can keep pruning the remaining old files and report
+// every failure once the in-memory state has been committed.
+func (f *FileStore) pruneOldFile(file TSMFile) (pruneResult, error) {
+	// give the observer a chance to process the file first.
+	if err := f.obs.FileUnlinking(file.Path()); err != nil {
+		return pruneKeepLoaded, err
+	}
+
+	if ts := file.TombstoneStats(); ts.TombstoneExists {
+		if err := f.obs.FileUnlinking(ts.Path); err != nil {
+			return pruneKeepLoaded, err
+		}
+	}
+
+	// If queries are running against this file, then we need to move it out of the
+	// way and let them complete.  We'll then delete the original file to avoid
+	// blocking callers upstream.  If the process crashes, the temp file is
+	// cleaned up at startup automatically.
+	//
+	// In order to ensure that there are no races with this (file held externally calls Ref
+	// after we check InUse), we need to maintain the invariant that every handle to a file
+	// is handed out in use (Ref'd), and handlers only ever relinquish the file once (call Unref
+	// exactly once, and never use it again). InUse is only valid during a write lock, since
+	// we allow calls to Ref and Unref under the read lock and no lock at all respectively.
+	if file.InUse() {
+		// Copy all the tombstones related to this TSM file
+		var deletes []string
+		if ts := file.TombstoneStats(); ts.TombstoneExists {
+			deletes = append(deletes, ts.Path)
+		}
+
+		// Rename the TSM file used by this reader
+		tempPath := fmt.Sprintf("%s.%s", file.Path(), TmpTSMFileExtension)
+		if err := file.Rename(tempPath); err != nil {
+			return pruneKeepLoaded, err
+		}
+
+		// Remove the old file and tombstones.  We can't use the normal TSMReader.Remove()
+		// because it now refers to our temp file which we can't remove.
+		for _, f := range deletes {
+			if err := os.Remove(f); err != nil {
+				return pruneKeepLoaded, err
+			}
+		}
+
+		return pruneInUse, nil
+	}
+
+	if err := file.Close(); err != nil {
+		// The reader may still be readable; keep it loaded rather than
+		// dropping it while its state is uncertain.
+		return pruneKeepLoaded, err
+	}
+
+	if err := file.Remove(); err != nil {
+		// The reader is already closed, so it cannot stay in the active set;
+		// report the removal failure instead of aborting the whole prune.
+		return pruneDropped, err
+	}
+	return pruneDropped, nil
 }
 
 // LastModified returns the last time the file store was updated with new

@@ -63,6 +63,25 @@ const (
 	// that can run at one time.  A value of 0 results in 50% of runtime.GOMAXPROCS(0) used at runtime.
 	DefaultMaxConcurrentCompactions = 0
 
+	// DefaultMaxFullCompactionFiles is the default value for
+	// Config.MaxFullCompactionFiles. The default of 0 disables rolling and
+	// preserves the legacy single-group full compaction. A positive value K
+	// opts in to rolling full compaction, where K is a soft cap on the
+	// number of TSM files opened simultaneously per round (rounds are chosen
+	// whole generations at a time and may exceed K). Rolling merges
+	// oldest-first in a left fold, so compacting N files takes
+	// ceil((N-1)/(K-1)) sequential rounds with cumulative write
+	// amplification approaching O(N^2/K); until a breadth-first/cohort merge
+	// replaces the left fold, rolling deliberately stays opt-in.
+	DefaultMaxFullCompactionFiles = 0
+
+	// DefaultMaxTSMFileSizeForMmap is the default threshold above which TSM files
+	// use pread (io.ReadFull) instead of whole-file mmap for block data. -1 means
+	// always mmap (legacy, for local disk); 0 means always pread (for network
+	// storage like HDFS where mmap pages are not reclaimed). A positive value N
+	// means files > N bytes use pread, <= N use mmap.
+	DefaultMaxTSMFileSizeForMmap = int64(-1)
+
 	// DefaultMaxIndexLogFileSize is the default threshold, in bytes, when an index
 	// write-ahead log file will compact into an index file.
 	DefaultMaxIndexLogFileSize = 1 * 1024 * 1024 // 1MB
@@ -125,6 +144,42 @@ type Config struct {
 	// not affected by this limit.  A value of 0 limits compactions to runtime.GOMAXPROCS(0).
 	MaxConcurrentCompactions int `toml:"max-concurrent-compactions"`
 
+	// MaxFullCompactionFiles is a SOFT cap on the number of TSM files opened
+	// simultaneously during a single full-compaction round when rolling is
+	// opted into. Compaction rounds are selected whole generations at a
+	// time, so a large first generation — plus the one extra generation the
+	// planner may append to guarantee progress — can exceed this value,
+	// sometimes by a wide margin; this setting does NOT guarantee a bound on
+	// memory usage or RSS (each open reader pins its mmap, indirectIndex,
+	// and offsets table). A value of 0 (the default) disables rolling and
+	// uses the legacy single-group full compaction; a value >= 4 enables
+	// rolling, which merges oldest-first in a left fold (compacting N files
+	// with a cap of K takes ceil((N-1)/(K-1)) sequential rounds, with
+	// cumulative write amplification approaching O(N^2/K)).
+	MaxFullCompactionFiles int `toml:"max-full-compaction-files"`
+
+	// MaxTSMFileSizeForMmap is the threshold above which TSM files use pread
+	// (io.ReadFull) instead of whole-file mmap for block data. -1 = always mmap
+	// (legacy, local disk); 0 = always pread (network storage like HDFS); N > 0
+	// = files > N bytes use pread. On network storage, mmap pages are not
+	// reclaimed by the kernel, causing RSS to approach N×fileSize. Pread removes
+	// that whole-file mirroring: steady resident memory drops to the file's
+	// index region (~1-2% of file size), plus transient per-block buffers.
+	// CAVEAT: during compaction, both mmap and pread hold, for the key being
+	// merged, that key's compressed blocks across all readers in the group —
+	// for a hot key spanning large files this can reach several GB regardless
+	// of this setting (see Compactor.UseStreamingIterator notes).
+	MaxTSMFileSizeForMmap int64 `toml:"max-tsm-file-size-for-mmap"`
+
+	// StreamingCompactionEnabled enables the experimental streaming compaction
+	// iterator (Compactor.UseStreamingIterator). When false (the default),
+	// compaction uses the legacy iterator. The streaming iterator produces
+	// byte-identical output and bounds steady-state merge memory via window
+	// eviction, but its per-key peak equals the legacy iterator (see the
+	// MaxTSMFileSizeForMmap caveat). It has NOT been enabled by default because
+	// its production benefit over the legacy iterator is limited.
+	StreamingCompactionEnabled bool `toml:"streaming-compaction-enabled"`
+
 	// MaxIndexLogFileSize is the threshold, in bytes, when an index write-ahead log file will
 	// compact into an index file. Lower sizes will cause log files to be compacted more quickly
 	// and result in lower heap usage at the expense of write throughput. Higher sizes will
@@ -171,6 +226,8 @@ func NewConfig() Config {
 		MaxSeriesPerDatabase:     DefaultMaxSeriesPerDatabase,
 		MaxValuesPerTag:          DefaultMaxValuesPerTag,
 		MaxConcurrentCompactions: DefaultMaxConcurrentCompactions,
+		MaxFullCompactionFiles:   DefaultMaxFullCompactionFiles,
+		MaxTSMFileSizeForMmap:    DefaultMaxTSMFileSizeForMmap,
 
 		MaxIndexLogFileSize:  toml.Size(DefaultMaxIndexLogFileSize),
 		SeriesIDSetCacheSize: DefaultSeriesIDSetCacheSize,
@@ -192,6 +249,18 @@ func (c *Config) Validate() error {
 
 	if c.MaxConcurrentCompactions < 0 {
 		return errors.New("max-concurrent-compactions must be non-negative")
+	}
+
+	// MaxFullCompactionFiles < 0 is invalid; 0 is allowed (disables rolling).
+	// Values below 4 are rejected to avoid excessive write amplification.
+	if c.MaxFullCompactionFiles < 0 {
+		return errors.New("max-full-compaction-files must be non-negative")
+	} else if c.MaxFullCompactionFiles > 0 && c.MaxFullCompactionFiles < 4 {
+		return errors.New("max-full-compaction-files must be 0 (disabled) or >= 4")
+	}
+
+	if c.MaxTSMFileSizeForMmap < -1 {
+		return errors.New("max-tsm-file-size-for-mmap must be -1 (always mmap), 0 (always pread), or a positive byte threshold")
 	}
 
 	if c.SeriesIDSetCacheSize < 0 {
@@ -241,6 +310,9 @@ func (c Config) Diagnostics() (*diagnostics.Diagnostics, error) {
 		"max-series-per-database":                c.MaxSeriesPerDatabase,
 		"max-values-per-tag":                     c.MaxValuesPerTag,
 		"max-concurrent-compactions":             c.MaxConcurrentCompactions,
+		"max-full-compaction-files":              c.MaxFullCompactionFiles,
+		"max-tsm-file-size-for-mmap":             c.MaxTSMFileSizeForMmap,
+		"streaming-compaction-enabled":           c.StreamingCompactionEnabled,
 		"max-index-log-file-size":                c.MaxIndexLogFileSize,
 		"series-id-set-cache-size":               c.SeriesIDSetCacheSize,
 		"series-file-max-concurrent-compactions": c.SeriesFileMaxConcurrentSnapshotCompactions,

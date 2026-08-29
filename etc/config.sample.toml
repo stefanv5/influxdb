@@ -119,6 +119,33 @@
   # It might help users who have slow disks in some cases.
   # tsm-use-madv-willneed = false
 
+  # MaxFullCompactionFiles is a SOFT cap on the number of TSM files opened
+  # simultaneously during a single full-compaction round when rolling full
+  # compaction is opted into. Compaction rounds are chosen whole generations
+  # at a time, so a large first generation -- plus the one extra generation
+  # the planner may append to guarantee progress -- can exceed this value,
+  # sometimes by a wide margin; it does not guarantee a bound on memory
+  # usage or RSS. Rolling merges oldest-first in a left fold: compacting N
+  # files with a cap of K takes ceil((N-1)/(K-1)) sequential rounds, with
+  # cumulative write amplification approaching O(N^2/K). A value of 0 (the
+  # default) disables rolling and uses the legacy single-group full
+  # compaction; a value >= 4 enables rolling.
+  # max-full-compaction-files = 0
+
+  # MaxTSMFileSizeForMmap is the threshold above which TSM files use pread (read
+  # syscalls) instead of whole-file mmap for block data. -1 = always mmap (default,
+  # best for local disks); 0 = always pread (recommended for network storage such as
+  # HDFS/FUSE/NFS, where mmap pages are not reclaimed and memory usage grows with
+  # file size); N > 0 = files larger than N bytes use pread.
+  # max-tsm-file-size-for-mmap = -1
+
+  # StreamingCompactionEnabled enables the experimental streaming compaction
+  # iterator. It is EXPERIMENTAL and disabled by default. When enabled it
+  # produces byte-identical output to the legacy iterator and bounds
+  # steady-state merge memory via window eviction, but its per-key peak
+  # memory equals the legacy iterator, so its production benefit is limited.
+  # streaming-compaction-enabled = false
+
   # Settings for the inmem index
 
   # The maximum series allowed per database before writes are dropped.  This limit can prevent

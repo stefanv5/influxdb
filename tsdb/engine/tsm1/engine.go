@@ -218,6 +218,7 @@ func NewEngine(id uint64, idx tsdb.Index, path string, walPath string, sfile *ts
 		fs.WithObserver(opt.FileStoreObserver)
 	}
 	fs.tsmMMAPWillNeed = opt.Config.TSMWillNeed
+	fs.SetMaxMmapTSMFileSize(opt.Config.MaxTSMFileSizeForMmap)
 
 	cache := NewCache(uint64(opt.Config.CacheMaxMemorySize))
 
@@ -225,6 +226,12 @@ func NewEngine(id uint64, idx tsdb.Index, path string, walPath string, sfile *ts
 	c.Dir = path
 	c.FileStore = fs
 	c.RateLimit = opt.CompactionThroughputLimiter
+	// Experimental streaming iterator: opt-in via
+	// Config.StreamingCompactionEnabled. When disabled (the default), compaction
+	// uses the legacy tsmBatchKeyIterator. See compact_streaming.go for the
+	// memory characteristics (per-key peak equals legacy; the win is bounded
+	// window eviction on the merge path, not peak reduction).
+	c.UseStreamingIterator = opt.Config.StreamingCompactionEnabled
 
 	var planner CompactionPlanner = NewDefaultPlanner(fs, time.Duration(opt.Config.CompactFullWriteColdDuration))
 	if opt.CompactionPlannerCreator != nil {
@@ -232,7 +239,16 @@ func NewEngine(id uint64, idx tsdb.Index, path string, walPath string, sfile *ts
 		planner.SetFileStore(fs)
 	}
 
+	// Configure rolling full-compaction (bounds simultaneous open files / RSS)
+	// when the planner supports it. A value of 0 disables rolling.
+	if dp, ok := planner.(*DefaultPlanner); ok {
+		dp.SetMaxFullCompactionFiles(opt.Config.MaxFullCompactionFiles)
+	}
+
 	logger := zap.NewNop()
+	// Hot-key gather warnings route through the compactor's logger; it is
+	// replaced along with the engine's logger in WithLogger.
+	c.Logger = logger
 	stats := &EngineStatistics{}
 	e := &Engine{
 		id:           id,
@@ -795,6 +811,7 @@ func (e *Engine) WithLogger(log *zap.Logger) {
 		e.WAL.WithLogger(e.logger)
 	}
 	e.FileStore.WithLogger(e.logger)
+	e.Compactor.Logger = e.logger
 }
 
 // LoadMetadataIndex loads the shard metadata into memory.
@@ -2130,6 +2147,13 @@ func (e *Engine) compact(wg *sync.WaitGroup) {
 			e.scheduler.setDepth(2, len(level2Groups))
 			e.scheduler.setDepth(3, len(level3Groups))
 			e.scheduler.setDepth(4, len(level4Groups))
+
+			// Boost level-4 priority while a rolling full compaction is
+			// mid-flight so its rounds are not starved by sustained level-1
+			// work and the rolling converges.
+			if dp, ok := e.CompactionPlan.(*DefaultPlanner); ok {
+				e.scheduler.setBoostLowPriority(dp.RollingInProgress())
+			}
 
 			// Find the next compaction that can run and try to kick it off
 			if level, runnable := e.scheduler.next(); runnable {

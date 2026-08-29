@@ -1,6 +1,8 @@
 v1.8.11 [unreleased]
 -------------------
 
+- feat(tsm1): compaction memory improvements — opt-in rolling full compaction (`max-full-compaction-files`, default 0 = legacy single-group full compaction; when opted in it is a soft cap bounded by whole generations, not a hard file-count or RSS limit, and the oldest-first left fold takes ceil((N-1)/(K-1)) sequential rounds with cumulative write amplification approaching O(N²/K)), disk-buffered output index for large merges, an optional pread mode for TSM readers on network storage (`max-tsm-file-size-for-mmap`) that removes whole-file page-cache mirroring (steady-state drops to the file's index size; a hot key's compressed blocks across the compaction group still transiently resident), and an opt-in experimental streaming compaction iterator (`streaming-compaction-enabled`, default off, byte-identical output)
+
 v1.8.10 [2021-10-11]
 -------------------
 

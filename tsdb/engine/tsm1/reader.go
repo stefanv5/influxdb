@@ -30,7 +30,8 @@ type TSMReader struct {
 	refs   int64
 	refsWG sync.WaitGroup
 
-	madviseWillNeed bool // Hint to the kernel with MADV_WILLNEED.
+	madviseWillNeed bool  // Hint to the kernel with MADV_WILLNEED.
+	maxMmapFileSize int64 // Threshold above which pread is used instead of mmap. <0=mmap always, 0=pread always.
 	mu              sync.RWMutex
 
 	// accessor provides access and decoding of blocks for the reader.
@@ -218,9 +219,19 @@ var WithMadviseWillNeed = func(willNeed bool) tsmReaderOption {
 	}
 }
 
+// WithMaxMmapFileSize sets the threshold above which TSM files use pread (io.ReadFull)
+// instead of whole-file mmap for block data. A value of 0 means always pread (for
+// network storage like HDFS); a negative value means always mmap (legacy). The
+// default is -1 (legacy mmap) unless wired from tsdb.Config.MaxTSMFileSizeForMmap.
+var WithMaxMmapFileSize = func(maxSize int64) tsmReaderOption {
+	return func(r *TSMReader) {
+		r.maxMmapFileSize = maxSize
+	}
+}
+
 // NewTSMReader returns a new TSMReader from the given file.
 func NewTSMReader(f *os.File, options ...tsmReaderOption) (*TSMReader, error) {
-	t := &TSMReader{}
+	t := &TSMReader{maxMmapFileSize: -1}
 	for _, option := range options {
 		option(t)
 	}
@@ -234,6 +245,7 @@ func NewTSMReader(f *os.File, options ...tsmReaderOption) (*TSMReader, error) {
 	t.accessor = &mmapAccessor{
 		f:            f,
 		mmapWillNeed: t.madviseWillNeed,
+		maxMmapSize:  t.maxMmapFileSize,
 	}
 
 	index, err := t.accessor.init()
@@ -245,6 +257,17 @@ func NewTSMReader(f *os.File, options ...tsmReaderOption) (*TSMReader, error) {
 	t.tombstoner = NewTombstoner(t.Path(), index.ContainsKey)
 
 	if err := t.applyTombstones(); err != nil {
+		// The accessor still holds the open fd (and, in mmap mode, the file
+		// mapping) and the index its offsets mapping: release them, or nothing
+		// the caller can Close was ever returned. The caller closes the file
+		// descriptor itself when NewTSMReader fails; os.File.Close is a safe
+		// no-op on an already-closed file.
+		if closeErr := t.accessor.close(); closeErr != nil {
+			err = fmt.Errorf("%v; closing accessor: %v", err, closeErr)
+		}
+		if indexErr := t.index.Close(); indexErr != nil {
+			err = fmt.Errorf("%v; closing index: %v", err, indexErr)
+		}
 		return nil, err
 	}
 
@@ -367,11 +390,17 @@ func (t *TSMReader) Close() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	if err := t.accessor.close(); err != nil {
-		return err
+	// Attempt both releases even when the first fails: returning early on an
+	// accessor error would skip index.Close() and leak the index's offsets
+	// mapping.
+	err := t.accessor.close()
+	if indexErr := t.index.Close(); indexErr != nil {
+		if err != nil {
+			return fmt.Errorf("%v; closing index: %v", err, indexErr)
+		}
+		return indexErr
 	}
-
-	return t.index.Close()
+	return err
 }
 
 // Ref records a usage of this TSMReader.  If there are active references
@@ -1208,6 +1237,13 @@ func (d *indirectIndex) UnmarshalBinary(b []byte) error {
 		return nil
 	}
 
+	// The cursor below is kept in an int64 because the offsets are stored as
+	// int32: reject anything larger so int32(len(b)) of exactly 2^31 (or more)
+	// cannot wrap negative.
+	if int64(len(b)) > math.MaxInt32 {
+		return fmt.Errorf("indirectIndex: index too large (%d bytes, max %d)", len(b), math.MaxInt32)
+	}
+
 	//var minKey, maxKey []byte
 	var minTime, maxTime int64 = math.MaxInt64, 0
 
@@ -1216,25 +1252,37 @@ func (d *indirectIndex) UnmarshalBinary(b []byte) error {
 	// each key is a time ordered list of index entry blocks for that key.  The loop below
 	// basically skips across the slice keeping track of the counter when we are at a key
 	// field.
-	var i int32
+	var i int64
 	var offsets []int32
-	iMax := int32(len(b))
+	iMax := int64(len(b))
 	for i < iMax {
-		offsets = append(offsets, i)
+		offsets = append(offsets, int32(i))
 
 		// Skip to the start of the values
 		// key length value (2) + type (1) + length of key
 		if i+2 >= iMax {
 			return fmt.Errorf("indirectIndex: not enough data for key length value")
 		}
-		i += 3 + int32(binary.BigEndian.Uint16(b[i:i+2]))
+		keyLen := int64(binary.BigEndian.Uint16(b[i : i+2]))
+		// The key block is [2-byte length][key][1-byte type][2-byte count]; the
+		// key must fit in the remaining bytes or the key reads below slice past
+		// the end of b. int64 arithmetic so the sum cannot overflow.
+		if i+5+keyLen > iMax {
+			return fmt.Errorf("indirectIndex: key length overruns index data")
+		}
+		i += 3 + keyLen
 
 		// count of index entries
 		if i+indexCountSize >= iMax {
 			return fmt.Errorf("indirectIndex: not enough data for index entries count")
 		}
-		count := int32(binary.BigEndian.Uint16(b[i : i+indexCountSize]))
+		count := int64(binary.BigEndian.Uint16(b[i : i+indexCountSize]))
 		i += indexCountSize
+		if count == 0 {
+			// A TSM index never holds a key with zero entries, and the backward
+			// cursor step below would move the cursor before the start of b.
+			return fmt.Errorf("indirectIndex: key with zero index entries")
+		}
 
 		// Find the min time for the block
 		if i+8 >= iMax {
@@ -1257,6 +1305,10 @@ func (d *indirectIndex) UnmarshalBinary(b []byte) error {
 		}
 
 		i += indexEntrySize
+	}
+
+	if len(offsets) == 0 {
+		return fmt.Errorf("indirectIndex: no keys found in index")
 	}
 
 	firstOfs := offsets[0]
@@ -1298,6 +1350,22 @@ func (d *indirectIndex) Close() error {
 	return munmap(d.offsets[:cap(d.offsets)])
 }
 
+// CloseBytes drops the index's reference to its backing byte slice so the
+// memory can be reclaimed once the reader is closed. In pread mode d.b is a
+// heap buffer (it aliases mmapAccessor.idxBuf); in mmap mode it views the
+// munmap'd file region. d.minKey and d.maxKey are sub-slices of d.b, so they
+// must be dropped too or the buffer stays reachable through them. CloseBytes
+// is idempotent and never unmaps d.offsets — that remains Close's job (exactly
+// once, from TSMReader.Close), so calling CloseBytes and Close in any order is
+// safe.
+func (d *indirectIndex) CloseBytes() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.b = nil
+	d.minKey = nil
+	d.maxKey = nil
+}
+
 // mmapAccess is mmap based block accessor.  It access blocks through an
 // MMAP file interface.
 type mmapAccessor struct {
@@ -1311,17 +1379,114 @@ type mmapAccessor struct {
 	f  *os.File
 
 	index *indirectIndex
+
+	// dataStart and dataEnd bound the file's data section: blocks live
+	// strictly between the 5-byte header and the start of the index region.
+	// Set by init() once the footer has been read; validEntry rejects entries
+	// pointing outside this range.
+	dataStart int64
+	dataEnd   int64
+
+	// pread mode fields (used when maxMmapSize >= 0 and file size > maxMmapSize).
+	// In pread mode, block data is NOT mmap'd; m.b stays nil and block reads
+	// go through os.File.ReadAt into per-call heap buffers. Only the index
+	// region is pread into idxBuf. This bounds resident RSS to index size
+	// (not file size) — critical for network storage (HDFS/FUSE/NFS) where
+	// mmap'd file pages are not reclaimed by the kernel.
+	preadMode   bool
+	idxBuf      []byte // index region heap buffer (replaces mmap'd index slice)
+	fileSize    int64  // cached stat.Size() for pread bounds checks
+	maxMmapSize int64  // threshold: file > maxMmapSize → pread; <= maxMmapSize → mmap. <0 = always mmap.
 }
 
-func (m *mmapAccessor) init() (*indirectIndex, error) {
+// preadFull reads exactly len(buf) bytes from f at offset, handling short reads
+// (FUSE/NFS may return partial). Returns nil only if exactly len(buf) bytes read.
+func preadFull(f *os.File, buf []byte, offset int64) error {
+	n := 0
+	for n < len(buf) {
+		rn, err := f.ReadAt(buf[n:], offset+int64(n))
+		n += rn
+		if err != nil {
+			if err == io.EOF && n == len(buf) {
+				return nil
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+// tsmHeaderSize is the size of the TSM file header: a 4-byte magic number
+// followed by a 1-byte version. Blocks always start after it.
+const tsmHeaderSize = int64(5)
+
+// maxTSMBlockSize is a writer-aligned budget for the encoded size of a single
+// block, enforced before any Size-derived allocation. A legitimate block holds
+// at most tsdb.DefaultMaxPointsPerBlock (1000) points — even pathologically
+// large string values keep blocks far below this — so a larger Size can only
+// come from a corrupt or truncated file. Without this cap, validEntry's
+// backing-file bound alone still lets a sparse/corrupt file larger than 4 GiB
+// pass Size=0xffffffff through to make([]byte, entry.Size) — a ~4 GiB
+// allocation.
+const maxTSMBlockSize = int64(256 << 20)
+
+// maxAllocLen is the largest length make() accepts on this platform (MaxInt).
+// maxTSMBlockSize is smaller on every supported platform, so the block cap
+// binds first; both bounds are checked before any Size-proportional make() so
+// a corrupt Size can neither panic inside make ("len out of range") nor drive
+// a huge allocation.
+const maxAllocLen = int64(^uint(0) >> 1)
+
+// validEntry checks that an index entry's bounds are sane, using subtraction
+// form so no addition can overflow (Offset near MaxInt64 plus a large uint32
+// Size would wrap negative and slip past an addition-form check). bound is the
+// total readable length of the backing store: m.fileSize in pread mode,
+// len(m.b) in mmap mode; it is clamped to m.dataEnd and Offset is required to
+// be at least m.dataStart because blocks live in the data section, not the
+// header or the index region. validEntry additionally enforces the absolute
+// maxTSMBlockSize cap and int representability on entry.Size, so an entry that
+// fits inside a huge corrupt backing file still cannot drive a
+// Size-proportional allocation or a makeslice panic. A corrupted index must
+// never panic or trigger a huge allocation (Size up to 0xFFFFFFFF ≈ 4GiB);
+// callers return ErrTSMClosed.
+func (m *mmapAccessor) validEntry(entry *IndexEntry, bound int64) bool {
+	if m.dataEnd < bound {
+		bound = m.dataEnd
+	}
+	return entry.Offset >= 0 && entry.Offset >= m.dataStart && entry.Size >= 4 &&
+		entry.Offset <= bound &&
+		int64(entry.Size) <= bound-entry.Offset &&
+		int64(entry.Size) <= maxTSMBlockSize &&
+		int64(entry.Size) <= maxAllocLen
+}
+
+// blockBytes returns the raw block bytes (after the 4-byte CRC) for an entry.
+// Must be called under m.mu.RLock(). In mmap mode: zero-copy slice into m.b.
+// In pread mode: fresh heap buffer via io.ReadFull (GC'd after caller drops it).
+func (m *mmapAccessor) blockBytes(entry *IndexEntry) ([]byte, error) {
+	if !m.preadMode {
+		if !m.validEntry(entry, int64(len(m.b))) {
+			return nil, ErrTSMClosed
+		}
+		return m.b[entry.Offset+4 : entry.Offset+int64(entry.Size)], nil
+	}
+	if !m.validEntry(entry, m.fileSize) {
+		return nil, ErrTSMClosed
+	}
+	buf := make([]byte, entry.Size)
+	if err := preadFull(m.f, buf, int64(entry.Offset)); err != nil {
+		return nil, err
+	}
+	return buf[4:], nil
+}
+
+func (m *mmapAccessor) init() (index *indirectIndex, err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	if err := verifyVersion(m.f); err != nil {
 		return nil, err
 	}
-
-	var err error
 
 	if _, err := m.f.Seek(0, 0); err != nil {
 		return nil, err
@@ -1331,33 +1496,92 @@ func (m *mmapAccessor) init() (*indirectIndex, error) {
 	if err != nil {
 		return nil, err
 	}
+	m.fileSize = stat.Size()
 
-	m.b, err = mmap(m.f, 0, int(stat.Size()))
-	if err != nil {
-		return nil, err
-	}
-	if len(m.b) < 8 {
-		return nil, fmt.Errorf("mmapAccessor: byte slice too small for indirectIndex")
-	}
+	// Decide: pread mode (file > maxMmapSize, or maxMmapSize==0 meaning always pread)
+	// vs mmap mode (file <= maxMmapSize, or maxMmapSize<0 meaning always mmap).
+	usePread := m.maxMmapSize >= 0 && stat.Size() > m.maxMmapSize
 
-	// Hint to the kernel that we will be reading the file.  It would be better to hint
-	// that we will be reading the index section, but that's not been
-	// implemented as yet.
-	if m.mmapWillNeed {
-		if err := madviseWillNeed(m.b); err != nil {
+	if usePread {
+		// === pread mode: do NOT mmap block data. Only pread the index region. ===
+		m.preadMode = true
+		m.b = nil
+
+		if stat.Size() < 8 {
+			return nil, fmt.Errorf("mmapAccessor: file too small for pread")
+		}
+		footer := make([]byte, 8)
+		if err := preadFull(m.f, footer, stat.Size()-8); err != nil {
+			return nil, fmt.Errorf("pread footer: %w", err)
+		}
+		indexStart := int64(binary.BigEndian.Uint64(footer))
+		// Reject indexStart == stat.Size()-8 (empty index) as well: mmap mode
+		// rejects indexStart >= indexOfsPos, so pread must agree — an empty
+		// index is not a valid TSM file in either mode.
+		if indexStart < 0 || indexStart >= stat.Size()-8 {
+			return nil, fmt.Errorf("mmapAccessor: invalid indexStart in pread mode")
+		}
+		indexLen := stat.Size() - 8 - indexStart
+		// The index region scales with cardinality, so unlike blocks it is not
+		// bounded by maxTSMBlockSize; reject anything at or above 2^31 anyway:
+		// indirectIndex.UnmarshalBinary assumes the index fits in an int32 and
+		// int32(len(b)) of exactly 2^31 wraps negative. This also satisfies
+		// maxAllocLen on every platform.
+		if indexLen >= math.MaxInt32 {
+			return nil, fmt.Errorf("mmapAccessor: pread index too large (%d bytes, max %d)", indexLen, int64(math.MaxInt32)-1)
+		}
+		m.dataStart = tsmHeaderSize
+		m.dataEnd = indexStart
+		m.idxBuf = make([]byte, indexLen)
+		if err := preadFull(m.f, m.idxBuf, indexStart); err != nil {
+			return nil, fmt.Errorf("pread index: %w", err)
+		}
+		m.index = NewIndirectIndex()
+		if err := m.index.UnmarshalBinary(m.idxBuf); err != nil {
 			return nil, err
 		}
-	}
+	} else {
+		// === mmap mode (unchanged): whole-file mmap ===
+		m.preadMode = false
+		m.b, err = mmap(m.f, 0, int(stat.Size()))
+		if err != nil {
+			return nil, err
+		}
+		// Any failure after the map exists must release it before returning:
+		// an active mapping keeps the file locked on Windows and would block
+		// TempDir cleanup.
+		defer func() {
+			if err != nil && len(m.b) > 0 {
+				munmap(m.b)
+				m.b = nil
+			}
+		}()
 
-	indexOfsPos := len(m.b) - 8
-	indexStart := binary.BigEndian.Uint64(m.b[indexOfsPos : indexOfsPos+8])
-	if indexStart >= uint64(indexOfsPos) {
-		return nil, fmt.Errorf("mmapAccessor: invalid indexStart")
-	}
-
-	m.index = NewIndirectIndex()
-	if err := m.index.UnmarshalBinary(m.b[indexStart:indexOfsPos]); err != nil {
-		return nil, err
+		if len(m.b) < 8 {
+			return nil, fmt.Errorf("mmapAccessor: byte slice too small for indirectIndex")
+		}
+		if m.mmapWillNeed {
+			if err := madviseWillNeed(m.b); err != nil {
+				return nil, err
+			}
+		}
+		indexOfsPos := len(m.b) - 8
+		indexStart := binary.BigEndian.Uint64(m.b[indexOfsPos : indexOfsPos+8])
+		if indexStart >= uint64(indexOfsPos) {
+			return nil, fmt.Errorf("mmapAccessor: invalid indexStart")
+		}
+		indexLen := int64(indexOfsPos) - int64(indexStart)
+		// Same 2^31 rejection as pread mode: indirectIndex.UnmarshalBinary
+		// assumes the index fits in an int32.
+		if indexLen >= math.MaxInt32 {
+			return nil, fmt.Errorf("mmapAccessor: index too large (%d bytes, max %d)", indexLen, int64(math.MaxInt32)-1)
+		}
+		m.dataStart = tsmHeaderSize
+		m.dataEnd = int64(indexStart)
+		m.index = NewIndirectIndex()
+		if err := m.index.UnmarshalBinary(m.b[indexStart:indexOfsPos]); err != nil {
+			return nil, err
+		}
 	}
 
 	// Allow resources to be freed immediately if requested
@@ -1391,6 +1615,9 @@ func (m *mmapAccessor) free() error {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
+	if m.preadMode {
+		return nil // no block mmap to madvise; idxBuf is small and resident by design
+	}
 	return madviseDontNeed(m.b)
 }
 
@@ -1404,6 +1631,54 @@ func (m *mmapAccessor) rename(path string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	if m.preadMode {
+		// pread mode: file content is unchanged by rename — just move the file
+		// and swap the fd. Do NOT rebuild the index: m.index is shared with
+		// TSMReader.index (which retains tombstones from applyTombstones).
+		// Rebuilding a new index without re-applying tombstones would make
+		// ReadAll return deleted data and leak the old offsets mmap. idxBuf and
+		// m.index stay valid (heap buffer, content-identical).
+		//
+		// Failure ordering: open the new fd and stat it BEFORE closing the old
+		// one, so a failure at any step leaves m.f usable. If the rename itself
+		// succeeded but open/stat failed, rename back to the original path
+		// first — the file content is unchanged either way.
+		oldPath := m.f.Name()
+		if err := file.RenameFile(oldPath, path); err != nil {
+			return err
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			// Roll the file back so the (still-open) old fd matches the path.
+			if err1 := file.RenameFile(path, oldPath); err1 != nil {
+				return fmt.Errorf("pread rename: open %s failed (%v) and rollback rename also failed (%v)", path, err, err1)
+			}
+			return err
+		}
+		stat, err := f.Stat()
+		if err != nil {
+			f.Close()
+			if err1 := file.RenameFile(path, oldPath); err1 != nil {
+				return fmt.Errorf("pread rename: stat %s failed (%v) and rollback rename also failed (%v)", path, err, err1)
+			}
+			return err
+		}
+		// All steps succeeded — now swap the fd. If closing the OLD fd fails,
+		// the rename has already happened and the new fd is valid and open:
+		// leave the reader functional on the new fd/path and report the close
+		// failure. Closing the new fd instead (the old behavior) would strand
+		// the reader on a stale fd whose path no longer exists, leaving the
+		// reader permanently unusable over a best-effort fd-close error.
+		closeErr := m.f.Close()
+		m.f = f
+		m.fileSize = stat.Size()
+		if closeErr != nil {
+			return fmt.Errorf("pread rename: closing old fd for %s failed (rename completed, reader left usable on new fd): %w", oldPath, closeErr)
+		}
+		return nil
+	}
+
+	// mmap mode (unchanged)
 	err := munmap(m.b)
 	if err != nil {
 		return err
@@ -1457,12 +1732,12 @@ func (m *mmapAccessor) readBlock(entry *IndexEntry, values []Value) ([]Value, er
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	if int64(len(m.b)) < entry.Offset+int64(entry.Size) {
-		return nil, ErrTSMClosed
+	block, err := m.blockBytes(entry)
+	if err != nil {
+		return nil, err
 	}
 	//TODO: Validate checksum
-	var err error
-	values, err = DecodeBlock(m.b[entry.Offset+4:entry.Offset+int64(entry.Size)], values)
+	values, err = DecodeBlock(block, values)
 	if err != nil {
 		return nil, err
 	}
@@ -1474,16 +1749,27 @@ func (m *mmapAccessor) readBytes(entry *IndexEntry, b []byte) (uint32, []byte, e
 	m.incAccess()
 
 	m.mu.RLock()
-	if int64(len(m.b)) < entry.Offset+int64(entry.Size) {
-		m.mu.RUnlock()
-		return 0, nil, ErrTSMClosed
+	defer m.mu.RUnlock()
+
+	if !m.preadMode {
+		// mmap mode: zero-copy slice
+		if !m.validEntry(entry, int64(len(m.b))) {
+			return 0, nil, ErrTSMClosed
+		}
+		crc, block := binary.BigEndian.Uint32(m.b[entry.Offset:entry.Offset+4]), m.b[entry.Offset+4:entry.Offset+int64(entry.Size)]
+		return crc, block, nil
 	}
 
-	// return the bytes after the 4 byte checksum
-	crc, block := binary.BigEndian.Uint32(m.b[entry.Offset:entry.Offset+4]), m.b[entry.Offset+4:entry.Offset+int64(entry.Size)]
-	m.mu.RUnlock()
-
-	return crc, block, nil
+	// pread mode: read from file into heap buffer
+	if !m.validEntry(entry, m.fileSize) {
+		return 0, nil, ErrTSMClosed
+	}
+	buf := make([]byte, entry.Size)
+	if err := preadFull(m.f, buf, int64(entry.Offset)); err != nil {
+		return 0, nil, err
+	}
+	crc := binary.BigEndian.Uint32(buf[0:4])
+	return crc, buf[4:], nil
 }
 
 // readAll returns all values for a key in all blocks.
@@ -1503,6 +1789,7 @@ func (m *mmapAccessor) readAll(key []byte) ([]Value, error) {
 	var temp []Value
 	var err error
 	var values []Value
+	var readBuf []byte // pread mode: reusable buffer for sequential block reads
 	for _, block := range blocks {
 		var skip bool
 		for _, t := range tombstones {
@@ -1518,8 +1805,28 @@ func (m *mmapAccessor) readAll(key []byte) ([]Value, error) {
 		}
 		//TODO: Validate checksum
 		temp = temp[:0]
-		// The +4 is the 4 byte checksum length
-		temp, err = DecodeBlock(m.b[block.Offset+4:block.Offset+int64(block.Size)], temp)
+
+		var blockBytes []byte
+		if !m.preadMode {
+			if !m.validEntry(&block, int64(len(m.b))) {
+				return nil, ErrTSMClosed
+			}
+			blockBytes = m.b[block.Offset+4 : block.Offset+int64(block.Size)]
+		} else {
+			if !m.validEntry(&block, m.fileSize) {
+				return nil, ErrTSMClosed
+			}
+			if cap(readBuf) < int(block.Size) {
+				readBuf = make([]byte, block.Size)
+			} else {
+				readBuf = readBuf[:block.Size]
+			}
+			if err := preadFull(m.f, readBuf, int64(block.Offset)); err != nil {
+				return nil, err
+			}
+			blockBytes = readBuf[4:]
+		}
+		temp, err = DecodeBlock(blockBytes, temp)
 		if err != nil {
 			return nil, err
 		}
@@ -1546,6 +1853,20 @@ func (m *mmapAccessor) close() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	if m.preadMode {
+		// pread mode: no mmap to munmap; close file handle + release the heap
+		// index. The indirectIndex's b aliases idxBuf, so nil-ing idxBuf alone
+		// would keep the full index resident for as long as a caller still
+		// references the closed reader. CloseBytes is idempotent and does not
+		// unmap d.offsets (TSMReader.Close → index.Close() does that, once).
+		if m.index != nil {
+			m.index.CloseBytes()
+		}
+		m.idxBuf = nil
+		return m.f.Close()
+	}
+
+	// mmap mode (unchanged)
 	if m.b == nil {
 		return nil
 	}
