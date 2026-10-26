@@ -101,7 +101,7 @@ flowchart LR
 ### 2.1 point 结构体
 
 ```go
-// models/points.go:221 — point (未导出)
+// models/points.go:228 — point (未导出)
 type point struct {
     time time.Time     // 解析后的时间戳 (time.Time 对象)
 
@@ -120,7 +120,7 @@ type point struct {
     cachedName   string                  // 缓存的 measurement 名称
     cachedTags   Tags                    // 缓存的 tags
 
-    it fieldIterator    // 字段迭代器 (用于零分配遍历)
+    it fieldIterator    // 字段迭代器 (用于低分配遍历)
 }
 ```
 
@@ -133,7 +133,7 @@ type point struct {
 ### 2.2 Point 接口
 
 ```go
-// models/points.go:77 — Point 接口
+// models/points.go:81 — Point 接口
 type Point interface {
     Name() []byte                    // measurement 名称
     SetName(string)                  // 设置 measurement 名称
@@ -150,12 +150,12 @@ type Point interface {
     Key() []byte                     // key (measurement + tags)
     String() string                  // 字符串表示
     MarshalBinary() ([]byte, error)  // 二进制编码
-    FieldIterator() FieldIterator    // 零分配字段迭代器
+    FieldIterator() FieldIterator    // 低分配字段迭代器
     // ... 更多方法
 }
 ```
 
-### 2.3 FieldIterator 接口 — 零分配字段遍历
+### 2.3 FieldIterator 接口 — 低分配字段遍历
 
 ```go
 // models/points.go:178 — FieldIterator 接口
@@ -173,13 +173,14 @@ type FieldIterator interface {
 ```
 
 > **小白解释**: `FieldIterator` 就像一个"逐个检查包裹内容"的工具。
-> 它不把所有内容倒出来（不构建 map），而是一个一个看（零分配）。
+> 它不把所有内容倒出来（不构建 map），而是一个一个看（低分配：未转义 key 是子切片，
+> 转义 key 与 `StringValue()` 仍会分配，见 §8.8）。
 > 这对于写入引擎特别重要——写入时只需要逐个字段处理，不需要完整的 map。
 
 ### 2.4 FieldType 常量
 
 ```go
-// models/points.go:156 — FieldType
+// models/points.go:163 — FieldType
 const (
     Integer  FieldType = iota  // 0: 整数 (如 42i)
     Float                      // 1: 浮点数 (如 3.14)
@@ -194,19 +195,19 @@ const (
 
 ```mermaid
 graph TD
-    subgraph "point 结构体"
-        A["key []byte<br>'cpu,host=web01,region=us-east'"]
-        B["fields []byte<br>'value=87.3,status=\"running\"'"]
-        C["ts []byte<br>'1704067200000000000'"]
-        D["time time.Time<br>2024-01-01 00:00:00 UTC"]
-        E["cachedFields map[string]interface{}<br>nil (懒解析)"]
-        F["cachedName string<br>'' (懒解析)"]
-        G["cachedTags Tags<br>nil (懒解析)"]
-        H["it fieldIterator<br>{start:0, end:0, key:nil, ...}"]
+    subgraph P["point 结构体"]
+        A["key []byte<br/>'cpu,host=web01,region=us-east'"]
+        B["fields []byte<br/>'value=87.3,status=#quot;running#quot;'"]
+        C["ts []byte<br/>'1704067200000000000'"]
+        D["time time.Time<br/>2024-01-01 00:00:00 UTC"]
+        E["cachedFields map[string]interface{}<br/>nil (懒解析)"]
+        F["cachedName string<br/>'' (懒解析)"]
+        G["cachedTags Tags<br/>nil (懒解析)"]
+        H["it fieldIterator<br/>{start:0, end:0, key:nil, ...}"]
     end
 
-    subgraph "原始输入缓冲区"
-        I["cpu,host=web01,region=us-east value=87.3,status=\"running\" 1704067200000000000"]
+    subgraph I0["原始输入缓冲区"]
+        I["cpu,host=web01,region=us-east value=87.3,status=#quot;running#quot; 1704067200000000000"]
     end
 
     A -.->|"subslice"| I
@@ -219,16 +220,17 @@ graph TD
     style I fill:#fff3e0
 ```
 
-> **关键**: `key`、`fields`、`ts` 都是原始输入缓冲区的**子切片**（subslice），
-> 不是新分配的内存。这是零分配优化的核心——但也有副作用：只要 point 存活，
-> 整个输入缓冲区就不会被 GC 回收。
+> **关键**: `fields`、`ts` 是原始输入缓冲区的**子切片**（subslice），不新分配内存；
+> `key` 只在 **tags 已排序**时才直接引用 buf；若 tag 顺序不是升序，`scanKey` 会
+> `make([]byte, ...)` 重建一份 canonical key（`models/points.go:550-585`）。
+> 这是低分配优化的核心——副作用是只要 point 存活，整个输入缓冲区就不会被 GC 回收。
 
 ## 3. 解析入口 — ParsePointsWithPrecision
 
 ### 3.1 函数签名与预分配
 
 ```go
-// models/points.go:336 — ParsePointsWithPrecision
+// models/points.go:343 — ParsePointsWithPrecision
 func ParsePointsWithPrecision(buf []byte, defaultTime time.Time, precision string) ([]Point, error) {
     // 预分配: 根据换行符数量预估 point 数量
     points := make([]Point, 0, bytes.Count(buf, []byte{'\n'})+1)
@@ -302,7 +304,7 @@ return points, nil
 ### 3.4 parsePoint 三阶段状态机
 
 ```go
-// models/points.go:383 — parsePoint
+// models/points.go:390 — parsePoint
 func parsePoint(buf []byte, defaultTime time.Time, precision string) (Point, error) {
     // 阶段1: 扫描 measurement + tags
     pos, key, err := scanKey(buf, 0)
@@ -400,6 +402,74 @@ flowchart TD
     N --> R
 ```
 
+### 3.5 时间戳：精度、范围与默认值
+
+时间戳是 line protocol 里最容易被"看起来能跑"掩盖的部分：它有一个乘数、一次溢出检查、一个开区间
+上界，以及"无时间戳时按精度截断"的默认值规则。
+
+```mermaid
+flowchart TD
+    A["scanTime(buf, pos)"] --> B{"ts 为空?"}
+    B -->|"是"| C["pt.time = defaultTime<br/>pt.SetPrecision(precision)（Truncate）"]
+    B -->|"否"| D["parseIntBytes(ts, 10, 64)"]
+    D --> E["SafeCalcTime(ts, precision)"]
+    E --> F["mult = GetPrecisionMultiplier(precision)"]
+    F --> G{"safeSignedMult(ts, mult) 溢出?"}
+    G -->|"是"| H["ErrTimeOutOfRange"]
+    G -->|"否"| I["time.Unix(0, t).UTC() → CheckTime"]
+    I --> J{"在 MinNanoTime..MaxNanoTime 内?"}
+    J -->|"否"| H
+    J -->|"是"| K{"ts 之后还有非空格字符?"}
+    K -->|"是"| L["ErrInvalidPoint"]
+    K -->|"否"| M["返回 point"]
+    C --> M
+```
+
+**六个精度档**（`GetPrecisionMultiplier`，`models/points.go:472-487`）：
+
+| precision | 单位 | 乘数 | 说明 |
+|-----------|------|------|------|
+| `""` 或 `"n"` | ns | 1 | 默认 |
+| `"u"` | µs | 1e3 | |
+| `"ms"` | ms | 1e6 | |
+| `"s"` | s | 1e9 | |
+| `"m"` | min | 60e9 | |
+| `"h"` | h | 3600e9 | |
+
+**范围与溢出**（`models/time.go:14-74`）：
+
+- `MinNanoTime = MinInt64 + 2`（1677-09-21T00:12:43.145224194Z）——最低两个值被保留作哨兵；
+- `MaxNanoTime = MaxInt64 - 1`（2262-04-11T23:47:16.854775806Z）——最高值用于分片开区间；
+- `safeSignedMult` 用 `c/b == a` 检测乘法溢出，溢出直接 `ErrTimeOutOfRange`；
+- 即使乘法没溢出，`CheckTime` 还会再比较一次 `t.Before(minNanoTime) || t.After(maxNanoTime)`。
+
+**无时间戳时的默认值**（`points.go:446-448`）：`pt.time = defaultTime; pt.SetPrecision(precision)`。
+注意 `SetPrecision`（`points.go:1683-1697`）是**按精度 Truncate**，不是乘倍数：
+
+| precision | 实际动作 |
+|-----------|---------|
+| `"n"` | 不截断 |
+| `"u"` | `Truncate(time.Microsecond)` |
+| `"ms"` | `Truncate(time.Millisecond)` |
+| `"s"` | `Truncate(time.Second)` |
+| `"m"` | `Truncate(time.Minute)` |
+| `"h"` | `Truncate(time.Hour)` |
+
+**时间戳之后只允许空格**（`points.go:459-466`）：`for pos < len(buf) { if buf[pos] != ' ' { return ErrInvalidPoint } }`。
+
+**案例**：
+
+| 输入 | precision | 结果 |
+|------|-----------|------|
+| `1704067200000000000` | n | 2024-01-01T00:00:00Z |
+| `1704067200000` | ms | 同一时刻（×1e6） |
+| `9223372036854775807`（MaxInt64） | n | `ErrTimeOutOfRange`（> MaxNanoTime） |
+| `9223372036854775806`（= MaxNanoTime） | n | 允许 |
+| `-9223372036854775807` | n | `ErrTimeOutOfRange`（< MinNanoTime） |
+| 无 ts，defaultTime=`2024-01-01T00:00:00.123456789Z` | ms | 截断为 `2024-01-01T00:00:00.123Z` |
+| `123abc` | 任意 | `bad timestamp`（`scanTime` 在 `a` 处遇到非数字直接返回，`points.go:879-885`） |
+| `cpu value=1i 123 abc` | 任意 | `ErrInvalidPoint`（时间戳块后还有非空格字符，`points.go:459-466`） |
+
 ## 4. 状态机详解
 
 ### 4.1 状态常量
@@ -421,7 +491,7 @@ const (
 ### 4.2 scanMeasurement — 扫描 measurement
 
 ```go
-// models/points.go:591 — scanMeasurement
+// models/points.go:598 — scanMeasurement
 func scanMeasurement(buf []byte, i int) (int, int, error) {
     // 第一个字节不能是逗号
     if i >= len(buf) || buf[i] == ',' {
@@ -463,7 +533,7 @@ func scanMeasurement(buf []byte, i int) (int, int, error) {
 ### 4.3 scanTags — 扫描 tags（内部小状态机）
 
 ```go
-// models/points.go:627 — scanTags
+// models/points.go:634 — scanTags
 func scanTags(buf []byte, i int, indices []int) (int, int, []int, error) {
     var (
         err    error
@@ -521,7 +591,7 @@ stateDiagram-v2
 **scanTagsKey — 扫描 tag key**:
 
 ```go
-// models/points.go:671 — scanTagsKey
+// models/points.go:678 — scanTagsKey
 func scanTagsKey(buf []byte, i int) (int, error) {
     // 第一个字符不能是空格、逗号、等号
     if i >= len(buf) || buf[i] == ' ' || buf[i] == ',' || buf[i] == '=' {
@@ -546,7 +616,7 @@ func scanTagsKey(buf []byte, i int) (int, error) {
 **scanTagsValue — 扫描 tag value**:
 
 ```go
-// models/points.go:700 — scanTagsValue
+// models/points.go:707 — scanTagsValue
 func scanTagsValue(buf []byte, i int) (int, int, error) {
     // tag value 不能为空
     if i >= len(buf) || buf[i] == ',' || buf[i] == ' ' {
@@ -580,7 +650,7 @@ func scanTagsValue(buf []byte, i int) (int, int, error) {
 ### 4.4 scanFields — 扫描 fields
 
 ```go
-// models/points.go:753 — scanFields
+// models/points.go:760 — scanFields
 func scanFields(buf []byte, i int) (int, []byte, error) {
     start := skipWhitespace(buf, i)
     i = start
@@ -682,7 +752,7 @@ func scanFields(buf []byte, i int) (int, []byte, error) {
 ### 4.5 scanTime — 扫描 timestamp
 
 ```go
-// models/points.go:854 — scanTime
+// models/points.go:861 — scanTime
 func scanTime(buf []byte, i int) (int, []byte, error) {
     start := skipWhitespace(buf, i)
     i = start
@@ -767,7 +837,7 @@ if isNumeric(buf[i+1]) || buf[i+1] == '-' || buf[i+1] == 'N' || buf[i+1] == 'n' 
 ### 5.2 scanNumber — 数字类型细分
 
 ```go
-// models/points.go:892 — scanNumber
+// models/points.go:899 — scanNumber
 func scanNumber(buf []byte, i int) (int, error) {
     start := i
     var isInt, isUnsigned bool
@@ -814,6 +884,12 @@ func scanNumber(buf []byte, i int) (int, error) {
             continue
         }
 
+        // '+' / '-' 仅在紧跟 e/E 时合法（如 1e+10、1e-10）
+        if (buf[i] == '+' || buf[i] == '-') && (buf[i-1] == 'e' || buf[i-1] == 'E') {
+            i++
+            continue
+        }
+
         // NaN 检查
         if i+2 < len(buf) && (buf[i] == 'N' || buf[i] == 'n') {
             return i, ErrInvalidNumber  // 不支持 NaN
@@ -830,7 +906,16 @@ func scanNumber(buf []byte, i int) (int, error) {
         return i, ErrInvalidNumber
     }
 
-    // 位数启发式检查
+    // 零位数守卫：只有符号/小数点/后缀（如 "-"、"."、"1.2.3" 的后半段）都非法
+    numericDigits := i - start
+    if isInt { numericDigits-- }
+    if decimal { numericDigits-- }
+    if buf[start] == '-' { numericDigits-- }
+    if numericDigits == 0 {
+        return i, ErrInvalidNumber
+    }
+
+    // 位数启发式检查（整数位数 >= 19 才真正 parseInt 校验范围；完整版见 §10.6）
     // ...
 }
 ```
@@ -839,21 +924,21 @@ func scanNumber(buf []byte, i int) (int, error) {
 
 ```mermaid
 flowchart TD
-    A["'=' 后面的第一个字节"] --> B{"是数字/负号/N/n?"}
+    A["'=' 后面的第一个字节"] --> B{"是数字、负号或 N/n?"}
 
     B -->|"是"| C["进入 scanNumber"]
-    B -->|"否"| D{"是引号 '\"'?"}
+    B -->|"否"| D{"是双引号?"}
 
-    D -->|"是"| E["String 类型<br>扫描到下一个引号"]
+    D -->|"是"| E["String 类型<br/>扫描到下一个双引号"]
     D -->|"否"| F["进入 scanBoolean"]
 
     C --> G{"有后缀 'i'?"}
-    G -->|"是"| H["Integer 类型<br>如 42i, -100i"]
+    G -->|"是"| H["Integer 类型<br/>如 42i, -100i"]
     G -->|"否"| I{"有后缀 'u'?"}
-    I -->|"是"| J["Unsigned 类型<br>如 42u"]
+    I -->|"是"| J["Unsigned 类型<br/>如 42u"]
     I -->|"否"| K{"有小数点 '.' 或 'e'?"}
-    K -->|"是"| L["Float 类型<br>如 3.14, 1e10"]
-    K -->|"否"| M["Float 类型<br>如 42 (默认)"]
+    K -->|"是"| L["Float 类型<br/>如 3.14, 1e10"]
+    K -->|"否"| M["Float 类型<br/>如 42 (默认)"]
 
     F --> N{"首字符是 t/T?"}
     N -->|"是"| O["检查 true/TRUE/True/t"]
@@ -889,7 +974,7 @@ const (
 ### 5.5 scanBoolean — 布尔值验证
 
 ```go
-// models/points.go:1033 — scanBoolean
+// models/points.go:1040 — scanBoolean
 func scanBoolean(buf []byte, i int) (int, []byte, error) {
     start := i
 
@@ -959,7 +1044,7 @@ func scanBoolean(buf []byte, i int) (int, []byte, error) {
 ### 5.6 FieldIterator.Next() — 类型再推断
 
 ```go
-// models/points.go:2266 — Next
+// models/points.go:2336 — Next
 func (p *point) Next() bool {
     p.it.start = p.it.end
     if p.it.start >= len(p.fields) {
@@ -1034,6 +1119,7 @@ if isInt {
     }
 } else if isUnsigned {
     // models/points.go:1006 — uint64 功能门控
+    // 只有 EnableUintSupport() 或 -tags uint/uint64 编译时才为 true（见 §13.5）
     // Return an error if uint64 support has not been enabled.
     if !enableUint64Support {
         return i, ErrInvalidNumber
@@ -1151,7 +1237,7 @@ scanNumber 主循环 (start 指向 '4', i 从 start 开始):
 ### 6.1 scanKey 构建 indices
 
 ```go
-// models/points.go:485 — scanKey
+// models/points.go:492 — scanKey
 func scanKey(buf []byte, i int) (int, []byte, error) {
     start := skipWhitespace(buf, i)
     i = start
@@ -1224,7 +1310,7 @@ func scanKey(buf []byte, i int) (int, []byte, error) {
 ### 6.2 insertionSort — 小数组排序
 
 ```go
-// models/points.go:736 — insertionSort
+// models/points.go:743 — insertionSort
 func insertionSort(l, r int, buf []byte, indices []int) {
     for i := l + 1; i < r; i++ {
         for j := i; j > l && less(buf, indices, j, j-1); j-- {
@@ -1365,8 +1451,11 @@ func (a Tags) AppendHashKey(dst []byte, escapeTags bool) []byte {
 >   对外可见的 series key 时必须转义。
 > - `Tags.HashKey(escapeTags bool)`（points.go:2211）调用
 >   `a.AppendHashKey(nil, escapeTags)`——把选择权交给 `HashKey` 的调用方。
->   `point.HashKey()` 等内部哈希路径会传 `false`，因为哈希只关心字节本身，不需要
->   规范化转义形式。
+>
+> 注意：全仓**没有** `point.HashKey()` 这个方法。需要 hash key 形式的真实调用点是
+> `services/httpd/response_writer.go:228`：按 shard 路由时执行
+> `models.NewTags(row.Tags).HashKey(false)`。而 `point.HashID()`（`models/points.go:1866`）
+> 直接用 `p.key` 做 FNV-1a，根本不经过 `HashKey`/`AppendHashKey`。
 
 ### 7.3 EscapeMeasurement / unescapeMeasurement 的双重转义防护
 
@@ -1520,7 +1609,7 @@ flowchart TD
 
     subgraph "零分配技术"
         B["unsafeBytesToString<br>unsafe.Pointer 转换"]
-        C["subslice 存储<br>key/fields/ts 直接引用 buf"]
+        C["subslice 存储（tags 已排序时）<br>key/fields/ts 直接引用 buf；乱序会重建 key"]
         D["预分配索引数组<br>make([]int, 100)"]
         E["栈上缓冲区<br>var tmp [20]Tag"]
         F["容量预计算<br>bytes.Count + 1"]
@@ -1600,7 +1689,7 @@ func (s *InlineFNV64a) Sum64() uint64 {
 ### 8.4 Subslice 存储 — 零拷贝字段
 
 ```go
-// models/points.go:383 — parsePoint
+// models/points.go:390 — parsePoint
 pt := &point{
     key:    key,      // 直接引用 buf 的子切片
     fields: fields,   // 直接引用 buf 的子切片
@@ -1608,8 +1697,9 @@ pt := &point{
 }
 ```
 
-point 的 `key`、`fields`、`ts` 字段都是输入缓冲区 `buf` 的子切片，
-不需要额外分配内存。
+在 **tags 已排序**的快速路径上，point 的 `key`、`fields`、`ts` 都是输入缓冲区 `buf` 的子切片，
+不需要额外分配；`fields`/`ts` 始终如此。若 tag 乱序，`scanKey` 会重建 key（一次 `make`），
+此时 `key` 不再指向原 buf（`models/points.go:550-585`）。
 
 ### 8.5 预分配索引数组
 
@@ -1656,7 +1746,9 @@ func (p *point) FieldIterator() FieldIterator {
 
 > **小白解释**: 传统的字段访问需要构建 `map[string]interface{}`，
 > 这需要分配 map 内部结构和每个 key 的字符串。
-> `FieldIterator` 直接在原始字节上遍历，完全零分配。
+> `FieldIterator` 直接在原始字节上遍历：未转义的 field key 是 buf 的子切片（零分配）；
+> 转义的 key 会走 `p.it.keybuf = escape.AppendUnescaped(...)`（`models/points.go:2340-2350`），
+> 而 `StringValue()` 会 `unescapeStringField(string(...))` 分配（`:2392-2394`）。
 
 ### 8.9 懒字段解析与缓存
 
@@ -1718,7 +1810,7 @@ return points, nil
 ### 9.3 scanLine 的引号感知
 
 ```go
-// models/points.go:1102 — scanLine
+// models/points.go:1109 — scanLine
 func scanLine(buf []byte, i int) (int, []byte) {
     start := i
     quoted := false
@@ -1798,7 +1890,7 @@ if start >= len(block) {
 ### 10.3 Null 字节
 
 ```go
-// models/points.go:1090 — skipWhitespace
+// models/points.go:1097 — skipWhitespace
 func skipWhitespace(buf []byte, i int) int {
     for i < len(buf) {
         if buf[i] != ' ' && buf[i] != '\t' && buf[i] != 0 {
@@ -1953,7 +2045,7 @@ func walkFields(buf []byte, fn func(key, value []byte) bool) error {
     return nil
 }
 
-// models/points.go:417 — parsePoint 中的逐字段校验
+// models/points.go:390 — parsePoint 中的逐字段校验
 var maxKeyErr error
 err = walkFields(fields, func(k, v []byte) bool {
     if sz := seriesKeySize(key, k); sz > MaxKeyLength {
@@ -2035,6 +2127,33 @@ maxKeyErr != nil → parsePoint 返回 (nil, maxKeyErr)
 > `#!~#`（4 字节），用于把 series key 和 field key 拼成 TSM 的 composite key。
 > `models` 包不能 import `tsdb/engine/tsm1`（会循环依赖），所以这里硬编码 4。
 
+### 10.12 行分隔与空白边界
+
+解析器对"换行"和"空白"的处理比直觉更严格，跨平台客户端最容易在这里踩坑。
+
+1. **行分隔符只认 `\n`**：`scanLine` 在未被引号包裹的 `\n` 处停下（`models/points.go:1109-1152`）；
+   `ParsePointsWithPrecision` 只剥掉行尾的 `\n`（`points.go:370-373`），**不处理 `\r`**。
+2. **`\r` 会留在行内**：CRLF 输入 `"cpu value=1i 123\r\n"` 得到 block `"cpu value=1i 123\r"`，
+   `scanTime` 扫到 `\r`（既不是数字也不是 `\n`/空格）→ `bad timestamp`。
+3. **measurement 与 fields 之间只认空格**：`scanMeasurement` 只在未转义的 `,`（进入 tag）与
+   ` `（进入 fields）处切换状态（`points.go:598-625`）。**tab 不是分隔符**。
+4. **tab 会被并进 key**：`"cpu\tvalue=1i 123\n"` 中，扫描器一路走到 `1i` 后面的空格才进入 fields，
+   于是 key 变成 `"cpu\tvalue=1i"`（measurement 名里混进 tab 与 `=1i`），fields 只剩 `"123"`，
+   `scanFields` 因 `equals == 0` 报 `invalid field format`（`points.go:760-855`）。
+5. **`skipWhitespace` 只跳过 ` `、`\t`、`\0`**（`points.go:1097-1106`），并且只用在行首
+   （`ParsePointsWithPrecision`）、`scanKey` 起点、`scanFields` 起点、`scanTime` 起点。
+   它不会把 tab 变成 measurement→fields 的分隔符。
+
+| 输入 | 结果 | 原因 |
+|------|------|------|
+| `"cpu value=1i 123\n"` | 解析成功，ts=123 | 标准 LF 行 |
+| `"cpu value=1i 123\r\n"` | `bad timestamp` | `\r` 未被剥离 |
+| `"cpu\tvalue=1i 123\n"` | `invalid field format` | tab 不是分隔符，key 被污染 |
+| `"  cpu value=1i 123\n"` | 解析成功 | 行首空白由 `skipWhitespace` 跳过 |
+
+**结论**：客户端必须发送 LF 结尾、用空格分隔 measurement 与 fields；tab 只能出现在需要转义的
+字符串值内部。
+
 ## 11. 架构设计意图
 
 ### 11.1 为什么用手写状态机而不是正则表达式
@@ -2042,7 +2161,7 @@ maxKeyErr != nil → parsePoint 返回 (nil, maxKeyErr)
 | 维度 | 手写状态机 | 正则表达式 |
 |------|----------|-----------|
 | 性能 | O(n) 单次扫描 | 可能回溯，最差 O(n²) |
-| 内存 | 零分配 | 每次匹配可能分配 |
+| 内存 | 低分配（常见路径） | 每次匹配可能分配 |
 | 错误信息 | 精确到字符位置 | 只能报告"不匹配" |
 | 可控性 | 完全控制每个字节 | 依赖正则引擎 |
 | 复杂度 | 代码量大 | 表达式简洁 |
@@ -2055,7 +2174,7 @@ maxKeyErr != nil → parsePoint 返回 (nil, maxKeyErr)
 
 | 维度 | subslice | 复制 |
 |------|---------|------|
-| 内存 | 零分配 | 每个字段一次分配 |
+| 内存 | 低分配（已排序 tag 常见路径） | 每个字段一次分配 |
 | GC 压力 | 无额外对象 | 大量小对象 |
 | 副作用 | 阻止输入缓冲区 GC | 无 |
 
@@ -2072,7 +2191,7 @@ maxKeyErr != nil → parsePoint 返回 (nil, maxKeyErr)
 
 | 维度 | FieldIterator | map 构建 |
 |------|--------------|---------|
-| 内存分配 | 零分配 | map + 字符串分配 |
+| 内存分配 | 低分配（未转义 key 的常见路径；转义 key / `StringValue()` 会分配） | map + 字符串分配 |
 | 使用场景 | 写入引擎逐字段处理 | 查询引擎需要随机访问 |
 | 灵活性 | 只能顺序遍历 | 可以按 key 查找 |
 
@@ -2133,16 +2252,24 @@ p := points[0]  // p.key 引用 buf 的一小部分
 ### 13.5 Unsigned 支持受功能标志控制
 
 ```go
-// models/points.go:67 — 默认禁用
+// models/points.go:71 — 默认禁用
 var enableUint64Support = false
 
-// models/points.go:72 — 需要手动启用
+// models/points.go:76 — 手动启用（仅用于测试/过渡期）
 func EnableUintSupport() {
     enableUint64Support = true
 }
 ```
 
-Unsigned 类型默认禁用，需要手动调用 `EnableUintSupport()` 启用。
+Unsigned 类型默认禁用。有两条开启路径：
+
+1. **运行时调用** `models.EnableUintSupport()`（测试与嵌入式调用方使用）。
+2. **编译期 build tag**：`models/uint_support.go` 带有 `//go:build uint || uint64`，文件内
+   `func init() { EnableUintSupport() }`（`models/uint_support.go:1-7`）。用
+   `go build -tags uint` 或 `-tags uint64` 编译时，整个二进制默认启用 unsigned。
+
+> **注意**: `enableUint64Support` 是**进程级全局变量**，`EnableUintSupport()` 没有同步保护；
+> 在服务运行期间并发调用会与 `scanNumber` 的读取形成数据竞争。生产环境应只用 build tag。
 
 ## 14. 关键文件索引
 

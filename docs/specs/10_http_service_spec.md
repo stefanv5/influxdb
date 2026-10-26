@@ -122,23 +122,28 @@ sequenceDiagram
     H->>H: 注册路由 (AddRoutes)
     H->>H: 创建 Throttler
 
+    Note over Main: cmd/influxd/run/server.go:346<br/>Prometheus.MustRegister(Controller.PrometheusCollectors()...)<br/>独立于 Handler 生命周期
+
     Main->>Svc: Open()
     Svc->>H: Handler.Open()
     H->>H: 打开访问日志文件
-    H->>H: 检查 Auth + SharedSecret
-    H->>H: 注册 Prometheus Collector (Flux)
-
-    Svc->>TCP: tls.Listen("tcp", ":8086") 或 net.Listen
+    H->>H: 设置 accessLogFilters (status filters)
+    H->>H: AuthEnabled 且 SharedSecret 为空时打印警告
+    Svc->>Svc: NewTLSConfigManager(https, tlsConfig, cert, key, ...)
+    Svc->>TCP: tlsManager.Listen("tcp", ":8086")
     alt Unix Socket 启用
         Svc->>UX: net.Listen("unix", "/var/run/influxdb.sock")
-        Svc->>UX: go serveUnixSocket()
+        Svc->>UX: go serve(unixSocketListener)
     end
-    Svc->>TCP: go serveTCP()
+    alt limit > 0
+        Svc->>Svc: ln = LimitListener(ln, limit)
+    end
+    Svc->>TCP: go serve(ln)
 
     Note over Svc: 服务运行中...<br>接收 HTTP 请求
 
     Main->>Svc: Close()
-    Svc->>H: Handler.Close() (关闭访问日志, 取消注册)
+    Svc->>H: Handler.Close() (只关闭访问日志)
     Svc->>Svc: httpServer.Shutdown(10s 超时)
     alt TCP serve 未启动
         Svc->>TCP: ln.Close()
@@ -149,6 +154,23 @@ sequenceDiagram
         Svc->>UX: unixSocketListener.Close()
     end
 ```
+
+> **两个容易记错的归属**:
+> - **Prometheus Collector 不在 `Handler.Open()` 里注册**。它由 `cmd/influxd/run/server.go:346`
+>   在构造 `srv` 时调用 `s.Prometheus.MustRegister(srv.Handler.Controller.PrometheusCollectors()...)`
+>   完成；`Handler.Open()` 只做三件事：打开访问日志、设置 status filters、打印 shared-secret 警告
+>   （`handler.go:386-408`）。`Handler.Close()` 也只关闭访问日志（`handler.go:409-419`），
+>   不会"取消注册" collector。
+> - **监听器由 `tlsManager.Listen` 创建**（`service.go:162-172`），不是直接 `tls.Listen`/`net.Listen`；
+>   Unix Socket 仍走 `net.Listen("unix", ...)`。`LimitListener` 在 TCP listener 建好、
+>   Unix Socket 也建好之后才套上（`service.go:214-216`）。
+
+> **连接限流行为** (`MaxConnectionLimit` / `LimitListener`, `listen.go:25-38`, `service.go:214-216`):
+> - `NewConfig` 不设置 `MaxConnectionLimit`（默认 0）→ `limit > 0` 为假 → 不套 `LimitListener`，**0 表示不限**。
+> - 套上后，`Accept()` 用一个容量为 `limit` 的信号量：取到槽位才返回连接；取不到时
+>   **直接 `c.Close()` 并继续 Accept**（不排队、不返回 503）。
+> - 被丢弃的连接不会进入 HTTP 层，因此不出现在访问日志与 HTTP 统计里；客户端表现为连接被重置
+>   （`limitListenerConn.Close` 归还槽位，`release` 只执行一次）。
 
 ### 1.3 Config — HTTP 配置
 
@@ -211,7 +233,7 @@ type Config struct {
 路由在 `NewHandler()` 中通过 `h.AddRoutes()` 批量注册：
 
 ```go
-// services/httpd/handler.go:186 — NewHandler 中的路由注册
+// services/httpd/handler.go:160 — NewHandler 中的路由注册
 h.AddRoutes([]Route{
     // 查询相关
     Route{"query-options", "OPTIONS", "/query",        false, true, h.serveOptions},           // CORS 预检
@@ -247,6 +269,11 @@ h.AddRoutes([]Route{
 
 ### 2.2 路由总览表
 
+> **规模**: 共 39 条路由 = 31 条基础路由（`handler.go:193-317`）+ 6 条条件 pprof 路由
+> （`handler.go:339-360`，需 `AuthEnabled && PprofEnabled && PprofAuthEnabled`）
+> + 2 条 Flux 路由（`handler.go:367-373`，`FluxEnabled` 决定 handler 是
+> `serveFluxQuery` 还是 `serveFluxQueryDisabled`）。
+
 | 方法 | 路径 | Handler | Route.Gzipped | Route.LoggingEnabled | 认证来源/条件 |
 |------|------|---------|---------------|----------------------|----------------|
 | `OPTIONS` | `/query` | `serveOptions` | 否 | 是 | CORS 预检 |
@@ -256,7 +283,7 @@ h.AddRoutes([]Route{
 | `POST` | `/write` | `serveWriteV1` | 是 | 可配置 | handler/auth 配置 + writeThrottler |
 | `OPTIONS` | `/api/v2/write` | `serveOptions` | 否 | 是 | CORS 预检 |
 | `POST` | `/api/v2/write` | `serveWriteV2` | 是 | 可配置 | handler/auth 配置，不经过 writeThrottler |
-| `POST` | `/api/v1/prom/write` | `servePromWrite` | 否 | 是 | Prom write auth 配置 + writeThrottler |
+| `POST` | `/api/v1/prom/write` | `servePromWrite` | 否 | 是 | `AuthEnabled` → `authenticate` 中间件 → `WriteAuthorizer.AuthorizeWrite`（无 Prom 专用开关）+ writeThrottler |
 | `POST` | `/api/v1/prom/read` | `servePromRead` | 是 | 是 | `PromReadAuthEnabled` |
 | `GET` | `/ping` | `servePing` | 否 | 是 | `PingAuthEnabled` |
 | `HEAD` | `/ping` | `servePing` | 否 | 是 | `PingAuthEnabled` |
@@ -323,6 +350,25 @@ h.AddRoutes([]Route{
 `net/http/pprof` 处理器（handler.go:569-570 → pprof.go:22-35）。`handleProfiles` 按
 `r.URL.Path` switch 到 `httppprof.Cmdline`/`Profile`/`Symbol`/`archiveProfilesAndQueries`/`Index`，
 **不涉及** `http.DefaultServeMux`。
+
+**四个开关的组合矩阵**（`handler.go:322`、`:567-575`）:
+
+| AuthEnabled | PprofEnabled | PprofAuthEnabled | `/debug/pprof*` 实际行为 |
+|---|---|---|---|
+| true | true | true | 注册认证路由 + `AuthorizeUnrestricted()`，非管理员 403 |
+| true | true | false | `handleProfiles`，**无认证** |
+| false | true | true/false | `handleProfiles`，**无认证**（`PprofAuthEnabled` 被忽略） |
+| 任意 | false | 任意 | 不匹配 pprof 分支，交给 mux（通常 404） |
+
+> 关键点：认证分支的条件是 `AuthEnabled && PprofEnabled && PprofAuthEnabled` 三者同时为真
+> （`handler.go:567`）。所以 `AuthEnabled=false` 时**即使** `PprofAuthEnabled=true`，
+> `/debug/pprof*` 也走无认证的 `handleProfiles`。
+>
+> `/debug/vars`、`/debug/requests` 由 `ServeHTTP` 的前缀分支直接分发（`handler.go:572-577`），
+> **不经过** handler 签名或 `authWrapper`。仅当 `AuthEnabled && PprofEnabled && PprofAuthEnabled`
+> 三者全真时，`ServeHTTP` 会先走 mux、命中带认证的注册路由（`handler.go:355-365`）；
+> 其余组合下前缀分支先命中，**始终无认证**。这与 `/debug/pprof` 的开关矩阵不同
+> （后者还要求 `PprofEnabled=true`）。
 
 ## 3. 中间件链
 
@@ -729,6 +775,9 @@ sequenceDiagram
 
     W->>W: ① atomic.AddInt64(&stats.WriteRequests, 1)
     W->>W: ② 检查 database != ""
+    alt database == ""
+        W-->>Client: 400 "database is required"
+    end
 
     W->>MC: ③ Database(database)
     alt 数据库不存在
@@ -745,11 +794,12 @@ sequenceDiagram
         end
     end
 
-    W->>TR: ⑥ truncateReader(body, MaxBodySize)
+    W->>TR: ⑥ body = truncateReader(r.Body, MaxBodySize)
     Note over TR: 超过 25MB 返回 errTruncated
 
     alt Content-Encoding: gzip
-        W->>GZ: ⑦ gzip.NewReader(body)
+        W->>GZ: ⑦ body = gzip.NewReader(r.Body) — 覆盖 ⑥ 的 body
+        Note over GZ: 截断器被丢弃；chunked gzip (ContentLength=-1) 连 413 预检都没有
     end
 
     W->>W: ⑧ buf.ReadFrom(body)
@@ -760,9 +810,13 @@ sequenceDiagram
     W->>W: atomic.AddInt64(&stats.WriteRequestBytesReceived, buf.Len())
 
     W->>PP: ⑨ models.ParsePointsWithPrecision(bytes, now, precision)
-    alt 全部解析失败
+    alt parseError != nil 且 0 个点
         PP-->>W: error, empty points
-        W-->>Client: 400 Bad Request
+        alt parseError == "EOF"
+            W-->>Client: 200 OK（空体）
+        else 其他解析错误
+            W-->>Client: 400 Bad Request
+        end
     end
 
     W->>W: ⑩ 解析 consistency 参数 (默认: one)
@@ -904,6 +958,101 @@ func (r *truncatedReader) Read(p []byte) (n int, err error) {
 > 注意使用 `N+1` 而非 `N`：只有当读取**超过** N 字节时才触发截断，
 > 恰好 N 字节时仍视为正常。
 
+> **重要边界（容易误读）**: `serveWrite` 里 `body = truncateReader(r.Body)` 先算出来
+> （`handler.go:1701-1705`），但 `Content-Encoding: gzip` 分支会用
+> `gzip.NewReader(r.Body)` **覆盖** `body`（`handler.go:1707-1711`），截断器因此被丢弃：
+> - 非 chunked 的 gzip 请求仍能靠 `r.ContentLength > MaxBodySize` 的预检返回 413
+>   （`handler.go:1717-1722`）；
+> - **chunked gzip** 的 `ContentLength == -1`，预检被跳过，解压后的数据没有 `MaxBodySize` 上限。
+>
+> 另外两个边界：`database == ""` → 400 `"database is required"`（`handler.go:1679-1682`）；
+> `ParsePointsWithPrecision` 返回 `"EOF"` 且 0 个点 → `writeHeader(200)` 空体
+> （`handler.go:1749-1757`）。因此 §4.4 的"25MB 上限"只对**非 gzip** 请求严格成立。
+
+### 4.5 V2 bucket 端点族（14 条路由）
+
+`handler.go:218-273` 注册了 14 条 `/api/v2/buckets*` 路由。§2.2a 只把它们当索引列出；
+本节讲真实行为。V2 的 "bucket" 在 OSS 1.x 中映射为 `database/retentionPolicy`，
+路径参数 `:dbrp` 承载这个组合。
+
+| 分组 | 路由 | Handler | 真实行为 |
+|------|------|---------|----------|
+| 创建 | `POST /api/v2/buckets` | `servePostCreateBucketV2`（1159-1263） | 建库或建 RP，返回 201 + bucket JSON |
+| 删除 | `DELETE /api/v2/buckets/:dbrp` | `serveDeleteBucketV2`（1279-1309） | `Store.DeleteRetentionPolicy` → `MetaClient.DropRetentionPolicy`，200 空体 |
+| 更新 | `PATCH /api/v2/buckets/:dbrp` | `serveUpdateBucketV2`（1311-1386） | `MetaClient.UpdateRetentionPolicy`，200 + bucket JSON |
+| 检索 | `GET /api/v2/buckets/:dbrp` | `serveRetrieveBucketV2`（1388-1420） | `oneBucket`，200 + bucket JSON |
+| 列表 | `GET /api/v2/buckets` | `serveListBucketsV2`（1422-1528） | 遍历全部 db×rp，按 `ReadPrivilege` 过滤 |
+| 兼容拒绝 | `*/labels*`、`*/members*`、`*/owners*`（9 条） | `serveLabelsNotAllowedV2` 等（1609-1624） | 统一 405 `"not supported in this version"` |
+
+```mermaid
+flowchart TD
+    P["POST /api/v2/buckets"] --> P1{"ContentLength > MaxBodySize?"}
+    P1 -->|"是"| E413["413"]
+    P1 -->|"否"| P2{"JSON 解析成功?"}
+    P2 -->|"否"| E400["400"]
+    P2 -->|"是"| P3{"bucket2dbrp 含 / ?"}
+    P3 -->|"否"| E400
+    P3 -->|"是"| P4{"brd.Rp 与路径 RP 冲突?"}
+    P4 -->|"是"| E400
+    P4 -->|"否"| P5{"meta.ValidName(rp)?"}
+    P5 -->|"否"| E400
+    P5 -->|"是"| P6{"AuthEnabled?"}
+    P6 -->|"是"| P7["AuthorizeCreateDatabase 或<br/>AuthorizeCreateRetentionPolicy"]
+    P7 -->|"拒绝"| E403["403"]
+    P6 -->|"否"| P8{"库已存在?"}
+    P7 -->|"通过"| P8
+    P8 -->|"否"| P9["CreateDatabaseWithRetentionPolicy"]
+    P8 -->|"是"| P10["CreateRetentionPolicy"]
+    P9 --> P11["201 + JSON"]
+    P10 --> P11
+
+    D["DELETE /api/v2/buckets/:dbrp"] --> D1["checkDbRp"]
+    D1 --> D2["AuthorizeDeleteRetentionPolicy"]
+    D2 --> D3{"库/RP 存在?"}
+    D3 -->|"否"| E404["404"]
+    D3 -->|"是"| D4["Store.DeleteRetentionPolicy"]
+    D4 --> D5["MetaClient.DropRetentionPolicy"]
+    D5 --> D6["200 空体"]
+
+    U["PATCH /api/v2/buckets/:dbrp"] --> U1["checkDbRp + AuthorizeCreateDatabase"]
+    U1 --> U2["body 413/400 → UpdateRetentionPolicy"]
+    U2 --> U3["200 + JSON"]
+
+    G["GET /api/v2/buckets/:dbrp"] --> G1["AuthorizeDatabase(ReadPrivilege)"]
+    G1 --> G2["oneBucket"]
+    G2 --> G3["200 + JSON"]
+
+    L["GET /api/v2/buckets"] --> L1{"id/name 互斥?"}
+    L1 --> L2{"after 与 offset 互斥?"}
+    L2 --> L3["逐 db AuthorizeDatabase 过滤"]
+    L3 --> L4["sendBuckets → 200"]
+```
+
+**创建分支的关键点**（`handler.go:1159-1263`）:
+- `bucket2dbrp(brd.Name)` 必须解析出非空 RP，否则 400；
+- 若 body 里的 `rp` 与名字里的 RP 不一致 → 400 `"two retention policies specified"`；
+- RP 名要过 `meta.ValidName`；
+- `RetentionRules[0]` 存在则用其 `EverySeconds`/`ShardGroupDurationSeconds`，否则用
+  `meta.DefaultRetentionPolicyDuration`；
+- 授权按"库是否存在"分叉：不存在 → `AuthorizeCreateDatabase`，存在 → `AuthorizeCreateRetentionPolicy`；
+- 成功返回 `201 Created` + `makeBucket` 的 JSON。
+
+**删除分支**（`handler.go:1279-1309`）与 11 号文档的 `DROP RETENTION POLICY`
+（`coordinator/statement_executor.go:394-409`）是**同一条**路径：
+`Store.DeleteRetentionPolicy` → `MetaClient.DropRetentionPolicy`。顺序不可颠倒。
+
+**列表分支**（`handler.go:1445-1528`）: `limit` 默认 100，`limit <= 0` 视为 `math.MaxInt`；
+`after` 与 `offset` 互斥；`id` 与 `name` 同时给出且不同 → 400；`after` 找不到 → 404；
+输出前逐个 db 做 `ReadPrivilege` 过滤，无权限的 db 整段跳过。
+
+> **易错点**: `:dbrp` 是 **pat** 风格路径参数，源码用 `r.URL.Query().Get(":dbrp")` 读取
+> （`handler.go:1280/1313/1390`），不是 Go 1.22 的 `r.PathValue`。
+
+**错误码总表**: 200（删除/更新/检索/列表成功）、201（创建成功）、400（JSON、dbrp 格式、
+RP 冲突、非法名字、body 超限以外的读错误、meta 操作失败）、403（认证开启时无用户或无权限）、
+404（删除时的库/RP 不存在、`oneBucket` 找不到、`after` 不存在）、405（labels/members/owners）、
+413（ContentLength 超限）。
+
 ## 5. 查询请求全链路
 
 ### 5.1 serveQuery 完整流程
@@ -955,7 +1104,12 @@ sequenceDiagram
     alt async=true
         SQ->>SQ: go async(q, results) — 后台消费
         SQ-->>Client: 204 No Content
-    else chunked=true
+    end
+
+    SQ->>RW: writeHeader(200) + Flush()   // 状态码在此固定
+    Note over SQ,RW: 之后的 Result.Err 只能写进 body，无法再改状态码
+
+    alt chunked=true
         loop 每个结果
             QE-->>SQ: result
             SQ->>RW: WriteResponse({Results: [result]})
@@ -963,11 +1117,14 @@ sequenceDiagram
         end
     else 非分块
         QE-->>SQ: result
-        SQ->>SQ: 合并同 statement 结果
         SQ->>SQ: 应用 MaxRowLimit 裁剪
+        SQ->>SQ: 合并同 statement 结果
         SQ->>RW: WriteResponse({Results: allResults})
     end
 ```
+
+> **注意**: 图中 `writeHeader(200) + Flush()` 之后状态码已经固定；执行期错误只能写进
+> JSON body 的 `results[].error`。完整的"两阶段"状态码语义见 §5.5。
 
 ### 5.2 查询参数详解
 
@@ -976,13 +1133,24 @@ sequenceDiagram
 | `q` | string | InfluxQL 查询语句 (必需) |
 | `db` | string | 目标数据库 |
 | `rp` | string | 目标保留策略 |
-| `epoch` | string | 时间戳精度: `h`, `m`, `s`, `ms`, `u`, `ns` |
+| `epoch` | string | 时间戳精度: `h`, `m`, `s`, `ms`, `u`, `ns`（仅当 `time_format=epoch` 时生效） |
+| `time_format` | string | `rfc3339` 或 `epoch`（默认 `epoch`；其他值 → 400） |
 | `chunked` | bool | 是否分块返回 |
 | `chunk_size` | int | 每块最大行数 (默认 10000) |
 | `async` | bool | 是否异步执行 |
 | `node_id` | uint64 | 指定执行节点 (集群模式) |
 | `pretty` | bool | JSON 格式化输出 |
-| `params` | string | JSON 格式的查询参数 |
+| `params` | string | JSON 格式的查询参数（供 `$param` 占位符使用） |
+
+> **`params` 解析细节**（`handler.go:656-687`）: 用 `json.Decoder` 并开启 `UseNumber()`；
+> 逐个值判断，字符串里含 `.` 的转 `float64`，否则转 `int64`，转换失败 → 400
+> `"error parsing json value: ..."`；JSON 本身解析失败 → 400
+> `"error parsing query parameters: ..."`。解析结果通过 `p.SetParams(params)` 交给解析器。
+>
+> **`time_format` 校验**（`handler.go:635-646`）: 空值默认 `epoch`；只接受 `rfc3339` /
+> `epoch`，其他值返回 400 `"Time format must be one of the following: rfc3339,epoch"`。
+> `epoch` 参数只在最终 `time_format == "epoch"` 且非空时才调用 `convertToEpoch`
+> （`handler.go:806-808`）；`time_format=rfc3339` 时调用 `convertToTimeFormat(r, time.RFC3339Nano)`。
 
 ### 5.3 分块 vs 非分块查询
 
@@ -1026,6 +1194,9 @@ if h.Config.MaxRowLimit > 0 {
 > 如果货物太多（超过 MaxRowLimit），就只装一部分，剩下的丢弃。
 > 分块查询则像分批寄送——每批 chunk_size 件，分多次寄出。
 > 分块模式对大结果集更友好，不会撑爆内存。
+>
+> 本节只是最小示例；`epoch`/`rfc3339` 转换、chunked 直写、`MaxRowLimit` 裁剪与
+> 同 `StatementID` 合并的完整实现见 §5.6。Result 的产生与切分见 11 §11.5/§13.4。
 
 ### 5.4 客户端断开检测
 
@@ -1061,6 +1232,218 @@ if !async {
 > 4. `CloseNotify()` 触发，`closing` 通道被关闭
 > 5. QueryExecutor 检测到 `closing` 通道关闭，停止执行
 > 6. 资源被释放，不再继续扫描数据
+>
+> `closing`/`AbortCh` 如何变成 `ErrQueryAborted`/`ErrQueryInterrupted` 见 11 §11.2/§4.6。
+
+### 5.5 HTTP 状态码映射（两阶段语义）
+
+`serveQuery` 的响应分成两个阶段：**写响应头之前**的错误可以改状态码；**写响应头之后**
+（`handler.go:793-796` 的 `writeHeader(200)` + `Flush()`）状态码已固定为 200，任何执行期
+错误都只能进入 JSON body 的 `results[].error`。
+
+**阶段一：写头之前（可改状态码）**
+
+| 条件 | 状态码 | 证据 |
+|---|---|---|
+| 缺少 `q` / multipart 文件打开失败 | 400 | handler.go:613-635 |
+| `time_format` 不是 `rfc3339`/`epoch` | 400 | handler.go:635-646 |
+| `params` JSON 解析或数值转换失败 | 400 | handler.go:656-687 |
+| `ParseQuery` 失败 | 400 | handler.go:686-690 |
+| `AuthorizeQuery` 失败 | 403 | handler.go:693-710 |
+| `async=true` | 204（不写 200） | handler.go:781-784 |
+
+这些响应统一带 `X-InfluxDB-Error`（401 时改带 `WWW-Authenticate`），由 `httpError`
+设置（`handler.go:2737-2760`）。
+
+**阶段二：写头之后（状态码恒为 200）**
+
+| 条件 | 客户端看到 |
+|---|---|
+| `AttachQuery` 失败（`MaxConcurrentQueries`、引擎关闭） | 200 + `results[].error` |
+| 任意语句执行错误（`ErrNotExecuted`、panic 恢复、`QueryTimeout`、`max-select-*`） | 200 + `results[].error` |
+| `convertToTimeFormat` 失败 | 仍是 200；源码会多调一次 `httpError(400)`（`handler.go:809-812`），但 `WriteHeader` 已发生 → 标准库记录 superfluous，状态码不变（已知缺陷，建议后续改为写 body 错误） |
+| 客户端提前断开 | 可能收到部分 JSON，无完整响应 |
+
+**为什么先 200 再 Flush**: 源码注释（`handler.go:790-792`）说明目的是尽早把响应头发给
+客户端，让客户端知道查询已被接受；chunked 模式下第一个结果可以立即写出。代价正是
+执行期错误无法再改状态码。
+
+```mermaid
+flowchart TD
+    A["serveQuery"] --> B{"预处理通过?"}
+    B -->|"否"| C["httpError 4xx + X-InfluxDB-Error"]
+    B -->|"是"| D["writeHeader 200 + Flush"]
+    D --> E["for r := range results"]
+    E --> F{"Result.Err 非空?"}
+    F -->|"是"| G["写入 body results[].error"]
+    F -->|"否"| H["写/合并结果"]
+    G --> I["结束：状态码仍 200"]
+    H --> I
+```
+
+> **契约**: 任何执行期错误（含并发限制、超时、panic、点数/series/bucket 超限）都**不得**
+> 声称改变 HTTP 状态码。11 号文档只定义 `Result.Err` 的内容与传播，状态码以本节为唯一事实源。
+
+### 5.6 查询响应装配（epoch / chunked / 非分块合并 / MaxRowLimit）
+
+§5.1 画到 `ExecuteQuery` 为止，本节把"结果如何变成响应字节"补全。Result 的产生与切分见
+11 §11.5/§13.4；本节只讲 HTTP 层。
+
+```mermaid
+sequenceDiagram
+    participant SQ as serveQuery
+    participant RW as ResponseWriter
+    participant QE as QueryExecutor
+
+    SQ->>QE: ExecuteQuery(q, opts, closing)
+    Note over SQ: async=true 时 go async(...) + 204，直接返回
+    SQ->>RW: writeHeader(200) + Flush()
+    loop for r := range results
+        QE-->>SQ: Result
+        alt epoch 参数非空且 time_format=epoch
+            SQ->>SQ: convertToEpoch(r, epoch)
+        else time_format=rfc3339
+            SQ->>SQ: convertToTimeFormat(r, RFC3339Nano)
+        end
+        alt chunked=true
+            SQ->>RW: WriteResponse(单个 Result) + Flush
+        else 非分块
+            SQ->>SQ: MaxRowLimit 裁剪
+            SQ->>SQ: 同 StatementID 合并
+        end
+    end
+    alt 非分块
+        SQ->>RW: WriteResponse(全部 Results)
+    end
+```
+
+**时间格式转换**（`handler.go:806-813`）:
+- `epoch` 参数非空且 `time_format == "epoch"` → `convertToEpoch(r, epoch)`，按 `h/m/s/ms/u/ns` 截断；
+- `time_format == "rfc3339"` → `convertToTimeFormat(r, time.RFC3339Nano)`；
+- 两者都不满足时不做转换，`time.Time` 直接按 RFC3339Nano 序列化。
+
+**两个案例**（同一查询 `SELECT mean(usage_user) FROM cpu GROUP BY host`，
+`cpu` 有 `host=web01` / `host=web02` 两个 series）:
+
+> **注意**: 案例①只覆盖 1 个 5 分钟窗口（每个 series 1 行），案例②覆盖 2 个窗口
+> （每个 series 2 行）；11 §13.4 的 chunked trace 又是另一组规模（web01 3 行 +
+> web02 1 行）。切分规则相同，Result 数只由 `chunk_size` 与 series 边界决定，
+> 与窗口数无关，三处数字不可横向直接对照。
+
+① `chunked=true&chunk_size=1`（每个 series 1 行）：Emitter 每遇到 chunkSize 边界或
+series 边界就返回一次（`query/emitter.go:54-67`），`serveQuery` 对每个 Result 立即
+写出并 Flush，客户端收到 **2 个独立 JSON 对象**：
+
+```json
+{"results":[{"statement_id":0,"series":[{"name":"cpu","tags":{"host":"web01"},"columns":["time","mean"],"values":[["2024-01-01T09:55:00Z",35]]}],"partial":true}]}
+{"results":[{"statement_id":0,"series":[{"name":"cpu","tags":{"host":"web02"},"columns":["time","mean"],"values":[["2024-01-01T09:55:00Z",42]]}]}]}
+```
+
+第一个对象只有 result 级 `"partial":true`（后面还有下一个 chunk）；series 级没有
+`partial`，因为 web01 的行不是在 chunkSize 边界被切开的（`query/emitter.go:64-67` 的
+series 边界分支只返回 `partial=true` 这个第二返回值，不设置 `row.Partial`）。第二个
+对象的 `partial` 被省略（`false` 且 `omitempty`）：它是最后一个 chunk。
+
+② 非分块：整个查询只在 channel 关闭后写一次响应，**1 个 JSON 对象**、`results[0].series`
+含 2 项（`handler.go:855-914`）：
+
+```json
+{"results":[{"statement_id":0,"series":[{"name":"cpu","tags":{"host":"web01"},"columns":["time","mean"],"values":[["2024-01-01T09:55:00Z",35],["2024-01-01T10:00:00Z",125]]},{"name":"cpu","tags":{"host":"web02"},"columns":["time","mean"],"values":[["2024-01-01T09:55:00Z",42],["2024-01-01T10:00:00Z",98]]}]}]}
+```
+
+合并规则（`handler.go:859-892`）：与上一条 `Result` 的 `StatementID` 相同才合并；
+`r.Err != nil` 时整体替换上一条；`SameSeries` 的 row 追加 `values` 并继承 `row.Partial`；
+不同 series 追加到 `series[]`；`Messages` 拼接；`Partial` 取最后一条的值
+（`cr.Partial = r.Partial`）。因此上面的最终结果里 `result.partial` 被省略。
+
+**MaxRowLimit 裁剪**（`handler.go:829-853`）: `MaxRowLimit > 0` 时按 series 顺序累计行数，
+超限的 series 被 `series.Values[:n]` 截断并标 `series.Partial = true`，后续 series 直接丢弃；
+命中上限后**显式把 `result.Partial` 置 false**（`handler.go:900-905`），因为非分块模式不会
+再发下一个 chunk；但 `series[].partial` 仍可能为 true，客户端据此知道该 series 被截断。
+
+**边界**:
+- `async=true` → `204 No Content` + `go h.async(q, results)` 在后台 drain（`handler.go:781-784`）；
+  不做任何结果装配。
+- 客户端断开 → `closing` 关闭、`opts.AbortCh = done`（`handler.go:750-773`）；handler 可能
+  在写出部分 JSON 后停止。取消语义见 11 §11.2/§4.6。
+
+### 5.7 /api/v2/delete — V2 删除流程
+
+`POST /api/v2/delete?bucket=db/rp` 是 V2 形态的删除端点，最终走 TSDB 层的
+`Store.Delete(db, sources, condition)`（tombstone），**不是** `PointsWriter`；权限复用
+`WriteAuthorizer.AuthorizeWrite`（与写入同权）。
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Del as serveDeleteV2
+    participant Meta as MetaClient
+    participant Auth as WriteAuthorizer
+    participant IQ as influxql
+    participant Store
+
+    Client->>Del: POST /api/v2/delete?bucket=db/rp
+    Del->>Del: bucket2dbrp(bucket)
+    alt 格式错误
+        Del-->>Client: 404 "delete - bucket: ..."
+    end
+    Del->>Meta: Database(db)
+    alt 库不存在
+        Del-->>Client: 404 "delete - database not found"
+    end
+    Del->>Meta: Database(db).RetentionPolicy(rp)
+    alt RP 不存在
+        Del-->>Client: 404 "delete - retention policy not found"
+    end
+    alt AuthEnabled
+        Del->>Del: user == nil?
+        Del->>Auth: AuthorizeWrite(user.ID(), db)
+        alt 未授权
+            Del-->>Client: 403
+        end
+    end
+    Del->>Del: ContentLength > MaxBodySize? → 413
+    Del->>Del: ReadFrom + JSON Unmarshal → 400
+    Del->>Del: start/stop 必填 + RFC3339Nano 解析 → 400
+    Del->>IQ: ParseExpr(predicate AND time >= ... AND time < ...)
+    alt 解析失败
+        Del-->>Client: 400
+    end
+    Del->>IQ: PartitionExpr 抽取 _measurement / 拒绝非法算子
+    alt 含 != / =~ / !~ / OR
+        Del-->>Client: 400
+    end
+    Del->>Store: Delete(db, srcs, remainingExpr)
+    alt 失败
+        Del-->>Client: 400
+    end
+    Del-->>Client: 200 空体
+```
+
+**谓词白名单**（`handler.go:1064-1097`）:
+
+| 谓词形态 | 处理 |
+|---|---|
+| `_measurement = 'm'` | 抽出为 `sources`（不留在条件里） |
+| 其他 `tag = 'v'` | 保留为剩余条件 |
+| `!=`、`=~`、`!~`、`OR` | 直接 400：`predicate only supports equality operators and conjunctions` |
+| `time` 条件 | 由服务端强制拼接：`predicate AND time >= '<start>' AND time < '<stop>'` |
+
+**参数**:
+
+| 参数 | 位置 | 说明 |
+|---|---|---|
+| `bucket` | query | 必填，格式 `db/rp`（`bucket2dbrp`） |
+| `start` | body | 必填，RFC3339Nano |
+| `stop` | body | 必填，RFC3339Nano |
+| `predicate` | body | 可选；只允许等值与 AND |
+
+**错误码**: 400（JSON/时间格式/谓词解析/`Store.Delete` 失败）、403（无用户或无写权限）、
+404（bucket 格式、库或 RP 不存在）、413（body 超限）、200（成功且无响应体）。
+
+> **易错点**: `_measurement = 'x'` 不是普通标签条件，而是被提升为 source；因此同一个
+> measurement 的删除会落到 `Store.Delete` 的 sources 参数上。源实现见
+> `services/httpd/handler.go:975-1109`。
 
 ## 6. 认证机制
 
@@ -1191,7 +1574,7 @@ case BearerAuthentication:
 ### 6.4 引导模式 (Bootstrap)
 
 ```go
-// services/httpd/handler.go:2847 — authenticate
+// services/httpd/handler.go:2837 — authenticate
 if requireAuthentication && h.MetaClient.AdminUserExists() {
     // 只有当管理员用户存在时才执行认证
     // ...
@@ -1226,6 +1609,11 @@ func NewThrottler(concurrentN, maxEnqueueN int) *Throttler {
     }
 }
 ```
+
+> **默认值**: `NewConfig` 并不设置 `MaxConcurrentWriteLimit` / `MaxEnqueuedWriteLimit`
+> （`services/httpd/config.go:71-99`），二者默认均为 **0**。0 的效果见 `Throttler.Handler`
+> （`handler.go:3174-3180`）：`cap(t.current) == 0` 时直接返回原 handler，**完全不限流**。
+> 本节示例里的 `10/100` 只是演示值，不是默认配置。
 
 ### 7.2 限流执行流程
 
@@ -1360,6 +1748,10 @@ func (h *Handler) serveFluxQuery(w http.ResponseWriter, r *http.Request, user me
 
     // 1. 解码请求 (JSON 或 Flux 脚本)
     req, err := decodeQueryRequest(r)
+    if err != nil {
+        h.httpError(w, err.Error(), http.StatusBadRequest)   // 400
+        return
+    }
 
     // 2. 设置上下文 (node_id, user)
     ctx := r.Context()
@@ -1377,6 +1769,10 @@ func (h *Handler) serveFluxQuery(w http.ResponseWriter, r *http.Request, user me
 
     // 4. 执行 Flux 查询
     q, err := h.Controller.Query(ctx, pr.Compiler)
+    if err != nil {
+        h.httpError(w, err.Error(), http.StatusInternalServerError)   // 500
+        return
+    }
     // 注意: 单个 defer 包裹一个匿名函数 (handler.go:2221-2224)
     defer func() {
         q.Cancel()  // 先执行 (闭包内自上而下)
@@ -1388,9 +1784,22 @@ func (h *Handler) serveFluxQuery(w http.ResponseWriter, r *http.Request, user me
     case "text/csv":
         fallthrough
     default:
+        hd, ok := pr.Dialect.(httpDialect)
+        if !ok {
+            // 只有 HTTP 认识的 dialect 才能通过 HTTP 端点返回
+            h.httpError(w, fmt.Sprintf("unsupported dialect over HTTP %T", req.Dialect), http.StatusBadRequest)
+            return
+        }
+        hd.SetHeaders(w)   // 先写 dialect 头；此处不写状态码
         encoder := pr.Dialect.Encoder()
         results := flux.NewResultIteratorFromQuery(q)
+        defer results.Release()
         n, err = encoder.Encode(w, results)
+        if err != nil && n == 0 {
+            // 编码器一个字都没写，才能安全地改状态码
+            h.httpError(w, err.Error(), http.StatusInternalServerError)
+            return
+        }
     }
 }
 ```
@@ -1408,6 +1817,17 @@ func (h *Handler) serveFluxQuery(w http.ResponseWriter, r *http.Request, user me
 > - 闭包体内语句**自上而下顺序执行** (非 LIFO): 函数返回时先跑 `q.Cancel()`，
 >   再跑 `q.Done()`。即先取消查询，再标记查询完成。最终执行顺序与旧版 LIFO 推理一致，
 >   但原因从"两个 defer 的后进先出"改为"单个 defer 内闭包的顺序执行"。
+
+**容易漏掉的五个分支**:
+1. `FluxEnabled=false` 时路由 handler 在 `AddRoutes` 前被换成 `serveFluxQueryDisabled`
+   （`handler.go:377`），直接 403 `"Flux query service disabled..."`（`handler.go:2263-2266`），
+   本节函数根本不会执行。
+2. `decodeQueryRequest` 失败 → 400（`handler.go:2186-2189`）。
+3. `Controller.Query` 失败 → 500（`handler.go:2216-2220`）。
+4. dialect 不是 `httpDialect` → 400 `"unsupported dialect over HTTP"`（`handler.go:2237-2240`）；
+   是则先 `hd.SetHeaders(w)`（`handler.go:2241`）再取 encoder。
+5. `encoder.Encode` 返回错误且 `n == 0` → 500；若 `n > 0`，响应体已经写出一部分，
+   状态码无法再改（`handler.go:2252-2257`）。这也解释了源码注释"不提前写头"的用意。
 
 ### 8.2 decodeQueryRequest — 请求解码
 
@@ -1469,23 +1889,32 @@ sequenceDiagram
     participant PW as PointsWriter
 
     Prom->>HTTP: POST /api/v1/prom/write<br/>Content-Type: application/x-protobuf
-    HTTP->>HTTP: 检查 Auth (PromWriteAuthEnabled)
+    HTTP->>HTTP: 检查 AuthEnabled（无 Prom 专用开关）
+    alt AuthEnabled && user == nil
+        HTTP-->>Prom: 403 "user is required to write to database ..."
+    else AuthEnabled && AuthorizeWrite 失败
+        HTTP-->>Prom: 403 "user is not authorized to write to database ..."
+    end
     HTTP->>TR: truncateReader(body, MaxBodySize)
     TR->>PB: buf.ReadFrom(body) → bytes.Buffer
     PB->>PB: snappy.Decode(nil, buf.Bytes())
     PB->>PB: req.Unmarshal(reqBuf) — prompb.WriteRequest
 
-    loop 每个 TimeSeries
-        PB->>Conv: 提取 Labels → measurement + tags
-        Note over Conv: __name__ label → measurement 名称<br/>其他 label → tag key/value
-        PB->>Conv: 提取 Samples → (timestamp, value) 对
-        Note over Conv: 每个 Sample 构建一个 models.Point<br/>timestamp: s.Timestamp (毫秒)→纳秒转换 (converters.go:83)
-        Conv->>PW: WritePoints(database, rp, points)
-    end
+    PB->>Conv: WriteRequestToPoints(&req)（内部 series→samples 双层循环）
+    Note over Conv: 每个 TimeSeries 提取 Labels → measurement + tags<br/>__name__ label → measurement 名称；其他 label → tag key/value<br/>每个 Sample → 一个 models.Point，timestamp: s.Timestamp (毫秒)→纳秒 (converters.go:83)
+    Conv-->>PB: []models.Point
+    PB->>PW: WritePoints(database, rp, consistency, user, points)（一次）
 
     PW-->>HTTP: 成功/错误
     HTTP-->>Prom: 204 / 400 / 500
 ```
+
+> **认证说明**: `Config` 中**没有** Prometheus 写入专用的认证开关（`services/httpd/config.go:34-69`）。
+> Prometheus remote write 复用 V1 写入的认证链：`authenticate` 中间件按 `AuthEnabled`
+> 解析用户 → `servePromWrite` 内再以 `WriteAuthorizer.AuthorizeWrite` 授权
+> （`handler.go:1918-1930`）。它在认证上与 `/write` 完全一致（同样走 `authenticate` +
+> `AuthorizeWrite`），也同样被 `writeThrottler` 包装（`handler.go:531`）；区别只在
+> handler 与请求体格式，认证上没有独立开关。
 
 **协议转换细节**:
 
@@ -1604,9 +2033,19 @@ sequenceDiagram
 |-----------------|----------------|
 | `matchers` (label 匹配) | `WHERE tag = 'value'` |
 | `start` / `end` (时间范围) | `WHERE time >= start AND time < end` |
-| `__name__` matcher | `FROM measurement` |
+| `__name__` matcher | `_measurement = 'x'` 标签条件（**不是** FROM） |
 | `=~` (正则匹配) | `tag =~ /regex/` |
 | `!=` (不等于) | `tag != 'value'` |
+
+> **两个隐含条件**:
+> 1. 每个 remote read 请求都会自动追加 `_field == "value"` 条件——`predicateFromMatchers`
+>    把 matcher 子树与 `fieldNode()` 用 `Node_LogicalAnd` 连接（`prometheus/converters.go:145-160`、
+>    `:163-184`）；Prometheus 写入时字段名固定为 `fieldName`（`value`），所以读取必须限定它。
+> 2. `len(req.Queries) != 1` 直接返回错误（`prometheus/converters.go:102-104`），最终由
+>    `servePromRead` 转成 400（`handler.go:2066-2090`）：一个 HTTP 请求只支持一个 query。
+>
+> `__name__` matcher 在 `nodeFromMatcher` 中被改名为 `_measurement` 标签
+> （`prometheus/converters.go:226-229`），因此它是标签条件而不是 source/measurement。
 
 ## 10. ServeHTTP 入口与路由分发
 
@@ -1804,9 +2243,14 @@ Authorization: Basic Z3JhZmFuYTpncmFmYW5h (grafana:grafana)
      → 检查 grafana_user 对 telegraf 数据库的 READ 权限
      → 返回 fineAuthorizer
    - chunked=true, chunk_size=1000
-   - ExecutionOptions{Database: "telegraf", ChunkSize: 1000, ReadOnly: true}
+   - ExecutionOptions{Database: "telegraf", ChunkSize: 1000, ReadOnly: (r.Method == "GET")}
+     // 源码: ReadOnly: r.Method == "GET" (handler.go:733)；本例是 POST → ReadOnly=false
    - 设置 closing 通道 (检测客户端断开)
    - QueryExecutor.ExecuteQuery(query, opts, closing) → results channel
+
+> **ReadOnly 的语义**: 它只由 HTTP 方法决定（`GET` → true，`POST` → false，`handler.go:733`），
+> 与"是否真的只读"无关。ReadOnly=true 时 DDL/DML 语句不会被拒绝，而是附加
+> `ReadOnlyWarning` 后**仍然执行**（见 11 §5.2a）。
 
 ④ 结果流式返回 (chunked)
    - 第 1 个 result: series(host=web01) 的 mean(usage_user) 按 1 分钟聚合
@@ -1957,7 +2401,46 @@ PprofAuthEnabled: false  // 不需要认证
 这些端点暴露了进程的内部状态（goroutine 栈、内存分配、CPU profile），
 攻击者可以利用这些信息进行情报收集。
 
-**建议**: 生产环境应设置 `pprof-auth-enabled = true` 或通过防火墙限制 `/debug/*` 路径。
+**建议**: 生产环境应设置 `pprof-auth-enabled = true`，**并且**确认
+`debug-pprof-enabled = false`（见 §14.4a——它是另一个独立暴露面），或用防火墙限制
+`/debug/*` 与 6060 端口。
+
+### 14.4a debug-pprof-enabled：6060 端口的第二 pprof 服务
+
+`DebugPprofEnabled` 不是 8086 上 `/debug/pprof` 的开关，而是在 **`localhost:6060` 另起
+一个 HTTP 服务**（`cmd/influxd/run/command.go:109-114`）:
+
+```go
+// cmd/influxd/run/command.go:109 — 启动前
+if config.HTTPD.DebugPprofEnabled {
+    runtime.SetBlockProfileRate(int(1 * time.Second))
+    runtime.SetMutexProfileFraction(1)
+    go func() { http.ListenAndServe("localhost:6060", nil) }()
+}
+```
+
+```mermaid
+flowchart LR
+    A["influxd 启动"] --> B{"DebugPprofEnabled?"}
+    B -->|"是"| C["SetBlockProfileRate(1s)"]
+    C --> D["SetMutexProfileFraction(1)"]
+    D --> E["go ListenAndServe(localhost:6060, DefaultServeMux)"]
+    B -->|"否"| F["跳过"]
+```
+
+**五个要点**:
+
+1. **与 8086 的 `/debug/pprof` 无关**: 它用 `http.DefaultServeMux`（`net/http/pprof` 的
+   `init()` 在 `command.go:10` 的空白导入时注册）另起监听；8086 的 pprof 由 `h.handleProfiles`
+   或注册路由提供（§2.3），二者互不影响。
+2. **无任何认证**: 不经过 `AddRoutes`、`authenticate`、`authWrapper`，
+   **不受** `AuthEnabled` / `PprofEnabled` / `PprofAuthEnabled` 约束。
+3. **附带性能开销**: block profile 采样周期 1 秒；mutex profile fraction = 1，
+   即**全采样**所有互斥锁竞争。这是持续开销，不是只在抓取 profile 时才有。
+4. **`localhost` 绑定只挡远程**: 同机进程、同容器网络命名空间、或通过端口转发/SSH
+   隧道仍可访问。
+5. **建议**: 生产默认关闭；确实需要时用端口级隔离（不发布 6060、NetworkPolicy、
+   独立 network namespace），不要只依赖 `localhost`。
 
 ### 14.5 请求体读取到内存
 

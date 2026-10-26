@@ -26,22 +26,19 @@ sequenceDiagram
     loop 每 RunInterval (1s) 轮询
         Timer->>Service: ① backgroundLoop tick
         Service->>MetaClient: ② AcquireLease("continuous_querier")
-        Note over MetaClient: OSS 源码: 直接返回成功<br>无 Raft Leader 判断
+        Note over MetaClient: OSS: 恒成功、无互斥<br>不读也不写共享状态
 
-        alt 获取租约成功
+        alt 获取租约成功（OSS 恒成立）
             Service->>Service: ③ runContinuousQueries(req)
             loop 每个数据库的每个 CQ
-                Service->>Service: ④ NewContinuousQuery(db, cqi)
-                Note over Service: 从 SQL 字符串重新解析 AST
-
-                Service->>Service: ⑤ shouldRunContinuousQuery(now, interval)
-                Note over Service: nextRun = lastRun + resampleEvery<br>if nextRun <= now → 执行
+                Service->>Service: ⑥ ExecuteContinuousQuery(&db, &cq, req.Now)
+                Note over Service: ④ NewContinuousQuery(db, cqi)<br>从 SQL 字符串重新解析 AST
+                Note over Service: ⑤ shouldRunContinuousQuery(now, interval)<br>nextRun = lastRun + resampleEvery，nextRun <= now 才继续
 
                 alt 需要执行
-                    Service->>Service: ⑥ ExecuteContinuousQuery(&db, &cq, req.Now)
-                    Service->>Service: ⑦ 更新 lastRuns[cqID] = cq.LastRun
-                    Note over Service: lastRuns 在查询前更新<br>失败后不会自动回退重试
-                    Note over Service: ⑧ 计算时间窗口:<br>startTime = truncate(nextRun + interval - resampleFor, interval)<br>endTime = truncate(now + interval - resampleEvery, interval)
+                    Service->>Service: ⑦ cq.LastRun = truncate(now - offset, EVERY) + offset<br>写入 lastRuns[cqID]
+                    Note over Service: lastRuns 在查询前更新<br>失败后不会回退重试
+                    Service->>Service: ⑧ 计算时间窗口<br>startTime = truncate(nextRun + interval - resampleFor - offset - 1ns) + offset<br>endTime = truncate(now + interval - resampleEvery - offset) + offset
 
                     Service->>Service: ⑨ cq.q.SetTimeRange(startTime, endTime)
                     Note over Service: 重写 WHERE time >= '...' AND time < '...'
@@ -59,6 +56,11 @@ sequenceDiagram
         end
     end
 ```
+
+> 说明：④⑤⑦⑧ 都发生在 ⑥ `ExecuteContinuousQuery` **内部**，不是调用方步骤。时间窗口公式里的
+> `-1ns` 让 `startTime` 向前多退 1 纳秒，保证它落在上一窗口的闭区间起点（否则 `truncate` 会把
+> 恰好对齐的 `nextRun` 归到下一窗口）；`offset` 则把 `GROUP BY time(1m, 30s)` 的偏移同时带入
+> 窗口两端（`service.go:359-360`）。
 
 ### 1.2 每一步的代码实现
 
@@ -173,10 +175,16 @@ func (s *Service) hasContinuousQueries() bool {
 
 因此，`Run(database, name, t)` 不是“只执行指定 CQ”的硬过滤器，而是“让匹配 CQ 立即具备执行资格”的调度触发。
 
+**调用约束**（`service.go:180-212`、`:121-150`）:
+- 必须在 `Open()` 之后调用。`RunCh` 是**无缓冲** channel（`service.go:109`），服务未启动或已 `Close()` 时 `s.RunCh <- ...` 会永久阻塞。
+- `Run()` 在发送前持有 `s.mu`（`:196-197` 的 `defer s.mu.Unlock()`）。若 `backgroundLoop` 正在执行一个耗时 CQ（同样持 `s.mu`），`Run()` 会一直阻塞并占住调用方 goroutine。
+- `Close()`（`service.go:139-150`）只 `close(stop)` + `wg.Wait()`，不会中断正在执行的 CQ；若此时有 `Run()` 阻塞在 `RunCh` 上，`backgroundLoop` 已退出，该 goroutine 永远不会被唤醒。
+- `Run()` 不保证立即产生写入：即使 `lastRuns` 被清除，非窗口边界的 `now` 也会让 `ExecuteContinuousQuery` 空跑（详见 12 号文档 §7.5）。
+
 #### 步骤 ②: AcquireLease — OSS 中直接成功
 
 ```go
-// services/meta/client.go:128 — AcquireLease (单节点模式)
+// services/meta/client.go:127 — AcquireLease (单节点模式)
 func (c *Client) AcquireLease(name string) (*Lease, error) {
     l := Lease{
         Name:       name,
@@ -211,9 +219,10 @@ func (leases *Leases) Acquire(name string, nodeID uint64) (*Lease, error) {
 ```
 
 **OSS 语义校准**:
-- `MetaClient.AcquireLease()` 在当前 OSS 源码中不检查 Raft Leader，也不会写入共享租约状态；它构造一个本地 `Lease` 后直接返回成功。
-- `services/meta/data.go` 中的 `Leases.Acquire` 是元数据结构上的租约辅助逻辑，但 CQ Service 通过 `Client.AcquireLease()` 调用时不会走到“仅 Leader 获取”的分支。
-- 因此本模块描述 CQ 调度时应理解为“OSS 单进程直接执行”，而不是“Raft Leader 独占执行”。
+- `MetaClient.AcquireLease()`（`services/meta/client.go:127-133`）不检查 Leader，也不读写任何共享状态；它构造一个本地 `Lease` 后直接返回成功，因此**不提供任何互斥**。返回的 `Lease` 也会被调用方丢弃（`_, err :=`）。
+- `services/meta/data.go` 中的 `Leases.Acquire`（`:1824-1847`）是元数据结构上的租约辅助逻辑，但 `Leases`/`NewLeases`（`data.go:1806-1821`）在 OSS 全树没有生产调用方，CQ Service 从不调用它。
+- 因此本模块描述 CQ 调度时应理解为“OSS 单进程直接执行”；多进程共连同一 meta 时 CQ 可能重复执行，leader/follower 语义只存在于 Enterprise 与测试 mock。
+- 租约没有显式 release，只有 60s 过期/续期（`DefaultLeaseDuration`，`services/meta/config.go:12`）；该值在 OSS 中同样不起作用。
 
 #### 步骤 ③④: CQ 遍历与解析
 
@@ -297,7 +306,7 @@ func (cq *ContinuousQuery) shouldRunContinuousQuery(now time.Time, interval time
 
     // 3. 判断是否需要执行
     if cq.HasRun {
-        // 获取上一窗口的时区偏移 (lastRun 前 1 秒)
+        // 获取上一窗口的时区偏移 (lastRun 前 1 纳秒)
         _, startOffset := cq.LastRun.Add(-1).Zone()
         nextRun := cq.LastRun.Add(resampleEvery)
         // 获取当前窗口结束时的时区偏移
@@ -327,17 +336,19 @@ func (cq *ContinuousQuery) shouldRunContinuousQuery(now time.Time, interval time
 ```mermaid
 flowchart TD
     A["shouldRunContinuousQuery"] --> B{"是聚合查询?"}
-    B -->|"否"| C["返回 false"]
+    B -->|"否"| C["返回 false + error"]
     B -->|"是"| D{"HasRun?"}
-    D -->|"否"| E["返回 true (首次执行)"]
+    D -->|"否"| E["返回 true, now"]
     D -->|"是"| F["nextRun = lastRun + resampleEvery"]
-    F --> G{"DST 偏移变化?"}
-    G -->|"是"| H["调整 nextRun"]
-    G -->|"否"| I["保持 nextRun"]
-    H --> J{"nextRun <= now?"}
-    I --> J
-    J -->|"是"| K["返回 true"]
-    J -->|"否"| L["返回 false"]
+    F --> G{"zone(lastRun-1ns) != zone(nextRun-1ns)?"}
+    G -->|"否"| H["保持 nextRun"]
+    G -->|"是"| I{"abs(startOffset-endOffset) < resampleEvery?"}
+    I -->|"是"| J["nextRun += diff"]
+    I -->|"否"| H
+    H --> K{"nextRun <= now?"}
+    J --> K
+    K -->|"是"| L["返回 true, nextRun"]
+    K -->|"否"| M["返回 false"]
 ```
 
 #### 步骤 ⑥⑦: 时间窗口计算
@@ -430,6 +441,65 @@ func (s *Service) ExecuteContinuousQuery(dbi *meta.DatabaseInfo, cqi *meta.Conti
     cq.q.SetTimeRange(startTime, endTime)
 }
 ```
+
+**副作用顺序（先推进 `lastRuns`，再执行查询）**:
+
+`cq.LastRun = truncate(now.Add(-offset), resampleEvery).Add(offset)`（`service.go:338-339`）
+发生在空窗口判断（`:359-364`）**之前**。因此即使本轮是空跑，`lastRuns` 也已经被推进到
+`now` 所在的桶边界。
+
+> **数值例**：CQ Service 被 `Close()` 17 分钟后在同一进程内再次 `Open()`（`lastRuns` 是纯内存 map，`Close()`/`Open()` 都不会清空它），`interval = 1m`、无 RESAMPLE。恢复后第一个 tick
+> `now = 12:17:20`，`HasRun=true`、`lastRun = 12:00:00` → `nextRun = 12:01:00 ≤ now` → 执行。
+> 推进后 `lastRuns = truncate(12:17:20, 1m) = 12:17:00`，而窗口是
+> `startTime = truncate(12:01:00 + 1m - 1m - 1ns) = 12:00:00`、`endTime = truncate(12:17:20) = 12:17:00`，
+> 即一次补算 `[12:00, 12:17)` 共 17 个桶。可见"补算"靠的是 `nextRun` 而非 `now`，
+> `lastRuns` 只负责把水位推到 12:17，避免下一轮重复扫描这 17 个桶。
+> **注意**：以上只在“同进程重启服务”时成立。若整个 influxd 进程重启，`lastRuns` 为空 →
+> `HasRun=false` → `shouldRunContinuousQuery` 直接返回 `(true, now)`（`service.go:540-547`），
+> 首个 tick 的 `startTime = truncate(now-1ns) = 12:17:00`、`endTime = 12:17:00`，**空跑、不补算**；
+> 此时只有 `RESAMPLE FOR` 能覆盖停机期间的数据（见 §5.4）。
+
+#### 步骤 ⑦.5: 锁内的执行、统计与返回
+
+上面的代码块只到窗口计算；真实函数在 `SetTimeRange` 之后还有约 60 行，全部在同一把
+`s.mu` 内执行。按阶段拆开如下：
+
+| 阶段 | 代码位置 | 是否持 `s.mu` | 失败后果 |
+|------|----------|---------------|----------|
+| `NewContinuousQuery` / 时区转换 | `service.go:287-297` | 否 | 直接返回 error，`lastRuns` 未变 → 下一 tick 重试 |
+| 读 `lastRuns` / `setIntoRP` / 取 interval | `:299-324` | 是 | 解析类错误 → 每 tick 重试 |
+| 推进 `lastRuns` | `:338-339` | 是 | 不失败；此后所有失败都不重试 |
+| 窗口计算 + 空窗口提前返回 | `:359-364` | 是 | 返回 `(false, nil)`，水位已推进 |
+| `SetTimeRange` | `:366-369` | 是 | 返回 `(false, err)`，不重试 |
+| 查询 + 写回 | `:374-392` | 是 | 返回 `(false, res.Err)`，不重试 |
+| 取 `written` / 日志 / 写 `cq_query` | `:394-433` | 是 | 统计写失败只记日志，仍返回 `true` |
+
+```go
+// services/continuous_querier/service.go:391-405 — 执行与点数提取
+res := s.runContinuousQueryAndWriteResult(cq)
+if res.Err != nil {
+    return false, res.Err
+}
+
+// extract number of points written from SELECT ... INTO result
+var written int64 = -1
+if len(res.Series) == 1 && len(res.Series[0].Values) == 1 {
+    s := res.Series[0]
+    written = s.Values[0][1].(int64)   // 取自 Executor 合成的 {time, written} 行
+}
+```
+
+这个 `written` 来自 `coordinator/statement_executor.go:611-626`：INTO 语句在 Flush 之后
+会额外发一行 `{"result", ["time","written"], [[1970-01-01T00:00:00Z, writeN]]}`。05 §9.2 与
+12 号文档 §7.5 说的是同一个值。
+
+> **数值案例**：某 CQ 查询耗时 8s，而 `RunInterval = 1s`。这 8s 内 `s.mu` 一直被持有：
+> `Run()`（`service.go:196-210`）会在同一把锁上阻塞；timer tick 在 channel 中排队，
+> 不会并发执行；tick 恢复后仍按 `nextRun` 补算，不会跳窗口。
+
+**锁域说明**：`s.mu` 只保护本 Service 的 `lastRuns` 与执行串行化，不保护 meta/存储。
+`Close()` 只 `close(stop)` + `wg.Wait()`，不会中断正在执行的 CQ（`closing` channel 要等
+那条语句返回后才关闭）。
 
 **时间窗口计算示例**:
 
@@ -531,6 +601,83 @@ func (s *SelectStatement) SetTimeRange(start, end time.Time) error {
 }
 ```
 
+#### 步骤 ⑨.5: 语句归一化 — `db.rp.measurement` 是如何补全的
+
+`ExecuteContinuousQuery` 只把 `Target.Measurement.RetentionPolicy` 填好（`setIntoRP`），
+`Target.Measurement.Database` 仍为空。如果直接拿这条语句去写，`writeInto` 会在
+`coordinator/statement_executor.go:1302-1304` 返回 `errNoDatabaseInTarget`。真正补全目标的是
+Executor 在执行前的两级归一化。
+
+```mermaid
+sequenceDiagram
+    participant CQ as CQ Service
+    participant Exec as query.Executor
+    participant Norm as StatementNormalizer
+    participant Target as stmt.Target.Measurement
+    participant SE as StatementExecutor
+
+    CQ->>Exec: ExecuteQuery(q, opts, closing)
+    Exec->>Exec: RewriteStatement(stmt)
+    Exec->>Norm: NormalizeStatement(stmt, defaultDB=cq.Database, opt.RetentionPolicy)
+    Norm->>Target: Database 为空 → 填 defaultDB
+    Norm->>Target: RetentionPolicy 为空 → 填默认 RP
+    Norm-->>Exec: nil
+    Exec->>SE: ExecuteStatement(stmt)
+    SE->>SE: executeSelectStatement → writeInto
+```
+
+```go
+// query/executor.go:373-390 — 每条语句执行前的归一化
+newStmt, err := RewriteStatement(stmt)          // :373
+if err != nil {
+    results <- &Result{Err: err}
+    break
+}
+stmt = newStmt
+
+if normalizer, ok := e.StatementExecutor.(StatementNormalizer); ok {
+    // defaultDB 来自 ExecutionOptions.Database（CQ 传的是 cq.Database）
+    if err := normalizer.NormalizeStatement(stmt, defaultDB, opt.RetentionPolicy); err != nil {
+        ...
+    }
+}
+```
+
+```go
+// coordinator/statement_executor.go:1429-1465 — normalizeMeasurement（节选）
+if m.Database == "" {
+    m.Database = defaultDatabase                  // CQ 场景 = cq.Database
+}
+if m.RetentionPolicy == "" {
+    if defaultRetentionPolicy != "" {
+        m.RetentionPolicy = defaultRetentionPolicy
+    } else if di.DefaultRetentionPolicy != "" {
+        m.RetentionPolicy = di.DefaultRetentionPolicy
+    } else {
+        return fmt.Errorf("default retention policy not set for: %s", di.Name)
+    }
+}
+```
+
+`NormalizeStatement`（`:1384-1419`）用 `influxql.WalkFunc` 遍历整条语句，`IsTarget` 的
+measurement 与普通 source 走同一个 `normalizeMeasurement`，所以 `SELECT ... INTO` 的三段式
+目标名也会被补齐。
+
+**数值案例**（`CREATE CONTINUOUS QUERY ... ON mydb BEGIN SELECT mean(v) INTO "temp_1m" FROM "raw" GROUP BY time(1m) END`）:
+
+| 原始 INTO 目标 | `setIntoRP` 之后 | `NormalizeStatement` 之后 |
+|---|---|---|
+| `"temp_1m"` | `RP=""` → 改为 `autogen` | `mydb.autogen.temp_1m` |
+| `"7d"."downsampled"` | `RP=7d`（保留） | `mydb.7d.downsampled` |
+| `"other"."rp"."m"` | `Database=other`（保留） | `other.rp.m`（显式库不被覆盖） |
+
+**错误边界**:
+- 目标库不存在 → `influxdb.ErrDatabaseNotFound`（`statement_executor.go:1446-1449`），发生在任何点写入之前。
+- 目标库 `DefaultRetentionPolicy` 为空且语句未写 RP → `default retention policy not set`。
+- 目标 measurement 的 `Database` 始终为空 → `errNoDatabaseInTarget`（`:1302-1304`）。
+
+> 逐行详解见 11 号文档 §6（`## 6. SELECT 执行路径`）与 §14（`## 14. NormalizeStatement — 语句标准化`）。
+
 #### 步骤 ⑨⑩⑪: 查询执行与结果写入
 
 ```go
@@ -556,31 +703,76 @@ func (s *Service) runContinuousQueryAndWriteResult(cq *ContinuousQuery) *query.R
     return res
 }
 
-// coordinator/statement_executor.go:544 — executeSelectStatement (INTO 写入)
+// coordinator/statement_executor.go:550-635 — executeSelectStatement (INTO 写入，节选)
 func (e *StatementExecutor) executeSelectStatement(ctx *query.ExecutionContext, stmt *influxql.SelectStatement) error {
+    cur, err := e.createIterators(ctx, stmt, ctx.ExecutionOptions)
+    if err != nil {
+        return err
+    }
+    // 行由 emitter 产出，不是直接调用 cur.Next()
+    em := query.NewEmitter(cur, ctx.ChunkSize)
+    defer em.Close()
+
+    var writeN int64
+    var pointsWriter *BufferedPointsWriter
     if stmt.Target != nil {
-        // SELECT ... INTO 语句
-        pointsWriter = NewBufferedPointsWriter(
-            e.PointsWriter,
+        pointsWriter = NewBufferedPointsWriter(e.PointsWriter,
             stmt.Target.Measurement.Database,
             stmt.Target.Measurement.RetentionPolicy,
-            10000,  // 批量 10,000 点
-        )
+            10000)  // 批量 10,000 点
     }
 
-    // 遍历查询结果
     for {
-        row := cur.Next()
-        if row == nil { break }
+        row, partial, err := em.Emit()
+        if err != nil {
+            return err
+        } else if row == nil {
+            select {
+            case <-ctx.Done():          // 查询被中断
+                return ctx.Err()
+            default:
+            }
+            break
+        }
 
-        // 将 row 转换为 Point 并写入
-        e.writeInto(stmt.Target, row, pointsWriter)
+        if stmt.Target != nil {
+            // 注意实参顺序：writer, stmt, row, strict；返回本行写入点数
+            n, err := e.writeInto(pointsWriter, stmt, row, e.StrictErrorHandling)
+            if err != nil {
+                return err
+            }
+            writeN += n
+            continue
+        }
+
+        // 非 INTO：把行（含 partial 标记）发给客户端
+        if err := ctx.Send(&query.Result{Series: []*models.Row{row}, Partial: partial}); err != nil {
+            return err
+        }
     }
 
-    // Flush 剩余数据
-    pointsWriter.Flush()
+    if stmt.Target != nil {
+        if err := pointsWriter.Flush(); err != nil {   // 写入剩余缓冲
+            return err
+        }
+        // INTO 语句额外合成一行 {time, written}
+        return ctx.Send(&query.Result{
+            Series: []*models.Row{{
+                Name:    "result",
+                Columns: []string{"time", "written"},
+                Values:  [][]interface{}{{time.Unix(0, 0).UTC(), writeN}},
+            }},
+        })
+    }
+
+    // 省略非 INTO 的收尾：源码用 `emitted` 标记是否已发送过行，
+    // 未发送过时补发空 Series（statement_executor.go:627-634）。
+    return nil
 }
 ```
+
+> 这一行 `{time, written}` 就是 CQ 的 `written` 来源（见步骤 ⑦.5 与 §9.2）：
+> `res.Series[0].Values[0][1]` 即 `writeN`。
 
 #### 步骤 ⑫: CQ 结果写入路径
 
@@ -650,7 +842,8 @@ sequenceDiagram
     Note over CQ: 查询完成后 BPW.Flush()<br>写入剩余缓冲的点
 
     BPW->>PW: Flush() → 写入最后一批
-    PW->>Cache + WAL: 标准写入路径
+    PW->>TSDB: WriteToShard(writeCtx, shardID, points)
+    Note over PW,WAL: 与上方完全相同：Shard → Engine → Cache + WAL
 ```
 
 **关键设计点**:
@@ -721,7 +914,10 @@ CREATE CONTINUOUS QUERY "cq_1m" ON "db"
 | 参数 | 含义 | 默认值 |
 |------|------|--------|
 | `EVERY` | CQ 执行频率 | = GROUP BY interval |
-| `FOR` | 回溯窗口长度 | = GROUP BY interval |
+| `FOR` | 回溯窗口长度 | `max(interval, EVERY)`（显式 FOR 优先，`service.go:345-350`） |
+
+> `EVERY > interval` 且未显式指定 `FOR` 时，一次运行覆盖 `EVERY/interval` 个 interval 桶
+> （`resampleFor` 被抬到 `resampleEvery`）；`EVERY ≤ interval` 时默认只回溯一个桶。
 
 ### 3.2 EVERY 的三种模式
 
@@ -750,24 +946,25 @@ flowchart LR
 
 ```mermaid
 sequenceDiagram
-    participant Data as 数据流
+    participant Timer as backgroundLoop Timer
     participant CQ as CQ Service
+    participant Storage as Storage(raw)
 
-    Note over Data: 12:00 数据到达
-    Data->>CQ: 触发 CQ (EVERY=1m)
-    Note over CQ: FOR=1m: 窗口 [11:59, 12:00)<br>FOR=5m: 窗口 [11:55, 12:00)
+    Note over Timer: 每 RunInterval 一次 tick
+    Timer->>CQ: tick (now)
+    Note over CQ: 窗口 = [now+interval-FOR, now+interval)
+    CQ->>Storage: SELECT ... GROUP BY time(interval)
+    Storage-->>CQ: 聚合结果
 
-    Note over Data: 12:01 数据到达
-    Data->>CQ: 触发 CQ
-    Note over CQ: FOR=1m: 窗口 [12:00, 12:01)<br>FOR=5m: 窗口 [11:56, 12:01)
-
-    Note over Data: 延迟数据在 12:03 到达<br>时间戳是 11:58
-    Data->>CQ: 数据写入 raw 表
-
-    Note over CQ: 下次执行 (12:03)<br>FOR=5m: 窗口 [11:58, 12:03)<br>包含 11:58 的延迟数据!
+    Note over Storage: 延迟数据在 12:03 到达（时间戳 11:58）
+    Note over CQ: CQ 不会因数据到达而触发；<br>要等下一个 tick，且窗口是否覆盖 11:58 取决于 FOR
 ```
 
 **FOR 的核心价值**：补算延迟到达的数据。当 `FOR > interval` 时，CQ 会重新计算最近 N 个窗口，覆盖之前的计算结果。
+
+> CQ 是 **Processing-Time 轮询**，不是 Event-Time 驱动：`backgroundLoop` 只有 timer 与 `RunCh` 两个
+> 触发源（`service.go:216-245`），`coordinator/points_writer.go` 不引用 CQ 包，数据到达不会触发 CQ。
+> 延迟数据到达后，要等下一个 tick 才可能被重算，且是否覆盖取决于 `FOR`。
 
 ### 3.4 时间窗口参数的 clamp 逻辑
 
@@ -866,19 +1063,84 @@ func truncate(ts time.Time, d time.Duration) time.Time {
 ### 4.2 DST 处理
 
 ```go
-// shouldRunContinuousQuery 中的 DST 处理
-nextRun := cq.LastRun.Add(resampleEvery)
-_, off1 := nextRun.Zone()
-_, off2 := cq.LastRun.Zone()
-if off1 != off2 {
-    // DST 转换: 调整 nextRun
-    nextRun = nextRun.Add(time.Duration(off2 - off1))
+// services/continuous_querier/service.go:526-537
+// 注意：Add(-1) 的参数是 time.Duration(-1)，即 -1 纳秒，
+// 等价于“取上一个窗口末尾时刻”的时区偏移。
+_, startOffset := cq.LastRun.Add(-1).Zone()
+nextRun := cq.LastRun.Add(resampleEvery)          // 绝对时间加法，跨 DST 按物理时长推进
+if _, endOffset := nextRun.Add(-1).Zone(); startOffset != endOffset {
+    diff := int64(startOffset-endOffset) * int64(time.Second)  // 秒 → 纳秒
+    if abs(diff) < int64(resampleEvery) {
+        nextRun = nextRun.Add(time.Duration(diff))
+    }
 }
 ```
 
-**DST 边界情况**:
-- **春季跳跃** (如 2:00 → 3:00)：某个窗口可能被跳过
-- **秋季重复** (如 1:00 → 2:00 出现两次)：某个窗口可能被执行两次
+1. **外层条件**：只有当 DST 切换时刻 T 落在 `(lastRun-1ns, nextRun-1ns]` 内（两端 UTC 偏移不同）才进入。`lastRun` 恰在整点且 `EVERY=1h` 时，T 正好等于 `nextRun`，而 `nextRun-1ns` 仍在旧偏移 → 外层不成立。
+2. **内层条件**：进入后也只有 `abs(diff) < resampleEvery` 才调整。US 的 1 小时跳变 `abs(diff)=1h`，因此 `EVERY ≤ 1h` 永远不补偿。
+3. **分支何时才可能触发**：需要 `resampleEvery > 跳变幅度`。1h 跳变需 `EVERY > 1h`；30min 跳变时区配 `EVERY=1h` 即可。
+4. **设计意图（源码无注释，属推断）**：`abs(diff) < resampleEvery` 只补偿“小于一个 resample 周期”的偏移抖动。跳变 ≥ 周期时补偿会把 `nextRun` 整体平移一个周期（`01:30 EST + 1h = 03:30 EDT` 补偿后正好退回 `01:30 EST`），节拍被破坏，因此宁可不补偿。`truncate()`（`service.go:562-583`）与 `query.IteratorOptions.Window`（`query/iterator.go:843-887`）用的是同一守卫范式。
+
+**DST 边界情况**（数值推演见 4.3）:
+- **春季跳跃**：墙上时刻不存在，但窗口网格按绝对时间推进，不会产生“物理时间不存在”的空窗口
+- **秋季重复**：重复的是墙上标签，绝对时间窗口不重复，CQ 不会对同一物理窗口执行两次
+- **内层守卫**：只有 `|偏移差| < resampleEvery` 才补偿；1 小时跳变配 `EVERY ≤ 1h` 永远不触发
+
+#### 4.2.1 窗口网格如何生成（理解 4.3 的前提）
+
+CQ 只负责给出 `[startTime, endTime)`，真正把区间切成桶的是 `query.IteratorOptions.Window`
+（`query/iterator.go:807-887`）。理解它才能正确解读 4.3 的两个 DST 案例。
+
+```go
+// query/iterator.go:807-887 — IteratorOptions.Window（精简）
+func (opt IteratorOptions) Window(t int64) (start, end int64) {
+    t -= int64(opt.Interval.Offset)          // 先扣掉 GROUP BY 的 offset
+    var zone int64
+    if opt.Location != nil {
+        _, zone = opt.Zone(t)                // 该时刻的时区偏移（纳秒）
+    }
+    dt := (t + zone) % int64(opt.Interval.Duration)
+    if dt < 0 {
+        dt += int64(opt.Interval.Duration)
+    }
+    start = t - dt
+    start += int64(opt.Interval.Offset)
+    // 截断后偏移变了、且变化量小于桶宽，才补偿
+    if opt.Location != nil {
+        _, startOffset := opt.Zone(start)
+        if o := zone - startOffset; o != 0 && abs(o) < int64(opt.Interval.Duration) {
+            start += o
+        }
+    }
+    end = t + (int64(opt.Interval.Duration) - dt) + int64(opt.Interval.Offset)
+    // end 的补偿带方向：o > 0（回拨）直接加；o < 0（前跳）还要确认跳变点落在桶内
+    if opt.Location != nil {
+        _, endOffset := opt.Zone(end)
+        if o := zone - endOffset; o != 0 && abs(o) < int64(opt.Interval.Duration) {
+            if o > 0 {
+                end += o
+            } else if _, z := opt.Zone(end + o); z == endOffset {
+                end += o
+            }
+        }
+    }
+    return
+}
+```
+
+**三条规则**:
+1. 桶边界按“绝对时间 + 时区偏移”计算：`t + zone` 后取模，等价于按本地墙上时间对齐。
+2. 偏移补偿只在 `abs(偏移差) < 桶宽` 时生效——与 `shouldRunContinuousQuery` 的内层守卫是同一范式。
+3. `end` 的补偿带方向判断（`query/iterator.go:865-885`）：回拨（`o > 0`）把桶向后延长；前跳（`o < 0`）只有当跳变点确实落在本桶内才补偿。
+
+**窗口枚举表**（案例一：`startTime = 05:00Z`、`endTime = 07:00Z`、`interval = 1h`、`Location = America/New_York`）:
+
+| 桶序号 | `t`（UTC） | 本地墙上 | 桶区间（UTC） | 桶区间（本地） |
+|---|---|---|---|---|
+| 1 | 05:00Z–05:59:59Z | 00:xx EST | `[05:00Z, 06:00Z)` | `[00:00 EST, 01:00 EST)` |
+| 2 | 06:00Z–06:59:59Z | 01:xx EST | `[06:00Z, 07:00Z)` | `[01:00 EST, 03:00 EDT)` |
+
+表里没有“02:00–03:00”这一行：它对应的绝对时间是 `[07:00Z, 08:00Z)`，不在查询范围内。
 
 #### 4.3 DST 边界案例详解
 
@@ -909,7 +1171,7 @@ gantt
     "窗口 22:00-23:00" :a1, 22:00, 60min
     "窗口 23:00-00:00" :a2, 23:00, 60min
     "窗口 00:00-01:00" :a3, 00:00, 60min
-    "窗口 01:00-02:00" :a4, 01:00, 60min
+    "窗口 01:00-03:00 (跨 DST)" :a4, 01:00, 120min
 
     section DST 跳跃
     "2:00 → 3:00 (跳跃!)" :crit, 02:00, 0
@@ -919,29 +1181,33 @@ gantt
 ```
 
 ```
-时间线 (America/New_York):
+时间线 (America/New_York, 2024-03-10):
+  lastRun = 01:00:00 EST = 06:00Z
+  nextRun = 01:00 EST + 1h = 03:00:00 EDT = 07:00Z
+  （02:00 这个墙上时刻在本地不存在，time.Add 直接按绝对时间跨过）
 
-t=01:59:59 EST  最后一个 EST 时间点
-t=03:00:00 EDT  时钟跳到 3:00 (EDT = UTC-4)
+shouldRunContinuousQuery 的 DST 检测:
+  _, startOffset := lastRun.Add(-1ns).Zone()   // -18000 (EST)
+  _, endOffset   := nextRun.Add(-1ns).Zone()   // -18000 (EST) ← 跳变点正好是 nextRun
+  startOffset == endOffset → 外层 if 不成立，diff 从未计算 → 不调整
+  nextRun 落到 03:00 EDT 是 time.Add 的绝对时间加法结果，不是守卫补偿
 
-CQ 执行过程:
-  lastRun = 01:00:00 EST
-  nextRun = lastRun + 1h = 02:00:00 EST
+查询范围 (本案例 SQL 为 RESAMPLE EVERY 1h FOR 2h):
+  startTime = truncate(07:00Z + 1h - 2h - 1ns) = 00:00 EST = 05:00Z
+  endTime   = truncate(07:00Z + 1h - 1h)       = 03:00 EDT = 07:00Z
+  范围 [05:00Z, 07:00Z) = 2 个物理小时，两个窗口都非空:
+    [00:00 EST, 01:00 EST) = [05:00Z, 06:00Z)   装 00:00–00:59 EST 的数据
+    [01:00 EST, 03:00 EDT) = [06:00Z, 07:00Z)   装 01:00–01:59 EST 的数据
+  不存在“物理时间不存在”的空窗口；02:00–03:00 不在查询范围内，
+  FILL(0) 不会为它补 0
 
-  但 02:00:00 EST 在物理时间上不存在!
-  Go 的 time.Add 会自动处理: 01:00 EST + 1h = 03:00 EDT
+对照: 若没有显式 FOR（默认 FOR = max(interval, EVERY) = 1h）:
+  范围 [06:00Z, 07:00Z)，只有 1 个窗口 [01:00 EST, 03:00 EDT)
 
-  shouldRunContinuousQuery 中的 DST 检测:
-    _, startOffset := lastRun.Add(-1).Zone()  // EST = -18000s
-    _, endOffset := nextRun.Add(-1).Zone()     // EDT = -14400s
-    diff = -18000 - (-14400) = -3600s (1小时)
-    abs(diff) < resampleEvery (1h)? 是 → 调整 nextRun
-
-  查询范围: [01:00 EST, 03:00 EDT) = 1小时物理时间
-  但 GROUP BY time(1h) 会产生 2 个窗口:
-    窗口 1: [01:00 EST, 02:00 EST) → 有数据
-    窗口 2: [02:00 EST, 03:00 EST) → 无数据 (物理时间不存在!)
-    → FILL(0) 会填充 0, FILL(none) 会跳过
+分支何时才会调整:
+  lastRun = 01:30 EST → nextRun = 03:30 EDT，外层成立，diff = -1h
+  abs(diff) = 1h，严格 < resampleEvery(1h) 为 false → 仍不调整
+  只有 |偏移差| < resampleEvery 才补偿（如 RESAMPLE EVERY 2h）
 ```
 
 **案例二: 秋季重复 (Fall Back)**
@@ -969,34 +1235,31 @@ gantt
 ```
 
 ```
-时间线 (America/New_York):
+时间线 (America/New_York, 2024-11-03, 以绝对时间为准):
+  lastRun = 01:00:00 EDT = 05:00Z
+  nextRun = 01:00 EDT + 1h = 01:00:00 EST = 06:00Z
+  （墙上时钟仍是 01:00，不是 02:00 EDT；time.Add 是绝对时间加法）
 
-t=01:59:59 EDT  最后一个 EDT 时间点
-t=01:00:00 EST  时钟回到 1:00 (EST = UTC-5)
+  zone(lastRun-1ns) = -14400 (EDT)
+  zone(nextRun-1ns) = -14400 (EDT)   ← 06:00Z-1ns 仍是 EDT
+  startOffset == endOffset → 外层不成立 → diff 不计算 → 不调整
 
-CQ 执行过程:
-  lastRun = 01:00:00 EDT (第一次)
-  nextRun = lastRun + 1h = 02:00:00 EDT
+下一次:
+  lastRun = 01:00 EST = 06:00Z → nextRun = 02:00 EST = 07:00Z
+  物理间隔: 1h、1h（05:00Z → 06:00Z → 07:00Z）
+  不存在“实际等待 2 小时”
 
-  但物理时间 02:00 EDT 之后, 时钟回拨到 01:00 EST
-  Go 的 time.Add: 01:00 EDT + 1h = 02:00 EDT (正确)
+被“重复”的是墙上标签 01:00，不是绝对时间窗口:
+  [05:00Z, 06:00Z) = 01:00 EDT → 01:00 EST
+  [06:00Z, 07:00Z) = 01:00 EST → 02:00 EST
+  两个窗口各自只被计算一次
 
-  shouldRunContinuousQuery DST 检测:
-    startOffset (EDT) = -14400s
-    endOffset (EDT) = -14400s (nextRun 仍在 EDT)
-    diff = 0 → 无调整
+若 lastRun 不在整点（如 01:30 EDT）:
+  nextRun = 01:30 EST (06:30Z)，外层成立，diff = +1h
+  abs(diff) == resampleEvery(1h)，严格 < 为 false → 不调整（同春季）
 
-  但当 CQ 在 02:00 EDT 触发后, 下一次:
-    lastRun = 02:00 EDT
-    nextRun = 03:00 EDT
-
-  此时物理时间已经是 01:00 EST (回拨后)
-  实际等待时间 = 2小时 (01:00 EST → 03:00 EST)
-
-  truncate 函数的 DST 补偿:
-    zone(ts) 返回当前时区偏移
-    如果截断后时区偏移变化, 补偿差值
-    确保窗口边界在时区转换后仍然正确
+truncate 的 DST 补偿同理: zone(ts) 偏移变化小于桶宽才补偿，
+保证窗口边界在时区转换后仍对齐。
 ```
 
 **truncate 函数的 DST 补偿逻辑**:
@@ -1067,7 +1330,7 @@ flowchart LR
 ### 5.4 为什么 lastRuns 在执行前更新
 
 ```go
-// service.go:294 — key 构造
+// service.go:301 — key 构造
 id := fmt.Sprintf("%s%s%s", dbi.Name, idDelimiter, cqi.Name)
 
 // service.go:338-339 (在查询执行之前)
@@ -1078,14 +1341,48 @@ s.lastRuns[id] = cq.LastRun
 res := s.runContinuousQueryAndWriteResult(cq)
 ```
 
-- **防止重入**：如果 CQ 执行时间超过 `resampleEvery`，下次 tick 不会重复执行
-- **代价**：查询失败后不会自动重试
+- **不是防重入**：串行性由“单 goroutine + `s.mu` 全程持有”保证（`service.go:299-300`），与更新时机无关
+- **推进 watermark**：先写 `lastRuns` 意味着失败也会推进窗口水位，因此失败不会按原窗口重试
+- **让 `Run()` 的清除立即可见**：`Run()` 删除 `lastRuns` 后，下一次 tick 会从最老未算窗口重算
+- **代价**：`lastRuns` 推进之后的失败（查询错误、写回错误）被跳过，不会自动重试
+
+`lastRuns` 的状态与生命周期：
+
+```mermaid
+stateDiagram-v2
+    [*] --> HasRunFalse: 进程启动 / 新 CQ / Run() 清除
+    HasRunFalse --> HasRunTrue: shouldRunContinuousQuery 返回 true
+    HasRunTrue --> HasRunTrue: 空跑也先推进 lastRuns
+    HasRunTrue --> HasRunFalse: Run() delete(lastRuns[key])
+    HasRunTrue --> [*]: 进程退出（map 清空，不持久化）
+
+    note right of HasRunFalse
+        key = db + 0x1F + cqName
+        失败返回点: NewContinuousQuery /
+        GroupByInterval / GroupByOffset /
+        shouldRunContinuousQuery
+        —— 都在 lastRuns 更新之前，下一 tick 重试
+    end note
+
+    note right of HasRunTrue
+        lastRuns[key] = truncate(now - offset, EVERY) + offset
+        唯一写入点 service.go:338-339
+        此后失败不再重试
+    end note
+```
+
+**生命周期要点**:
+- key 格式 `db + "\x1f" + cqName`（`idDelimiter`，`service.go:29`、`:301`）。
+- 唯一删除点：`Run()`（`service.go:204` 附近的 `delete(s.lastRuns, id)`）。
+- 四个“更新前失败”返回点：`service.go:289`（`NewContinuousQuery` 解析）、`:312`（`GroupByInterval`）、`:320`（`GroupByOffset`）、`:326`（`shouldRunContinuousQuery`）。另有 `:314` 的 `interval == 0` 静默返回 `(false, nil)`——不记日志、不加 `QueryFail`。
+- 空跑也会推进（`:338` 先于 `:361` 的提前返回）。
+- 进程重启后 map 为空；已被删除的 CQ 会留下无人清理的 key（仅内存，无实际影响）。
 
 ## 6. 架构收益
 
 | 维度 | 收益 |
 |------|------|
-| **实现简洁** | 轮询模型 + Lease 选举，代码量小 |
+| **实现简洁** | 轮询模型 + 名义租约（OSS 恒成功、无互斥），代码量小 |
 | **容错性** | RESAMPLE FOR 支持补算延迟数据 |
 | **灵活性** | EVERY/FOR 独立配置，支持多种降采样策略 |
 | **一致性** | CQ 结果走标准写入路径，保证数据一致性 |
@@ -1137,18 +1434,27 @@ if ok, err := s.ExecuteContinuousQuery(&db, &cq, req.Now); err != nil {
 }
 ```
 
-CQ 执行失败会返回错误到 `runContinuousQueries`，后者记录日志并递增 `QueryFail` 计数器。错误不会被静默吞掉，但也不会重试、告警或暂停后续执行。
+CQ 失败分两类，运维含义完全不同：
+
+1. `lastRuns` 更新（`service.go:338-339`）**之前**的失败——SQL 解析失败、CQ 不是聚合查询、`GroupByInterval`/`GroupByOffset` 解析失败、`shouldRunContinuousQuery` 返回 error：每一轮 `RunInterval`（默认 1s）都会重跑并记录一条 `"Error executing query"`，`QueryFail` 每秒 +1，直到 CQ 被修复或删除。**这是日志风暴与计数器虚高的来源。**
+2. `lastRuns` 更新**之后**的失败——`SetTimeRange` 失败、查询执行错误（`res.Err`）、写回错误：窗口水位已经推进，本轮窗口被跳过，不会重试，也不会有告警。
 
 **CQ 失败场景与监控**:
 
-| 失败场景 | 错误类型 | 表现 | 监控方式 |
-|----------|---------|------|---------|
-| **Cache 满** | `ErrCacheMemorySizeLimitExceeded` | INTO 写入被拒绝，CQ 返回错误 | 日志 + `QueryFail`；通常不写 `cq_query` |
-| **查询超时** | `context.DeadlineExceeded` | Executor 中断查询，CQ 返回错误 | 日志 + `QueryFail`；通常不写 `cq_query` |
-| **Field 类型冲突** | `PartialWriteError` | 部分点被丢弃或返回写入错误 | 成功返回时看 `cq_query.pointsWrittenOK`；失败时看日志 + `QueryFail` |
-| **内存不足 (OOM)** | `runtime: out of memory` | 进程崩溃 | 系统级监控 |
-| **Shard 不存在** | `ErrShardNotFound` | 写入失败，Write-Through 重试 | `cq_query` 无记录 |
-| **SQL 解析失败** | `influxql.ParseError` | CQ 定义无效，跳过执行 | 日志中出现 "Error executing query" |
+| 失败场景 | 错误类型 | 表现 | 是否重试 |
+|----------|---------|------|----------|
+| Cache 满 | `ErrCacheMemorySizeLimitExceeded` | INTO 写入被拒绝，CQ 返回错误 | 否（窗口已推进） |
+| 查询超时 | `query.ErrQueryTimeoutLimitExceeded`（受服务端 `query-timeout` 约束，默认 0 = 不限） | Executor 中断查询，CQ 返回错误 | 否 |
+| Field 类型冲突 | `tsdb.PartialWriteError`（`Dropped=1`） | 冲突点整点丢弃，其余点写入；HTTP/内部返回 partial write | 否 |
+| 内存不足 | `runtime: out of memory` | 进程崩溃 | — |
+| Shard 正在删除 | `tsdb.ErrShardDeletion` → `PartialWriteError` | 该 shard 写入失败，客户端收到 400 | 否（客户端可重试） |
+| SQL 解析失败 | `influxql.ParseError` | 每 `RunInterval` 重复记录 + `QueryFail++` | **是，无限重试** |
+| CQ 非聚合 / GROUP BY 解析失败 | error | 同上 | **是，无限重试** |
+
+> 超时错误来自 `query.ErrQueryTimeoutLimitExceeded`（`query/task_manager.go:328-338`），由服务端
+> `query-timeout` 控制（默认 `0` 表示不限制，`task_manager.go:17-19`）；CQ 自身不设超时、
+> 也不传 `AbortCh`。`ErrShardDeletion` 在 `coordinator/points_writer.go:491-498` 被转成
+> `PartialWriteError`（HTTP 400），服务端没有退避重试。
 
 **cq_query measurement 监控查询**:
 
@@ -1178,7 +1484,7 @@ curl http://localhost:8086/debug/vars | jq '.cq'
 nextRun := cq.LastRun.Add(resampleEvery)
 ```
 
-`ExecuteContinuousQuery` 在读取 `lastRuns` 前获取 `s.mu`，并持有到方法返回；时间窗口计算、`lastRuns` 提前更新、查询执行和统计写入都在同一把锁内完成。因此同一个 `Service` 内 CQ 是串行执行的，且执行前更新 `lastRuns` 可以防止下一次 tick 并发重入同一个 CQ。
+`ExecuteContinuousQuery` 在读取 `lastRuns` 前获取 `s.mu`（`service.go:299-300`），并持有到方法返回；时间窗口计算、`lastRuns` 提前更新、查询执行和统计写入都在同一把锁内完成。因此同一个 `Service` 内 CQ 天生串行——`backgroundLoop` 只有一个 goroutine，且整段执行持锁，不存在“同一个 CQ 被并发重入”的问题。执行前更新 `lastRuns` 的真正作用有两点：(1) 让失败也推进 watermark，因此失败不重试；(2) 让 `Run()` 清除 `lastRuns` 的动作立刻影响下一次 tick 的判定。
 
 这个设计的代价也很直接：
 - CQ 失败时，`lastRuns` 已经推进，不会按失败前的原窗口自动重试
@@ -1225,12 +1531,14 @@ s.MetaClient.AcquireLease("continuous_querier")
 ```
 
 所有 CQ 共享一个 Lease。无法将部分 CQ 迁移到其他节点执行以分散负载。
+不过 OSS 的 `Client.AcquireLease`（`services/meta/client.go:127-133`）恒成功、不读写共享状态，
+因此这个“粒度”目前在 OSS 没有实际约束力（详见 §1.2 的 OSS 语义校准）。
 
 ### 7.10 DST 转换的边界情况
 
-- **春季跳跃**：某个时间窗口可能被跳过
-- **秋季重复**：某个时间窗口可能被执行两次
-- 当前代码只调整了 `nextRun`，未处理窗口边界的特殊情况
+- **春季跳跃**：窗口网格按绝对时间推进，`time.Add` 直接跨过不存在的墙上时刻；1h 跳变配 `EVERY ≤ 1h` 时守卫不触发
+- **秋季重复**：重复的是墙上标签，绝对时间窗口不重复，CQ 不会对同一物理窗口执行两次
+- **守卫只在 `|偏移差| < resampleEvery` 时补偿**：其设计意图是只吸收小于一个 resample 周期的偏移抖动，避免把整周期跳变平移掉、破坏调度节拍
 
 ## 8. BufferedPointsWriter — 批量写入
 
@@ -1269,8 +1577,8 @@ func NewBufferedPointsWriter(w pointsWriter, database, retentionPolicy string, c
 func (w *BufferedPointsWriter) WritePointsInto(req *IntoWriteRequest) error {
     // 1. 验证目标 database/RP
     if req.Database != w.database || req.RetentionPolicy != w.retentionPolicy {
-        return fmt.Errorf("partial write: database must be %q, retention policy must be %q",
-            w.database, w.retentionPolicy)
+        return fmt.Errorf("writer for %s.%s can't write into %s.%s",
+            w.database, w.retentionPolicy, req.Database, req.RetentionPolicy)
     }
 
     // 2. 分批写入
@@ -1358,6 +1666,10 @@ if len(res.Series) == 1 && len(res.Series[0].Values) == 1 {
     written = s.Values[0][1].(int64)  // SELECT INTO 返回的写入点数
 }
 ```
+
+> 这一行由 `coordinator/statement_executor.go:611-626` 在 `Flush()` 之后合成：
+> `Series[0] = {Name:"result", Columns:["time","written"], Values:[[t0, writeN]]}`。
+> 12 号文档 §7.5 引用的是同一个值。
 
 ### 9.3 cq_query measurement 结构
 
@@ -1482,6 +1794,82 @@ func (c *DefaultPlanner) PlanLevel(level int) ([]CompactionGroup, int64) {
 `PlanLevel` 只看同 level 的相邻 generation。level 1 的阈值是 8，其余 level 是 4。
 如果 chunk 不足且没有 tombstone，只有当后面存在不低于当前 level 的 generation
 时才提前推进，避免低 level 文件长期卡住。
+
+### 10.3.1 Scheduler 如何选层（planner 之后）
+
+`PlanCompactions()` 只产出 5 个 level 的候选；真正决定“下一个跑谁”的是 `Scheduler`。
+
+```mermaid
+flowchart LR
+    P["PlanCompactions()<br>level1..level5 候选"] --> D["Scheduler.SetDepth(1..5, len)"]
+    D --> N["Scheduler.next()"]
+    N --> M{"正在跑的 compaction 总数<br>>= maxConcurrency?"}
+    M -->|"是"| X["本轮不调度"]
+    M -->|"否"| W["按 depth[i] * weight[i] 取最大值<br>（i = 1..5 全参与）"]
+    W --> ISO["compactHiPriorityLevel(1/2)<br>compactLoPriorityLevel(3)<br>compactFull(4)<br>compactOptimize(5)"]
+```
+
+```go
+// tsdb/engine/tsm1/scheduler.go:8 — 权重
+var defaultWeights = [TotalCompactionLevels]float64{0.4, 0.3, 0.2, 0.1, 0.01}
+
+// tsdb/engine/tsm1/scheduler.go:36-67 — nextByQueueDepths（精简）
+func (s *Scheduler) nextByQueueDepths(depths [TotalCompactionLevels]int) (int, bool) {
+    running := level1Running + level2Running + level3Running + level4Running + level5Running
+    if running >= s.maxConcurrency {
+        return 0, false              // ① 总数已达上限：本轮直接放弃
+    }
+    loLimit, _ := s.limits()
+    end := len(depths)
+    if level3Running+level4Running+level5Running >= loLimit &&
+        s.maxConcurrency-(level1Running+level2Running) == 0 {
+        end = 2                      // ② 死分支：条件成立时 ① 必然已返回
+    }
+    var weight float64
+    for i := 0; i < end; i++ {
+        if float64(depths[i])*s.weights[i] > weight {
+            level, runnable = i+1, true
+            weight = float64(depths[i]) * s.weights[i]
+        }
+    }
+    return level, runnable
+}
+
+// tsdb/engine/tsm1/scheduler.go:73-85 — limits
+func (s *Scheduler) limits() (int, int) {
+    hiLimit := s.maxConcurrency * 4 / 5
+    loLimit := (s.maxConcurrency / 5) + 1
+    ...
+    return loLimit, hiLimit
+}
+```
+
+**要点**:
+- `maxConcurrency` 来自 `opt.CompactionLimiter.Capacity()`（`engine.go:289`），即
+  `MaxConcurrentCompactions`；配置为 0 时取 `GOMAXPROCS(0)/2`（至少 1，`tsdb/store.go:499-503`）。
+- 权重是硬编码的，level 5 只有 0.01：`depth` 相同的条件下，level 1 永远优先。
+- `limits()` 同时算出 `hiLimit = max*4/5`，但 OSS 的 `next()` 只用 `loLimit`；`hiLimit` 是死值。
+  `loLimit` 也只喂给上文代码块里那个不可达的 `end = 2` 分支，在 OSS 中同样不影响选层。
+- **`end = 2` 分支不可达**：第二个条件 `s.maxConcurrency-(l1+l2) == 0` 等价于 `l1+l2 == maxConcurrency`，
+  而 `l3+l4+l5 >= loLimit >= 1`，两者相加必然 `>= maxConcurrency`，于是函数开头的总数守卫
+  已经 `return 0, false`。源码注释里的“只剩前两层还有空位”与实际控制流相反：OSS **不存在**
+  “保底只跑 level 1/2”的策略。只有将来移除或放宽开头的总数守卫，这段代码才会生效。
+- level 5 在 optimize holdoff 期间被 `SetDepth(5, 0)` 强制为 0（`engine.go:2219-2235`），
+  因此不会被选中，但候选组仍会走 `ReleaseCompactionPlans` 释放。
+
+**每轮 tick 的完整顺序**（`engine.go:2180-2288`）：
+
+1. `PlanCompactions()` → `planCompactionsInner()`（`:2360-2431`）：`PlanLevel(1..3)` + `Plan(lastWrite)`（level 4）+ `PlanOptimize(lastWrite)`（level 5）。
+2. **L4 → L5 晋升**（`:2377-2395`）：level 4 候选组里只要含一个已优化文件，`IsGroupOptimized` 返回 true，整组被提升到 level 5，并改用 aggressive `PointsPerBlock`；原始 level 5 组追加在其后。
+3. `Scheduler.SetDepth(1..5, len(...))`（`:2231-2235`）。
+4. `Scheduler.next()` 选层，按 level 分派到 `compactHiPriorityLevel`（1/2）、`compactLoPriorityLevel`（3）、`compactFull`（4）、`compactOptimize`（5）（`:2238-2288`）。
+5. 未启动的候选统一 `ReleaseCompactionPlans` 归还文件锁。
+
+> **数值例**：`maxConcurrency = 8` → `loLimit = 2`、`hiLimit = 6`。
+> ① 当前 `l1..l5 = [0,0,0,0,0]`、`depth = [20, 10, 3, 1, 0]`，加权值 `8.0 / 3.0 / 0.6 / 0.1 / 0`，选中 level 1。
+> ② 当前 `l1..l5 = [0,0,0,0,0]`、`depth = [0, 12, 5, 2, 0]`，加权值 `0 / 3.6 / 1.0 / 0.2 / 0`，选中 level 2。
+> ③ 当前 `l1..l5 = [2,2,2,1,1]`（总数 = 8 = `maxConcurrency`）时，无论 `depth` 为何，开头守卫
+> 直接 `return 0, false`，本轮不调度。注意这不是“候选范围收缩到 level 1/2”——`end = 2` 分支永远执行不到。
 
 ### 10.4 `Plan` 与 `PlanOptimize`
 

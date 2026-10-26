@@ -36,7 +36,7 @@ flowchart TB
 
     subgraph 租约使用
         NoLease["不使用租约<br/>每个节点独立执行"]
-        UsesLease["使用租约<br/>仅 leader 执行"]
+        UsesLease["使用租约<br/>OSS: 恒成功，无互斥"]
     end
 
     RetSvc --> Ticker --> NoLease
@@ -52,16 +52,16 @@ flowchart TB
 |------|----------|----------|----------|-------------|------|
 | **Retention Service** | `services/retention/service.go:50` | `time.NewTicker` | 30 分钟 | 否 | 删除过期数据和 ShardGroup |
 | **Precreator Service** | `services/precreator/service.go:13` | `time.After` | 10 分钟 | 否 | 预创建即将到期的 ShardGroup |
-| **CQ Service** | `services/continuous_querier/service.go` | `AcquireLease` | 可配置 | 是 | 仅 leader 执行连续查询 |
+| **CQ Service** | `services/continuous_querier/service.go` | `time.Timer`（`RunInterval`，默认 1s）+ 每次执行前 `AcquireLease` 闸门 | 1 秒 | 名义上是（OSS 无互斥） | 执行连续查询 |
 
 ### 1.2 为什么 Retention 和 Precreator 不使用租约
 
 ```mermaid
 flowchart LR
-    subgraph "CQ Service（使用租约）"
-        CQ1["节点 A (leader)"] -->|"执行 CQ"| Result1["写入结果到新 ShardGroup"]
-        CQ2["节点 B (follower)"] -->|"获取租约失败"| Skip1["跳过执行"]
-        Note1["CQ 是计算任务<br/>重复执行会产生重复数据"]
+    subgraph "CQ Service（名义租约，OSS 无互斥）"
+        CQ1["节点 A"] -->|"AcquireLease 恒成功"| Result1["执行 CQ"]
+        CQ2["节点 B"] -->|"AcquireLease 恒成功"| Skip1["也执行 CQ（可能重复）"]
+        Note1["OSS: Leases.Acquire / NewLeases<br/>无生产调用方"]
     end
 
     subgraph "Retention Service（不使用租约）"
@@ -77,45 +77,180 @@ flowchart LR
     end
 
     style CQ1 fill:#c8e6c9
-    style CQ2 fill:#ffcdd2
+    style CQ2 fill:#c8e6c9
 ```
 
 **设计决策**：
-- **CQ 必须用租约**：连续查询是计算任务，如果多个节点同时执行，会产生重复数据写入
-- **Retention 不需要租约**：每个节点删除的是自己本地磁盘上的 Shard 文件，是天然分布式的
-- **Precreator 不需要租约**：`ShardGroupByTimestamp` 检查保证幂等性，重复创建不会产生副作用
+- **CQ 名义上使用租约**：设计意图是“多节点只让 leader 执行”；但 OSS 的 `Client.AcquireLease`（`services/meta/client.go:127-133`）恒成功、不读写共享状态，该保护在本仓库不生效——多进程共连同一 meta 时 CQ 可能重复执行。
+- **Retention 不使用租约**：`services/retention/` 全目录无 lease 符号，服务按 ticker 独立运行；每个节点删除的是自己本地磁盘上的 Shard 文件，天然分布式。
+- **Precreator 不使用租约**：`services/precreator/` 同样无 lease 符号；`ShardGroupByTimestamp` 检查保证幂等性，重复创建不会产生副作用。
 
 ### 1.3 服务生命周期
+
+> 本节只覆盖 Retention/Precreator 的 Open/Close；三个服务的依赖注入与 CQ 生命周期见 §1.4。
 
 ```mermaid
 sequenceDiagram
     participant Main as influxd 主进程
     participant RetSvc as Retention Service
     participant PreSvc as Precreator Service
-    participant Meta as MetaClient
-    participant TSDB as TSDBStore
 
-    Main->>RetSvc: NewService(config)
+    Main->>RetSvc: NewService(config) → SetOSSMetaClient / TSDBStore / DropShardMetaRef
     Main->>RetSvc: WithLogger(logger)
-    Main->>RetSvc: Open()
-    RetSvc->>RetSvc: 创建 done channel
-    RetSvc->>RetSvc: 启动 run() goroutine
+    Main->>RetSvc: Open() → 创建 done，启动 run() goroutine
+    Note over RetSvc: 首个 DeletionCheck 要等满一个 check-interval（30m）
 
-    Main->>PreSvc: NewService(config)
+    Main->>PreSvc: NewService(config) → MetaClient
     Main->>PreSvc: WithLogger(logger)
-    Main->>PreSvc: Open()
-    PreSvc->>PreSvc: 创建 done channel
-    PreSvc->>PreSvc: 启动 runPrecreation() goroutine
+    Main->>PreSvc: Open() → 创建 done，启动 runPrecreation()
+    Note over PreSvc: 首个 precreate 要等满一个 check-interval（10m）
 
     Note over RetSvc,PreSvc: 两个服务独立运行，互不依赖
 
     Main->>Main: 收到 SIGTERM/SIGINT
-    Main->>RetSvc: Close()
-    RetSvc->>RetSvc: close(done) → goroutine 退出
-    Main->>PreSvc: Close()
-    PreSvc->>PreSvc: close(done) → goroutine 退出
+    Main->>RetSvc: Close() → close(done) + wg.Wait()
+    Note over RetSvc: 若当前 DeletionCheck 正在执行，会阻塞到它结束
+    Main->>PreSvc: Close() → close(done) + wg.Wait()
     Main->>Main: 进程退出
 ```
+
+**生命周期语义**:
+- **首个 tick 延迟**：`Open()` 只是 `go run()` / `go runPrecreation()`；`run()` 先
+  `time.NewTicker`（`services/retention/service.go:139-151`），`runPrecreation()` 先
+  `time.After(checkInterval)`（`services/precreator/service.go:72-86`）。因此第一次检查要等满一个
+  间隔，`Open()` 不会立刻执行。
+- **Close 不中断当前检查**：`Close()` 只 `close(done)` 再 `wg.Wait()`（`retention/service.go:121-131`、
+  `precreator/service.go:59-69`）。`DeletionCheck`/`precreate` 没有 context、没有超时，正在执行时会
+  一直跑到结束，`Close()` 随之阻塞。运维停机时间可能因此拉长（见 §11.9）。
+- **participants 精简**：原图里的 `Meta`/`TSDB` 没有任何消息，已删除。
+
+### 1.4 服务装配与启动/关闭契约
+
+三个后台服务都由 `cmd/influxd/run/server.go` 手工装配（没有 DI 容器），字段是导出的，为 nil 时
+多数情况下只在运行时 panic 或静默失效。
+
+```mermaid
+flowchart LR
+    Main["influxd main"] --> AR["appendRetentionPolicyService<br>server.go:300"]
+    Main --> AP["appendPrecreatorService<br>server.go:396"]
+    Main --> AC["appendContinuousQueryService<br>server.go:416"]
+    AR --> R1["retention.NewService(c)"]
+    R1 --> R2["SetOSSMetaClient(s.MetaClient)"]
+    R1 --> R3["srv.TSDBStore = s.TSDBStore"]
+    R1 --> R4["srv.DropShardMetaRef = OSSDropShardMetaRef(...)"]
+    AP --> P1["precreator.NewService(c)"]
+    P1 --> P2["srv.MetaClient = s.MetaClient"]
+    AC --> C1["continuous_querier.NewService(c)"]
+    C1 --> C2["srv.MetaClient / QueryExecutor / Monitor"]
+    C1 --> C3["Monitor.RegisterDiagnosticsClient('cq', srv)"]
+```
+
+| 服务 | 字段 | 谁注入 | 为 nil 的后果 |
+|------|------|--------|----------------|
+| Retention | `MetaClient` | `srv.SetOSSMetaClient(s.MetaClient)`（`server.go:305`） | 首次 `DeletionCheck` 解引用时 panic |
+| Retention | `TSDBStore` | `srv.TSDBStore = s.TSDBStore`（`server.go:306`） | 首次 `DeletionCheck` 调 `ShardIDs()` 时 panic |
+| Retention | `DropShardMetaRef` | `retention.OSSDropShardMetaRef(s.MetaClient)`（`server.go:307`） | `Open()` 直接返回 `invalid nil for retention service DropShardMetaRef`（`service.go:107-109`），服务完全不运行 |
+| Precreator | `MetaClient` | `srv.MetaClient = s.MetaClient`（`server.go:401`） | 首次 `precreate` panic |
+| CQ | `MetaClient` | `srv.MetaClient = s.MetaClient`（`server.go:421`） | `Open()` 的 `assert(s.MetaClient != nil, ...)` panic |
+| CQ | `QueryExecutor` | `srv.QueryExecutor = s.QueryExecutor`（`server.go:422`） | `Open()` 的 `assert(... != nil)` panic |
+| CQ | `Monitor` | `srv.Monitor = s.Monitor`（`server.go:423`） | 赋成 nil 接口后 `s.Monitor.Enabled()` 会 panic；若跳过赋值则用 `NewService` 的 `nullMonitor(0)`，`cq_query` 统计不落盘 |
+
+```go
+// services/retention/service.go:18-52 — OSS 接口与适配器
+type OSSMetaClient interface {
+    Databases() []meta.DatabaseInfo
+    DeleteShardGroup(database, policy string, id uint64) error
+    DropShard(id uint64) error
+    PruneShardGroups() error
+}
+
+type MetaClient interface {
+    OSSMetaClient
+    NodeID() uint64
+}
+
+const ossNodeID uint64 = math.MaxUint64   // 不可能与 Enterprise 节点 ID 冲突
+
+type ossMetaClientAdapter struct{ OSSMetaClient }
+
+func (c *ossMetaClientAdapter) NodeID() uint64 { return ossNodeID }
+```
+
+```go
+// services/retention/service.go:102-131 — Open/Close
+func (s *Service) Open() error {
+    if !s.config.Enabled || s.done != nil { return nil }
+    if s.DropShardMetaRef == nil {
+        return fmt.Errorf("invalid nil for retention service DropShardMetaRef")
+    }
+    s.done = make(chan struct{})
+    s.wg.Add(1)
+    go func() { defer s.wg.Done(); s.run() }()
+    return nil
+}
+
+func (s *Service) Close() error {
+    if !s.config.Enabled || s.done == nil { return nil }
+    close(s.done)
+    s.wg.Wait()          // 等当前 DeletionCheck 结束
+    s.done = nil
+    return nil
+}
+```
+
+```go
+// services/precreator/service.go:28-69 — NewService/Open/Close
+func NewService(c Config) *Service {
+    return &Service{
+        checkInterval: time.Duration(c.CheckInterval),
+        advancePeriod: time.Duration(c.AdvancePeriod),
+        Logger:        zap.NewNop(),
+    }
+}
+
+func (s *Service) Open() error {
+    if s.done != nil { return nil }
+    s.done = make(chan struct{})
+    s.wg.Add(1)
+    go s.runPrecreation()
+    return nil
+}
+```
+
+```go
+// services/continuous_querier/service.go:104-150 — NewService/Open/Close
+func NewService(c Config) *Service {
+    s := &Service{
+        Config:      &c,
+        Monitor:     nullMonitor(0),
+        RunInterval: time.Duration(c.RunInterval),
+        RunCh:       make(chan *RunRequest),      // 无缓冲
+        lastRuns:    map[string]time.Time{},
+        ...
+    }
+    return s
+}
+
+func (s *Service) Open() error {
+    if s.stop != nil { return nil }
+    assert(s.MetaClient != nil, "MetaClient is nil")
+    assert(s.QueryExecutor != nil, "QueryExecutor is nil")
+    s.stop = make(chan struct{})
+    s.wg.Add(1)
+    go s.backgroundLoop()
+    return nil
+}
+```
+
+**失败案例**：只调用 `retention.NewService(c)` + `Open()`，忘记赋 `DropShardMetaRef`。
+`Open()` 在 `service.go:107-109` 直接报错 `invalid nil for retention service DropShardMetaRef`，
+`influxd` 启动失败——这是三个服务里唯一一处显式的 nil 校验。
+
+**启动/关闭语义**（与 §1.3 一致）:
+- 首个 `DeletionCheck`/`precreate` 要等满一个 interval（`retention/service.go:139-151`、
+  `precreator/service.go:72-86`）。
+- `Close()` 只发信号；若当前检查正在执行，会阻塞到它结束（`retention/service.go:121-131`）。
+- `Service.Run`/`ContinuousQuerier` 在 OSS 无生产调用方，只有测试与内嵌调用。
 
 ## 2. Retention Service 全链路
 
@@ -341,7 +476,7 @@ deletedShardIDs := make(map[uint64]deletionInfo)
 - **owners 提取**: `meta.ShardInfo.Owners` 是 `[]ShardOwner{NodeID uint64}`，而
   `DropShardMetaRef(shardID, owners []uint64)` 接收的是裸 `[]uint64`。`newDeletionInfo`
   做的就是 `[]ShardOwner → []uint64` 的扁平化转换，避免在 phantom-shard 分支
-  (service.go:283-300) 重复遍历 `si.Owners`。
+  (service.go:284-300) 重复遍历 `si.Owners`。
 - **OSS 场景下 owners 为空**: OSS 每个 ShardGroup 只有 1 个 Shard 且 `ShardInfo.Owners`
   为空 (Module 06 已确认)，所以 `newDeletionInfo` 返回的 `owners` 在 OSS 中恒为空切片。
   但 Enterprise 模式下 `owners` 非空，`isOSS()` 分支 (service.go:288) 会据此判断
@@ -445,36 +580,55 @@ if err := s.MetaClient.PruneShardGroups(); err != nil {
 }
 ```
 
-`PruneShardGroups` 的实现（`services/meta/client.go:680-704`）：
+`PruneShardGroups` 分两层：`client.go` 只负责 Clone/commit 的发布外壳，真正的筛选循环在
+`data.go` 的 `Data.PruneShardGroups`。
 
 ```go
-// services/meta/client.go:680 — PruneShardGroups
+// services/meta/client.go:680-691 — 薄封装（Clone → mutate → commit）
 func (c *Client) PruneShardGroups() error {
-    var changed bool
     expiration := time.Now().Add(ShardGroupDeletedExpiration)  // -14 天
     c.mu.Lock()
     defer c.mu.Unlock()
     data := c.cacheData.Clone()
-    for i, d := range data.Databases {
-        for j, rp := range d.RetentionPolicies {
-            var remainingShardGroups []ShardGroupInfo
-            for _, sgi := range rp.ShardGroups {
-                // 保留: 未删除 或 删除时间不超过 14 天
-                if sgi.DeletedAt.IsZero() || !expiration.After(sgi.DeletedAt) || len(sgi.Shards) > 0 {
-                    remainingShardGroups = append(remainingShardGroups, sgi)
-                    continue
-                }
-                changed = true  // 该 ShardGroup 的元数据将被移除
-            }
-            data.Databases[i].RetentionPolicies[j].ShardGroups = remainingShardGroups
-        }
-    }
+    changed := data.PruneShardGroups(expiration)
     if changed {
         return c.commit(data)
     }
     return nil
 }
 ```
+
+```go
+// services/meta/data.go:476-492 — 真正的筛选循环
+func (data *Data) PruneShardGroups(expiration time.Time) bool {
+    var changed bool
+    for i, d := range data.Databases {
+        for j, rp := range d.RetentionPolicies {
+            var remainingShardGroups []ShardGroupInfo
+            for _, sgi := range rp.ShardGroups {
+                if sgi.DeletedAt.IsZero() || !expiration.After(sgi.DeletedAt) || len(sgi.Shards) > 0 {
+                    remainingShardGroups = append(remainingShardGroups, sgi)
+                    continue
+                }
+                changed = true
+            }
+            data.Databases[i].RetentionPolicies[j].ShardGroups = remainingShardGroups
+        }
+    }
+    return changed
+}
+```
+
+**两个条件缺一不可**：
+1. `len(sgi.Shards) == 0`——所有节点都完成了物理删除，并且 `DropShardMetaRef` 已把 `ShardInfo`
+   从元数据里移除；
+2. `sgi.DeletedAt` 早于 `now-14d`。
+
+> **小白解释**: 软删除后元数据还要保留 14 天。这不是"给慢节点的宽限期"，而是两道门：
+> 第一道门（`Shards` 为空）确认物理删除与 meta 引用清理都已完成；第二道门（14 天）是在清空后
+> 继续保留墓碑，给运维留出排查窗口。只要组里还剩任何一个 `ShardInfo`，无论过多久都不会被修剪。
+
+> 该函数的发布语义（Clone → mutate → commit、失败不广播）见 §2.8。
 
 **ShardGroupDeletedExpiration 常量**：
 
@@ -497,6 +651,74 @@ if retryNeeded {
 
 **重试策略**: 不使用指数退避，而是在下一个 `check_interval`（默认 30 分钟）自然重试。
 这是因为保留策略检查本身就是周期性的，不需要额外的重试机制。
+
+### 2.8 MetaClient 的写入模型：Clone → mutate → commit
+
+所有 meta 写操作（`CreateShardGroup`、`PrecreateShardGroups`、`PruneShardGroups`…）都走同一套发布模型：
+
+1. 取 `c.mu` 写锁；
+2. `data := c.cacheData.Clone()` 深拷贝当前快照；
+3. 在副本上调用 `Data` 层的纯内存方法（失败时副本被丢弃，`cacheData` 不变）；
+4. `c.commit(data)`：`Index++` → `snapshot()` 落盘 → `c.cacheData = data` → `close(c.changed)` → `c.changed = make(chan struct{})`。
+
+```mermaid
+sequenceDiagram
+    participant Svc as 调用方（Retention/Precreation/...）
+    participant C as meta.Client
+    participant D as Data 副本
+    participant Disk as meta.db
+    participant W as WaitForDataChanged 的 watcher
+
+    Svc->>C: CreateShardGroup / PruneShardGroups / ...
+    C->>C: c.mu.Lock() → defer Unlock()
+    C->>C: data := c.cacheData.Clone()
+    C->>D: 在副本上 mutate
+    D-->>C: changed
+    C->>C: data.Index++
+    C->>Disk: snapshot(tmp → Write → Sync → RenameFile)
+    Disk-->>C: nil / err
+    alt snapshot 失败
+        C-->>Svc: return err（cacheData 不变，changed 不广播）
+    else 成功
+        C->>C: c.cacheData = data
+        C->>W: close(c.changed)
+        C->>C: c.changed = make(chan struct{})
+        C-->>Svc: return nil
+    end
+```
+
+```go
+// services/meta/client.go:948-964 — commit
+func (c *Client) commit(data *Data) error {
+    data.Index++
+    if err := snapshot(c.path, data); err != nil {   // 先落盘
+        return err
+    }
+    c.cacheData = data                               // 再换指针
+    close(c.changed)                                 // 广播
+    c.changed = make(chan struct{})
+    return nil
+}
+```
+
+**读路径**：`Databases()`、`RetentionPolicy()`、`ShardGroupsByTimeRange()` 等只加 `c.mu.RLock()`
+读 `c.cacheData` 指针，拿到的是不可变快照（写入方永远改副本，不改已发布的 `Data`）。
+`ShardGroupsByTimeRange`（`client.go:615-634`）的 `RLock` 覆盖整个调用：指针读取、
+`RetentionPolicy` 查找、`Deleted()`/`Overlaps()` 过滤以及逐个 `append`。元素按值复制
+（`ShardGroupInfo` 是值类型，其 `Shards` 切片与缓存共享底层数组），不做深拷贝，因此仍很快。
+
+**失败语义**：
+- `snapshot` 失败 → `cacheData` 仍是旧指针，磁盘仍是旧版本，`changed` 不广播，调用方收到 error。
+- 下一次重试安全：`Index` 只加在副本上，失败的那次不会让编号跳号。
+- 注意：`snapshot` 只 `f.Sync()` + rename，没有 `SyncDir`（详见 07 号文档 §9.2/§3.2.x）。
+
+**规模案例**：10 个 DB × 3 个 RP × 1000 个 ShardGroup。Retention 每 30 分钟调用一次
+`PruneShardGroups`，每次都要 `Clone()` 整棵元数据树；`c.mu.Lock()` 覆盖
+`MarshalBinary + os.Create + Write + fsync + rename`。这段时间内所有 `RLock`
+（包括写路径 `PointsWriter.MapShards` 里的 `RetentionPolicy()`）都会阻塞——这是 meta 写入
+最大的延迟代价。
+
+> 逐行详解见 07 号文档 §3.2（`commit`）与 §9（snapshot）；本节只保留摘要。
 
 ## 3. TSDBStore.DeleteShard — 物理删除完整流程
 
@@ -555,13 +777,11 @@ sequenceDiagram
         end
     end
 
-    Note over Store: 步骤 4: Epoch 同步
+    Note over Store: 步骤 4: Epoch 屏障（不针对普通写入）
     Store->>Epoch: epoch.StartWrite()
-    Epoch-->>Store: guards, gen
-    loop 每个 guard
-        Store->>Epoch: guard.Wait()
-        Note over Store: 等待正在进行的写入完成
-    end
+    Epoch-->>Store: guards（仅来自 WaitDelete，可为空）, gen
+    Note over Store: guards 只来自 WaitDelete（DeleteSeries / DeleteMeasurement）<br>DeleteShard 从不安装 guard，普通写入也不进 guards
+    Note over Store: 真正的隔离：步骤 2 已从 s.shards 摘除（新写入拿到 ErrShardNotFound）<br>sh.Close() 用 Shard.mu 等待在途写入
 
     Note over Store: 步骤 5: 关闭 Shard
     Store->>Shard: sh.Close()
@@ -591,10 +811,24 @@ func (s *Store) DeleteShard(shardID uint64) error {
     }
 ```
 
-> **审计校准** (store.go:978-982): Shard 不存在时返回 `ErrShardNotFound`，**不是** `return nil`。
-> 幂等性由 **Retention caller** 保证：service.go:263 用 `!errors.Is(err, tsdb.ErrShardNotFound)`
-> 过滤该错误，把它视为"磁盘已经没有数据"并继续调用 `DropShardMetaRef`，而不是重试。
-> `DeleteShard` 本身只负责报告事实（shard 在不在），不负责吞掉错误。
+> **审计校准** (`tsdb/store.go:978-982`): Shard 不存在时返回 `ErrShardNotFound`，**不是** `return nil`。
+> `ErrShardNotFound` 只表示 **store 不再持有该 shard**，不等于磁盘已清空。
+> `DeleteShard` 在把 shard 从 `s.shards` 摘除（`:996`）之后，仍可能因 `Index()`（`:1016`）、
+> `walkShards` 系列清理、`sh.Close()`（`:1128`）、`os.RemoveAll`（`:1133-1135`）失败而返回
+> 其它错误；此时文件留在磁盘，而 shard 已不在 `s.shards`。
+>
+> **4 步失败链**:
+> 1. `DeleteShard` 返回非 `ErrShardNotFound` 错误 → Retention 置 `retryNeeded=true; continue`
+>    （`services/retention/service.go:262-267`），且 `:219` 已把 id 从 `deletedShardIDs` 删除，
+>    **本轮不会再走 phantom 分支**。
+> 2. 下一轮：`DeletedShardGroups()` 重新把该 id 放回 `deletedShardIDs`（组里仍有这个 `ShardInfo`）。
+> 3. 但 `ShardIDs()` 只返回 `s.shards` 的 key（`tsdb/store.go:1389-1394`），该 id 已不在其中 →
+>    Phase 2 的本地删除循环根本不会遍历到它。
+> 4. 同一轮的 phantom 循环（`services/retention/service.go:284-300`）在 OSS 直接
+>    `DropShardMetaRef` → `meta.Client.DropShard` 删除 `ShardInfo`。磁盘目录
+>    `data/<db>/<rp>/<id>` 与 WAL 目录成为孤儿，之后无人再尝试删除。
+>
+> 排查命令：`ls data/<db>/<rp>/<id>` 与对应 WAL 目录，人工确认后删除。
 
 ### 3.3 步骤 2: 标记为待删除
 
@@ -729,8 +963,28 @@ if err := os.RemoveAll(sh.path); err != nil {
 return os.RemoveAll(sh.walPath)
 ```
 
-**Epoch 同步的作用**: 确保在删除 Shard 文件之前，所有正在进行的写入操作都已完成。
-如果写入和删除并发执行，可能导致写入到已被删除的文件，引发数据损坏。
+**Epoch 同步的真实作用**: epoch 只登记 **series/measurement 删除** 的 guard——
+`epochTracker.StartWrite` 的 guards 只来自 `e.deletes`（`tsdb/epoch_tracker.go:63-80`），
+而 `e.deletes` 只由 `WaitDelete` 填充；`WaitDelete` 的生产调用方只有
+`DeleteMeasurement`（`store.go:1292`）与 `DeleteSeries`（`store.go:1757`）。
+`DeleteShard` **从不安装 guard**，所以这里的 `guard.Wait()` 不会因为“有普通写入”而阻塞。
+
+shard 删除与写入的隔离实际靠三件事：
+- `delete(s.shards, shardID)` 之后，新写入在 `WriteToShard` 拿到 `ErrShardNotFound`（`store.go:1871-1875`）；
+- 在途写入与 `sh.Close()` 由 `Shard.mu` 串行（`shard.go:562-564` 读锁 vs `:412-415` 写锁）；
+- 关闭后 `ready()` 返回 `ErrEngineClosed`（`shard.go:451-458`）。
+
+**写 / series-delete / shard-delete 三方 wait 关系**:
+
+| 操作 | 调用 `StartWrite` | 调用 `WaitDelete` | 会不会等普通写入 | 被谁等 |
+|------|------------------|-------------------|------------------|--------|
+| 普通写入 `WriteToShard` | 是（`store.go:1861+`） | 否 | — | `Shard.mu` 与 `sh.Close()` 串行 |
+| `DeleteSeries` / `DeleteMeasurement` | 是 | **是**（`:1757` / `:1292`） | 是（等 `StartWrite` 之后、`EndWrite` 之前的写入） | — |
+| `DeleteShard` | 是（`store.go:1119-1123`） | 否 | **否** | 仅等已存在的 series/measurement 删除 guard |
+| `DeleteDatabase` | 是 | 否 | 否 | — |
+
+`guard.Matches(points)` / 条件过滤只影响 `DeleteSeries`/`DeleteMeasurement` 对“哪些写入需要等待”的判定，
+与 shard 删除无关。
 
 ### 3.6 步骤 7: 延迟清理
 
@@ -787,7 +1041,7 @@ sequenceDiagram
         Store->>Store: 检查 s.shards[100] → 不存在
         Store->>Store: 检查 s.pendingShardDeletes[100] → 存在!
         Store-->>Writer: return ErrShardDeletion
-        Note over Writer: 等待删除完成后重试
+        Note over Writer: 服务端返回 PartialWriteError (HTTP 400)<br>由客户端决定是否重试
 
         Store->>Store: os.RemoveAll(path)
         Store->>Store: delete(s.pendingShardDeletes, 100)
@@ -803,7 +1057,7 @@ sequenceDiagram
 ### 4.2 CreateShard 中的检查
 
 ```go
-// tsdb/store.go:907-911 — CreateShard
+// tsdb/store.go:892-896 — CreateShard
 // Shard may be undergoing a pending deletion. While the shard can be
 // recreated, it must wait for the pending delete to finish.
 if _, ok := s.pendingShardDeletes[shardID]; ok {
@@ -880,8 +1134,9 @@ func (s *Service) runPrecreation() {
 > - `Ticker`: 固定间隔触发，不管上一次处理是否完成
 > - `time.After`: 上一次处理完成后，再等待一个间隔才触发下一次
 >
-> 如果 `precreate()` 耗时 5 分钟，使用 `time.After` 的实际间隔是 10+5=15 分钟，
-> 而使用 `Ticker` 会在 10 分钟时就触发，可能导致并发执行。
+> 如果 `precreate()` 耗时 5 分钟，使用 `time.After` 的实际间隔是 10+5=15 分钟；
+> 而使用 `Ticker` 会在 10 分钟时到期。由于这里是单 goroutine 同步调用，**不会并发执行**，
+> 到期的 tick 只会留在容量为 1 的 channel 里（多次到期被合并成一次）。
 
 ### 5.4 precreate 函数
 
@@ -973,6 +1228,16 @@ from (now)                    to (now + 30min)
   |  则预创建下一个 ShardGroup      |
 ```
 
+**没有“追赶”机制（重要）**:
+- 每次每 RP 最多只建 1 组：`g := rp.ShardGroups[len-1]`，条件满足时只创建一个后继组。
+- `g.EndTime.After(from)` 中 `from = now`，要求最后一组的结束时间在未来。服务停机
+  3 天、`ShardGroupDuration = 1d` 时，最后一组早已结束，`After(now)` 恒为 false，
+  **本 RP 会一直跳过**，不会按 `check_interval` 逐步补齐。
+- 停机期间的组只能由写入路径 `MapShards → CreateShardGroup` 按需创建，首笔写入会付建组延迟。
+- 创建失败只 `Info` 记录并 `continue`（`client.go:796-799`），不会重试。
+
+> 这里的 `Clone → mutate → commit` 发布语义见 §2.8。
+
 ## 6. ShardGroup 生命周期
 
 ### 6.1 完整生命周期状态机
@@ -981,37 +1246,63 @@ from (now)                    to (now + 30min)
 stateDiagram-v2
     [*] --> Created: CreateShardGroup(timestamp)
     Created --> Active: 数据写入开始
-    Active --> Expired: EndTime + Duration < now
-    Expired --> SoftDeleted: DeleteShardGroup<br/>设置 DeletedAt
-    SoftDeleted --> Pruned: PruneShardGroups<br/>DeletedAt > 14天前
+    Active --> Expired: EndTime + RP.Duration < now
+    Active --> SoftDeleted: DeleteShardGroup 设置 DeletedAt
+    Expired --> SoftDeleted: DeleteShardGroup 设置 DeletedAt
+    Active --> SoftDeleted: DropShard 删除组内最后一个 shard
+    SoftDeleted --> Created: 旧时间戳再次写入 / CreateShardGroup 新建组
+    SoftDeleted --> Pruned: 组内无 shard 且 DeletedAt 超过 14 天
     Pruned --> [*]
 
     note right of Created
-        StartTime = 时间戳对齐
+        StartTime = timestamp.Truncate(ShardGroupDuration)
         EndTime = StartTime + ShardGroupDuration
-        ShardGroupDuration 根据 RP Duration 自动计算
+        若 EndTime > MaxNanoTime 则钳到 MaxNanoTime+1
     end note
 
     note right of Active
-        接收写入请求
-        包含 1..N 个 Shard
+        写路径按需命中（ShardGroupAt → Contains）
+        OSS 每个组固定 1 个 Shard
     end note
 
     note right of Expired
-        不再接收新写入
-        仍可查询历史数据
+        已进入删除候选
+        但写路径只按 RP Duration 过滤，
+        组本身不感知 Expired
     end note
 
     note right of SoftDeleted
         DeletedAt ≠ zero
-        物理文件仍在磁盘上
+        物理文件可能仍在磁盘上
+        DropShard 删掉组内最后一个 shard 时
+        也会副作用置 DeletedAt
     end note
 
     note right of Pruned
-        元数据从 MetaClient 移除
-        物理文件已删除
+        两个条件缺一不可:
+        组内无 shard 且 DeletedAt 早于 now-14d
     end note
 ```
+
+**状态说明**:
+- `Expired` = “已进入删除候选”。如果组未被软删/截断，写路径仍可能命中；正常 HTTP 写入会
+  先在 `MapShards` 被 `now - RP.Duration` 过滤掉（`coordinator/points_writer.go:309-320`）。
+  例外是绕过写入路径的场景（importer、直接调用 meta）。
+- `SoftDeleted` = `DeletedAt != zero`；物理文件可能仍在。`DropShard` 删除组内最后一个
+  `ShardInfo` 时会副作用置 `DeletedAt`（`services/meta/data.go:313-321`）。
+- `Pruned` = `len(Shards)==0` **且** `DeletedAt` 早于 `now-14d`（`data.go:476-492`）。
+- `SoftDeleted → Created` 是回边：同一时间段再次写入会由 `CreateShardGroup` 新建一个组
+  （`ShardGroupByTimestamp` 会跳过已删除组）。
+
+**Truncate 分支（Enterprise/运维路径）**:
+- 唯一业务写入点是 `Data.TruncateShardGroups`（`services/meta/data.go:835-858`）；
+  `services/meta/client.go:670` 只是 `Clone → Truncate → commit` 的封装。
+- 只被接口声明与 mock 引用（`coordinator/meta_client.go:30`、`internal/meta_client.go:47`、
+  `coordinator/meta_client_test.go:35`），**OSS 1.x 无生产调用方**。
+- `EndTime` 字段本身不变，变的是路由判据：`ShardGroupByTimestamp` 用
+  `!sgi.Truncated() || timestamp.Before(sgi.TruncatedAt)`（`data.go:1263-1271`）；
+  而写路径 `ShardGroupAt` 只用 `Contains`（原始 `StartTime/EndTime`），**不看** `TruncatedAt`。
+- `Compacting` 是 TSM 引擎状态，不属于 ShardGroup 生命周期，见 05 号文档第 10 章。
 
 ### 6.2 ShardGroupDuration 自动计算
 
@@ -1044,7 +1335,7 @@ type ShardGroupInfo struct {
     EndTime     time.Time
     DeletedAt   time.Time      // 零值 = 未删除，非零 = 软删除时间
     Shards      []ShardInfo
-    TruncatedAt time.Time      // 截断时间（写入时 EndTime 被缩短）
+    TruncatedAt time.Time      // 非零表示该组在 TruncatedAt 之后不再被路由（Enterprise/运维工具路径；OSS 无生产调用方）
 }
 
 // Deleted() 判断是否已软删除
@@ -1085,8 +1376,8 @@ flowchart TD
         Note1["永远成功<br/>不需要真正的锁竞争"]
     end
 
-    subgraph "集群模式 (data.go:1824-1847)"
-        C1["AcquireLease(name, nodeID)"] --> C2{"租约存在?"}
+    subgraph "集群模式 (Leases.Acquire, data.go:1824-1847；OSS 无调用方)"
+        C1["Leases.Acquire(name, nodeID)"] --> C2{"租约存在?"}
         C2 -->|"不存在"| C3["创建新租约<br/>Owner = nodeID<br/>Expiration = now + 60s"]
         C2 -->|"存在"| C4{"已过期<br/>OR<br/>同一 Owner?"}
         C4 -->|"是"| C5["续期/接管<br/>Expiration = now + 60s"]
@@ -1102,7 +1393,7 @@ flowchart TD
 ### 7.3 单机模式实现
 
 ```go
-// services/meta/client.go:128-134 — AcquireLease (单机)
+// services/meta/client.go:127-133 — AcquireLease (单机)
 func (c *Client) AcquireLease(name string) (*Lease, error) {
     l := Lease{
         Name:       name,
@@ -1146,6 +1437,11 @@ func (leases *Leases) Acquire(name string, nodeID uint64) (*Lease, error) {
     return l, nil
 }
 ```
+
+> **OSS 可达性**: 上面的 `Leases.Acquire` 需要显式 `nodeID`，只有 Enterprise 的 meta 层会调用；
+> `Leases`/`NewLeases`（`data.go:1806-1821`）在 OSS 全树**没有任何调用方**（连测试都没有）。
+> OSS 的 `Client.AcquireLease(name)`（`client.go:127-133`）是另一条路径，恒成功。
+> 因此本节的 leader/follower 互斥在 OSS 中不存在。
 
 ### 7.5 CQ Service 如何使用租约
 
@@ -1197,8 +1493,12 @@ func (s *Service) backgroundLoop() {
   所以不会丢执行，只是可能多跑一轮 (CQ 内部用 `lastRuns` 去重，重复触发会被跳过)。
 - **日志区分**: 分支 A 打 `"Running continuous queries by request"` + `req.Now`，
   分支 B 无额外日志。运维可通过日志区分"手动触发"与"定时触发"。
-- **租约前置**: 两个分支都必须先 `AcquireLease("continuous_querier")` 成功才执行，
-  保证集群中只有 leader 节点跑 CQ。
+- **租约前置（仅形式）**: 两个分支都会先调用 `AcquireLease("continuous_querier")`。OSS 的
+  `Client.AcquireLease`（`services/meta/client.go:127-133`）**无条件返回成功**，既不检查也不写入
+  共享状态，因此**不提供任何互斥**；`Leases.Acquire` 与 `NewLeases`（`services/meta/data.go:1806-1847`）
+  在 OSS 全树无生产调用方。多进程共连同一 meta 时 CQ 可能重复执行；leader/follower 语义只存在于
+  Enterprise 与测试 mock（`service_test.go`）。租约也没有显式 release，只有 60s 过期/续期
+  （`DefaultLeaseDuration`，`services/meta/config.go:12`）——该值在 OSS 中同样不起作用。
 
 ```mermaid
 flowchart TD
@@ -1211,8 +1511,8 @@ flowchart TD
     D -->|"否"| F["t.Reset(RunInterval)"]
     D -->|"是"| E
     F --> A
-    E -->|"成功"| G["runContinuousQueries(req)"]
-    E -->|"失败 (非 leader)"| H["跳过本轮"]
+    E -->|"成功 (OSS 恒成立)"| G["runContinuousQueries(req)"]
+    E -->|"失败 (OSS 不会发生)"| H["跳过本轮"]
     G --> I{"是 RunCh 分支?"}
     I -->|"是 (分支 A)"| A
     I -->|"否 (分支 B)"| J["t.Reset(RunInterval)"]
@@ -1220,33 +1520,42 @@ flowchart TD
     H --> A
 ```
 
-> **具体案例**: 手动 `Run()` 触发立即执行
+> **具体案例**: 手动 `Run()` 在非窗口边界只推进 `lastRuns`
 >
-> 假设 `RunInterval = 10s`，当前时间是 00:00:00，上一个 tick 刚在 00:00:00 跑过，
-> 下一个 tick 预计 00:00:10。
+> 假设 `RunInterval = 10s`，`GROUP BY time(1m)`，无 RESAMPLE，当前时间 00:00:03。
 >
-> 1. 用户在 00:00:03 手动调用 `service.Run("mydb_myCQ", time.Now())` (例如通过
->    `influxd inspect` 或测试钩子)。
-> 2. `Run` 清除 `s.lastRuns["mydb_myCQ"]` (service.go:204)，然后向 `s.RunCh` 发送
->    `&RunRequest{Now: 00:00:03}`。
-> 3. `backgroundLoop` 的 select 立即选中 `RunCh` 分支 (分支 A)。
-> 4. `hasContinuousQueries()` 返回 true，`AcquireLease` 成功 (单机模式永远成功)。
-> 5. 打日志 `"Running continuous queries by request" at=00:00:03`，调用
->    `runContinuousQueries(req)`。
-> 6. `myCQ` 因为 `lastRuns` 被清除，重新计算时间窗口并执行，把 00:00:00~00:00:03
->    之间的新数据聚合写入目标 measurement。
-> 7. 分支 A **不** Reset timer，所以 00:00:10 的定时 tick 仍会到来——但此时
->    `lastRuns["mydb_myCQ"]` 已被更新，定时 tick 跑 `myCQ` 时发现"最近一次运行
->    覆盖的时间窗口已包含当前"，跳过实际计算 (CQ 的 `lastRuns` 去重逻辑)。
+> 1. 用户调用 `Service.Run("mydb", "myCQ", time.Now())`。OSS 中该方法**只有测试/内嵌调用方**，
+>    `influxd inspect` 没有 CQ 子命令。
+> 2. `Run()` 删除 `s.lastRuns["mydb\x1fmyCQ"]`，然后向**无缓冲**的 `RunCh` 发送
+>    `&RunRequest{Now: 00:00:03}`（`service.go:196-210`）。若服务未 `Open()` 或已 `Close()`，
+>    这里会永久阻塞且持有 `s.mu`。
+> 3. `backgroundLoop` 选中 `RunCh` 分支（分支 A）→ `hasContinuousQueries()` →
+>    `AcquireLease`（OSS 恒成功）→ `runContinuousQueries(req)`。
+> 4. `HasRun=false` → `shouldRunContinuousQuery` 返回 `(true, now=00:00:03)`。随后
+>    `cq.LastRun = truncate(00:00:03) = 00:00:00` 并写入 `lastRuns`（`service.go:338-339`）。
+> 5. 窗口计算：`startTime = truncate(00:00:03 + 1m - 1m - 1ns) = 00:00:00`；
+>    `endTime = truncate(00:00:03 + 1m - 1m) = 00:00:00`。`endTime.After(startTime) == false`
+>    → **空跑返回 `(false, nil)`，不执行查询、不写任何点**。
+> 6. 分支 A 不 Reset timer，00:00:10 的 tick 仍会到来；但 `nextRun = lastRun + 1m = 00:01:00 > now`，
+>    跳过。直到 00:01:00 的 tick 才执行 `[00:00, 00:01)`。
 >
-> 这就是为什么 `Run` 适合用于"配置变更后立即重跑 CQ"或"补跑漏掉的时间窗口"，
-> 而不会破坏定时调度的节奏。
+> **结论**：清除 `lastRuns` 只保证“下一次调度从最老未算窗口重算”，不保证在任意时刻立即产生一次写入。
+> `Run()` 的主要可观测效果是把 `lastRuns`/`HasRun` 推进到 `now` 所在的桶边界。若希望 `Run()` 重算历史
+> 窗口，必须配置 `RESAMPLE FOR > interval`（此时 `startTime` 向前多回溯 `FOR`，`endTime` 仍截断到当前
+> 桶边界，因此仍不包含当前未完成的桶）。
+
+**写回路径与点数统计**: CQ 的 `SELECT ... INTO` 走与用户写入完全相同的
+`PointsWriter → MapShards → Store.WriteToShard → Shard.WritePoints → Engine.WritePoints(Cache+WAL)`
+路径。目标库/RP 由 `query.Executor` 的 `RewriteStatement + NormalizeStatement` 解析（默认库 =
+CQ 所在库，默认 RP 由 `setIntoRP` 填入），详见 05 号文档 §1.2 步骤 ⑨.5。写入点数来自 Executor
+合成的 `{time, written}` 结果行（`coordinator/statement_executor.go:611-626`），CQ 从
+`res.Series[0].Values[0][1]` 取值并写入 `cq_query`（05 号文档 §9.2）。
 
 **为什么 CQ 需要租约而 Retention/Precreator 不需要？**
 
 | 服务 | 操作性质 | 幂等性 | 是否需要租约 |
 |------|----------|--------|-------------|
-| CQ | 计算 + 写入 | 非幂等（重复执行产生重复数据） | 是 |
+| CQ | 计算 + 写入 | 非幂等（重复执行产生重复数据） | 名义上是（OSS 恒成功、无互斥） |
 | Retention | 删除本地文件 | 幂等（删两次等于删一次） | 否 |
 | Precreator | 创建元数据 | 幂等（ShardGroupByTimestamp 检查） | 否 |
 
@@ -1254,14 +1563,14 @@ flowchart TD
 
 ### 8.1 案例一: Retention 删除过期数据
 
-> **场景**: RP Duration = 7 天，ShardGroupDuration = 1 天，数据在 t=0 时写入
+> **场景**: RP Duration = 7 天，ShardGroupDuration = 1 天，数据在 t=0 时写入。
+> OSS 每个 ShardGroup 只有 1 个 Shard，本案例按单 shard 推演。
 
 ```
 时间线:
-t=0       写入数据 → ShardGroup A (StartTime=Day0, EndTime=Day1)
-t=1d      ShardGroup A 到期，新数据写入 ShardGroup B
-t=7d      RP Duration 到期，ShardGroup A 应该被清理
-t=7d+1s   Retention Service 的 ticker 触发（假设恰好在此时）
+t=0        写入数据 → ShardGroup A (StartTime=Day0, EndTime=Day1), Shard 1
+t=1d       新数据写入 ShardGroup B (StartTime=Day1, EndTime=Day2), Shard 2
+t=8d+1s    Retention Service 的 ticker 触发
 ```
 
 **Retention Service 执行过程**:
@@ -1271,63 +1580,50 @@ Step 1: MetaClient.Databases() → [{Name: "mydb", RPs: [{Name: "autogen", Durat
 
 Step 2: 遍历 mydb.autogen:
   - r.DeletedShardGroups() → [] (没有已删除的)
-  - r.ExpiredShardGroups(now=7d+1s):
+  - r.ExpiredShardGroups(now=8d+1s):
     - ShardGroup A: EndTime=Day1, EndTime + Duration = Day1 + 7d = Day8
-      Day8.Before(7d+1s) = false → 不过期!
-    - ShardGroup B: EndTime=Day2, EndTime + Duration = Day2 + 7d = Day9
-      Day9.Before(7d+1s) = false → 不过期!
-
-Step 3: 无过期 ShardGroup，本轮不做任何操作
-```
-
-**等等，ShardGroup A 为什么不过期？** 因为 `ExpiredShardGroups` 的判断是
-`EndTime.Add(rpi.Duration).Before(t)`，即 `EndTime + RP_Duration < now`。
-
-ShardGroup A 的 EndTime = Day1，RP Duration = 7d，所以判断条件是 `Day1 + 7d < now`，
-即 `Day8 < now`。只有在 t > Day8 时才会过期。
-
-```
-修正时间线:
-t=0       写入数据 → ShardGroup A (StartTime=Day0, EndTime=Day1)
-t=8d      Retention Service ticker 触发
-```
-
-**t=8d 时的执行过程**:
-
-```
-Step 1: MetaClient.Databases() → [mydb]
-
-Step 2: 遍历 mydb.autogen:
-  - r.DeletedShardGroups() → [] (没有已删除的)
-  - r.ExpiredShardGroups(now=8d):
-    - ShardGroup A: EndTime=Day1, EndTime + Duration = Day1 + 7d = Day8
-      Day8.Before(8d) = true → 过期!
+      Day8.Before(8d+1s) = true → 过期!
     - ShardGroup B: EndTime=Day2, EndTime + Duration = Day9
-      Day9.Before(8d) = false → 不过期
+      Day9.Before(8d+1s) = false → 不过期
 
   - MetaClient.DeleteShardGroup("mydb", "autogen", shardGroupA.ID)
-    → 设置 ShardGroupA.DeletedAt = now (软删除)
-  - 收集 ShardGroup A 的 Shard ID: {1, 2, 3}
+    → 设置 ShardGroupA.DeletedAt = 8d+1s (软删除)
+  - 收集 ShardGroup A 的 Shard ID: {1}
 
-Step 3: TSDBStore.ShardIDs() → [1, 2, 3, 4, 5, 6]
-  - Shard 1 在 deletedShardIDs 中 → DeleteShard(1) → 删除文件
-  - Shard 2 在 deletedShardIDs 中 → DeleteShard(2) → 删除文件
-  - Shard 3 在 deletedShardIDs 中 → DeleteShard(3) → 删除文件
-  - Shard 4 不在 → 跳过
-  - Shard 5 不在 → 跳过
-  - Shard 6 不在 → 跳过
+Step 3: TSDBStore.ShardIDs() → [1, 2]
+  - Shard 1 在 deletedShardIDs 中:
+      SetShardNewReadersBlocked(1, true)   // 阻止新 reader
+      ShardInUse(1) → false                 // 没有旧查询持有
+      DeleteShard(1)                        // 先从 s.shards 摘除，再删文件
+      DropShardMetaRef(1, owners=[])        // OSS: meta.Client.DropShard(1) 移除 ShardInfo
+  - Shard 2 不在 deletedShardIDs 中 → 跳过
+
+  注意: 组内最后一个 ShardInfo 被移除时，DropShard 会在 DeletedAt 仍为零值的情况下
+  副作用置 DeletedAt（data.go:313-321；本案例里 DeleteShardGroup 已经设过，不会被覆盖）。
 
 Step 4: MetaClient.PruneShardGroups()
-  - ShardGroupA.DeletedAt = now (刚刚删除)
-  - now - 14d < DeletedAt → 不修剪（需要等待 14 天）
+  - ShardGroupA: DeletedAt = 8d+1s, len(Shards) == 0
+  - expiration = now - 14d = 8d+1s - 14d，expiration.After(DeletedAt) = false
+  - → 不修剪（第二道门未满足）
+```
 
-14 天后 (t=22d):
+> **为什么不是 7d？** `ExpiredShardGroups` 的判断是
+> `EndTime.Add(rpi.Duration).Before(t)`，即 `EndTime + RP_Duration < now`。
+> ShardGroup A 的 EndTime = Day1，所以条件是 `Day8 < now`：只有 `t > Day8` 才过期，
+> `t = Day8` 时 `Before` 返回 false。
+
+**14 天后 (t=22d+1s)**:
+
+```
 Step 4: MetaClient.PruneShardGroups()
-  - ShardGroupA.DeletedAt = 8d
-  - now - 14d = 8d → 8d.After(8d) = false → 不修剪
-  - 但 next check (t=22d + 30min): now - 14d = 8d + 30min > 8d → 修剪!
+  - DeletedAt = 8d+1s, expiration = now - 14d = 8d+1s
+  - expiration.After(DeletedAt) = false → 仍不修剪
+  - 下一个 tick (t=22d+1s+30min): expiration = 8d+1s+30min > 8d+1s → 修剪
   - ShardGroup A 的元数据从 MetaClient 中移除
 ```
+
+> 若 Step 3 漏掉 `DropShardMetaRef`，`len(Shards)` 永远为 1，第二道门虽然满足、
+> 第一道门却永远不满足——14 天后也不会修剪。
 
 ### 8.2 案例二: Precreator 预创建 ShardGroup
 
@@ -1367,18 +1663,18 @@ PrecreateShardGroups(from=Day0+23:30, to=Day1):
     → 跳过（EndTime 恰好等于 cutoff，Before 返回 false）
 ```
 
-**t=Day1-5min (23:55) 时的执行过程**:
+**t=Day1-10min (23:50) 时的执行过程**:
 
 ```
-precreate(now=Day1-5min):
-  cutoff = now + 30min = Day1 + 25min
+precreate(now=Day1-10min):
+  cutoff = now + 30min = Day1 + 20min
 
-PrecreateShardGroups(from=Day1-5min, to=Day1+25min):
+PrecreateShardGroups(from=Day1-10min, to=Day1+20min):
   遍历 mydb.autogen:
     last ShardGroup = {EndTime: Day1}
     检查: !Deleted() = true ✓
-    检查: EndTime.Before(Day1+25min) = true ✓
-    检查: EndTime.After(Day1-5min) = true ✓
+    检查: EndTime.Before(Day1+20min) = true ✓
+    检查: EndTime.After(Day1-10min) = true ✓
     → 条件全部满足!
 
     nextTime = Day1 + 1ns
@@ -1402,7 +1698,7 @@ PrecreateShardGroups(from=Day1-5min, to=Day1+25min):
   延迟: 50ms (受 Raft 共识影响)
 
 有预创建:
-  t=Day0+23:55      Precreator 预创建完成
+  t=Day0+23:50      Precreator 预创建完成
   t=Day1:00:00.001  写入请求到达
   t=Day1:00:00.002  ShardGroup 已存在 → 直接写入
   t=Day1:00:00.003  写入成功
@@ -1428,7 +1724,7 @@ t=5ms    写入请求: CreateShard("mydb", "autogen", 100)
          → s.pendingShardDeletes[100] 存在!
          → s.mu.Unlock()
          → return ErrShardDeletion
-         → 写入请求等待并重试
+         → 服务端转成 PartialWriteError (HTTP 400) 上抛，不做退避重试
 
 t=100ms  DeleteShard(100) 完成
          → os.RemoveAll(path)
@@ -1449,21 +1745,24 @@ flowchart LR
     subgraph "Ticker (Retention)"
         T1["t=0: 触发 + 处理 5min"] --> T2["t=30: 触发 + 处理 5min"]
         T2 --> T3["t=60: 触发 + 处理 5min"]
-        NoteT["固定间隔，不等处理完成<br/>适合: 删除操作可能很快完成"]
+        NoteT["固定节拍，channel 容量 1<br/>处理超时会丢 tick 或立即补跑"]
     end
 
     subgraph "time.After (Precreator)"
         A1["t=0: 触发 + 处理 2min"] --> A2["t=12: 触发 + 处理 2min"]
         A2 --> A3["t=24: 触发 + 处理 2min"]
-        NoteA["处理完再等间隔<br/>适合: 避免并发创建冲突"]
+        NoteA["完成后再计时<br/>周期漂移，但不会堆积"]
     end
 ```
 
 **设计理由**:
-- **Retention 用 Ticker**: 删除操作是幂等的，即使 ticker 快速连续触发也不会有问题。
-  Ticker 保证固定的检查频率，确保过期数据不会被延迟清理太久。
-- **Precreator 用 time.After**: 预创建涉及 MetaClient 的写锁（`c.mu.Lock()`），
-  使用 `time.After` 可以避免并发预创建操作导致的锁竞争。
+- 两者都是**单 goroutine 同步调用**（`run()` / `runPrecreation()`），`DeletionCheck` 与
+  `precreate` 都不会与自己的下一次调用并发执行——不存在“并发执行”问题。
+- **Retention 用 Ticker**：固定节拍。`time.Ticker` 的 channel 容量为 1，如果一次
+  `DeletionCheck` 超过 30 分钟，期间到期的多个 tick 会被合并成一次（丢 tick），恢复后立即补跑一次。
+- **Precreator 用 time.After**：每次 `select` 都新建 Timer，计时从“处理完成”开始，
+  因此实际周期是 `checkInterval + 处理耗时`，会漂移但不会堆积。
+- 两种驱动方式都无法避免彼此的写锁竞争（`c.mu.Lock()`），选型只是历史与节拍需求，不是并发保护。
 
 ### 9.2 为什么软删除后还要等 14 天
 
@@ -1488,8 +1787,12 @@ sequenceDiagram
 
     Note over Meta: 如果 PruneShardGroups 在 Day2 执行:<br/>元数据被移除，但节点 B 还没删完<br/>节点 B 的 Retention Service<br/>下次检查时找不到 ShardGroup 元数据<br/>→ Shard 文件永远留在磁盘上!
 
-    Note over Meta: 14 天缓冲期确保所有节点<br/>都有足够时间完成物理删除
+    Note over Meta: 两道门: ① len(Shards)==0<br/>(所有节点的物理删除与 meta 引用清理都已完成)<br/>② DeletedAt 超过 14 天（保留墓碑给运维排查）
 ```
+
+> 14 天不是“给慢节点的宽限期”。第一道门（`len(Shards)==0`）已经保证每个节点的
+> `DeleteShard` + `DropShardMetaRef` 都完成；第二道门是在清空后继续保留墓碑，
+> 给运维留出排查窗口（见 §2.6 的两个条件）。
 
 ### 9.3 为什么 DeleteShard 要做 Series Diff
 
@@ -1518,10 +1821,12 @@ ShardGroup A: [StartTime=Day0, EndTime=Day1)
 ShardGroup B: [StartTime=Day1, EndTime=Day2)
 
 为什么是 +1ns 而不是 =EndTime?
-→ 因为 ShardGroup 的 Contains() 判断是: !t.Before(StartTime) && t.Before(EndTime)
+→ ShardGroup 的 Contains() 判断是: !t.Before(StartTime) && t.Before(EndTime)
 → 即 StartTime <= t < EndTime (左闭右开区间)
-→ 如果 B.StartTime = A.EndTime，那么时间点 A.EndTime 同时属于 A 和 B
-→ +1ns 只是传给 `createShardGroup` 的定位时间戳，使它落入下一段半开区间。
+→ 传 A.EndTime 时，Contains(A) 已经为 false；但 CreateShardGroup 还会跑
+  区间收缩循环，用 !timestamp.Before(endI) 判断“时间戳不早于旧组结束”，
+  +1ns 让定位时间戳严格晚于旧组 EndTime，明确落在下一段半开区间，
+  不会被收缩逻辑判回旧区间。
 新 ShardGroup 的 `StartTime` 仍由 `timestamp.Truncate(ShardGroupDuration)` 计算，
 通常等于旧组的 `EndTime`，不是 `EndTime + 1ns`。
 ```
@@ -1532,13 +1837,13 @@ ShardGroup B: [StartTime=Day1, EndTime=Day2)
 |------|------|------|
 | **存储管理** | 自动过期清理 | 无需人工干预，数据按 RP Duration 自动淘汰 |
 | **写入性能** | 预创建避免写入延迟 | ShardGroup 提前创建，写入时无需等待 Raft 共识 |
-| **数据安全** | 两阶段删除 | 软删除 → 物理删除，14 天缓冲期防止误删 |
+| **数据安全** | 两阶段删除 | 软删除 → 物理删除；Prune 需 `len(Shards)==0` 且墓碑满 14 天 |
 | **Series 清理** | Diff 精确删除 | 只删除孤立 Series，不影响其他 Shard 的查询 |
 | **并发安全** | Epoch 同步 | 确保删除前所有 in-flight 写入完成 |
 | **竞态保护** | pendingShardDeletes | 防止删除和创建的竞态条件 |
 | **幂等性** | 所有操作可重试 | 失败后下一个周期自动重试，无需人工干预 |
 | **可测试性** | 匿名接口依赖注入 | MetaClient 和 TSDBStore 可以轻松 mock |
-| **单机简化** | Lease 永远成功 | 单机模式下 AcquireLease 直接返回成功，无需锁竞争 |
+| **单机简化** | Lease 永远成功 | 单机模式下 AcquireLease 直接返回成功、无互斥（也不是真正的分布式锁） |
 | **资源回收** | PruneShardGroups | 14 天后清理元数据，防止元数据无限增长 |
 
 ## 11. 潜在隐患与瓶颈
@@ -1565,7 +1870,8 @@ case <-time.After(s.checkInterval):
 
 **影响**: 在高负载场景下，预创建可能延迟，导致写入时临时创建 ShardGroup。
 
-**对比**: `time.NewTicker` 会保持固定间隔，但可能导致并发执行。
+**对比**: `time.NewTicker` 保持固定节拍（channel 容量 1，处理超时会丢 tick 或立即补跑）；
+两者都是单 goroutine 同步调用，都不会并发执行，只是周期语义不同。
 
 ### 11.3 DeleteShard 的 Series Diff 在高基数下性能差
 
@@ -1577,22 +1883,31 @@ CreateShard 可能频繁返回 `ErrShardDeletion`。
 
 **缓解**: SeriesIDSet 使用 Roaring Bitmap 实现，Diff 操作本身是高效的位运算。
 
-### 11.4 Epoch Wait 可能阻塞删除
+### 11.4 DeleteShard 可能被谁阻塞
 
-**问题**: `epoch.StartWrite()` 后需要等待所有 `guard.Wait()` 完成。
-如果有大量正在进行的写入，删除操作可能被长时间阻塞。
+**问题**: `DeleteShard` 在 `epoch.StartWrite()` 之后会等待所有已安装的 guard；
+但 shard 删除本身不装 guard，所以阻塞来源不是普通写入，而是：
+
+- 同 shard 上在途的 `DeleteSeries` / `DeleteMeasurement`（罕见）；
+- `sh.Close()` 等待 `Shard.mu` 上的在途写入；
+- 高基数时 `SeriesIDSet.Diff()` 与 `FlushSegments` 的耗时。
 
 **影响**: `DeleteShard` 完成前，`pendingShardDeletes` 持续时间变长；
 同一 shard 的重新创建会更久地返回 `ErrShardDeletion`。
+普通写入不会让删除长时间阻塞，因为新写入在 `s.shards` 摘除后立即拿到 `ErrShardNotFound`。
 
 ### 11.5 PruneShardGroups 的 14 天缓冲期假设
 
-**问题**: 14 天的缓冲期假设所有节点都能在 14 天内完成物理删除。
-如果某个节点宕机超过 14 天，恢复后可能无法找到 ShardGroup 元数据。
+**问题**: `PruneShardGroups` 有两个条件：`len(Shards)==0` 且 `DeletedAt` 早于 `now-14d`。
+其中 `len(Shards)` 只有在所有节点都完成 `DeleteShard` + `DropShardMetaRef` 后才会归零。
+因此 14 天不是“慢节点宽限期”，真正的风险是**第一道门永远不满足**：某个节点的
+`DeleteShard` 中途失败会留下孤儿目录，下一轮 phantom 分支把 `ShardInfo` 删掉后
+`len(Shards)` 归零，元数据会按 14 天规则正常修剪，但磁盘目录已经无人清理
+（见 §3.2 的 4 步失败链）。
 
-**影响**: 宕机节点恢复后，可能有孤立的 Shard 文件无法被清理。
+**影响**: 元数据被修剪后，孤儿目录只占磁盘、无法再被自动清理。
 
-**缓解**: 这种情况极为罕见，且孤立文件只占用磁盘空间，不影响数据正确性。
+**缓解**: 监控 `data/<db>/<rp>/<id>` 与 `ShardIDs()` 的差集；必要时人工删除。
 
 ### 11.6 全局锁竞争
 
@@ -1637,57 +1952,114 @@ s.Logger.Info("Failed to precreate shards", zap.Error(err))
 **影响**: 预创建失败不会立刻造成数据丢失，但会把创建成本推迟到写入路径，
 高写入压力下可能增加延迟尖峰。
 
+**没有追赶机制**: 预创建只覆盖 `(now, now+advancePeriod]` 内的下一组。
+`g.EndTime.After(from)`（`from = now`）一旦不满足，本 RP 就永久跳过，直到写入路径
+`MapShards → CreateShardGroup` 建出新组。每次每 RP 最多建 1 组，失败只记 `Info`。
+停机 3 天 + `ShardGroupDuration = 1d` → 预创建触发 0 次，首笔写入要付建组延迟。
+
+### 11.9 Close 会等待当前检查结束
+
+**问题**: `Close()` 只 `close(done)` + `wg.Wait()`；`run()`/`runPrecreation()` 要等
+`DeletionCheck`/`precreate` 返回后才会重新进入 `select` 看到 `done`。高基数 shard 的
+`SeriesIDSet.Diff()`、`FlushSegments` 或 `PruneShardGroups` 的 meta commit 都可能耗时
+数秒到数分钟。
+
+**影响**: 停机/滚动重启被拉长；`influxd` 的信号处理会卡在 `Close()`。
+
+**缓解**: 没有 context/超时可用；只能降低单次检查的工作量（更短的 `check-interval`）
+或接受停机延迟。
+
 ## 12. 源码校准：Retention 物理删除并发保护
 
-Retention 的真实物理删除不是简单调用 `DeleteShard`。当前源码会先阻止新读者，
-确认没有读者正在使用 shard，再删除磁盘数据并清理 meta 引用；如果发现磁盘上有
-metadata 仍引用但本地 store 已不存在的 phantom shard，也会通过 `DropShardMetaRef`
-清理 metadata reference。
+Retention 的真实物理删除不是简单调用 `DeleteShard`。当前源码先收集过期组并软删，
+再遍历**本地** shard 逐个 block → InUse → DeleteShard → DropShardMetaRef；最后只剩
+“metadata 有引用、本地不存在”的 phantom shard 走只删 meta 的分支。两段循环是**分开**的。
 
 ```mermaid
 flowchart TD
-    A["DeletionCheck()"] --> B["ExpiredShardGroups(now)"]
-    B --> C["DeleteShardGroup(db, rp, shardGroupID)"]
-    C --> D["遍历 Shards"]
-    D --> E["SetShardNewReadersBlocked(shardID, true)"]
-    E --> F{"ShardInUse(shardID)?"}
-    F -->|"是"| G["SetShardNewReadersBlocked(false)<br/>本轮跳过"]
-    F -->|"否"| H["TSDBStore.DeleteShard(shardID)"]
-    H -->|"nil 或 ErrShardNotFound"| I["Service.DropShardMetaRef(shardID, owners)"]
-    H -->|"其他 error"| J["记录错误并保留 meta ref"]
-    I --> K["继续下一个 shard"]
-    B --> L["phantom shard 检查"]
-    L --> M["metadata 仍引用但本地不存在的 shard<br/>清理 metadata reference"]
+    A["DeletionCheck()"] --> B["Phase 1: DeletedShardGroups() + ExpiredShardGroups(now)"]
+    B --> C["DeleteShardGroup(db, rp, id) 软删，置 DeletedAt"]
+    C --> D["收集 deletedShardIDs"]
+    D --> E["Phase 2: 遍历本地 TSDBStore.ShardIDs()"]
+    E --> F{"id 在 deletedShardIDs 中?"}
+    F -->|"否"| E
+    F -->|"是"| G["SetShardNewReadersBlocked(id, true)"]
+    G --> H{"ShardInUse(id)?"}
+    H -->|"是"| I["defer 解除 block<br/>本轮跳过"]
+    H -->|"否"| J["DeleteShard(id)"]
+    J -->|"nil 或 ErrShardNotFound"| K["DropShardMetaRef(id, owners)"]
+    J -->|"其他 error"| L["retryNeeded = true<br/>保留 meta ref"]
+    K --> M["Phase 3: 遍历 deletedShardIDs 的剩余项"]
+    L --> M
+    M --> N["phantom: 只做 DropShardMetaRef<br/>不碰磁盘"]
+    N --> O["Phase 4: PruneShardGroups()"]
 ```
 
-对应接口需要包含读者阻塞和引用检查：
+> 注意 Phase 2 的 `SetShardNewReadersBlocked`/`ShardInUse` 只对**本地仍在**的 shard 生效；
+> 本地不存在的 shard 走 Phase 3，Phase 3 不会尝试 `DeleteShard`。
+
+接口是**节选**（仅列出本节涉及的方法）；完整定义见 §2.1：
 
 ```go
-// services/retention/service.go
-type TSDBStore interface {
-    DeleteShard(shardID uint64) error
-    SetShardNewReadersBlocked(shardID uint64, blocked bool) error
-    ShardInUse(shardID uint64) (bool, error)
-    ShardIDs() []uint64
-}
-
-type MetaClient interface {
+// services/retention/service.go — 节选
+type OSSMetaClient interface {
+    Databases() []meta.DatabaseInfo
+    DeleteShardGroup(database, policy string, id uint64) error
     DropShard(id uint64) error
     PruneShardGroups() error
 }
 
+type MetaClient interface {
+    OSSMetaClient
+    NodeID() uint64
+}
+
 type Service struct {
+    MetaClient
+    TSDBStore interface {
+        ShardIDs() []uint64
+        DeleteShard(shardID uint64) error
+        SetShardNewReadersBlocked(shardID uint64, blocked bool) error
+        ShardInUse(shardID uint64) (bool, error)
+    }
     DropShardMetaRef func(shardID uint64, owners []uint64) error
 }
 ```
 
-**ErrShardNotFound 语义**: `tsdb.Store.DeleteShard` 在 shard 不存在时会返回
-`ErrShardNotFound`。Retention 层把这个错误视为“磁盘已经没有数据”，仍然继续调用
-注入的 `DropShardMetaRef` 回调，避免 metadata 永久保留一个已经不存在的 shard 引用。
+**ErrShardNotFound 语义**: `tsdb.Store.DeleteShard` 在 store 不再持有该 shard 时返回
+`ErrShardNotFound`。Retention 层用 `!errors.Is(err, tsdb.ErrShardNotFound)` 过滤该错误并继续调用
+注入的 `DropShardMetaRef`——但 `ErrShardNotFound` 只表示 **store 不再持有该 shard**，
+**不等于磁盘已清空**。
 
-**案例**: shard 42 已过期，但仍有一个查询持有 reader。
+**4 步失败链（孤儿目录）**:
+
+```mermaid
+flowchart TD
+    A["DeleteShard: 先从 s.shards 摘除<br/>store.go:997"] --> B["Index / walkShards / sh.Close / os.RemoveAll 失败<br/>store.go:1016,1128,1133-1135"]
+    B --> C["返回非 ErrShardNotFound 错误<br/>shard 已不在 s.shards，文件仍在磁盘"]
+    C --> D["Retention 本轮 retryNeeded=true; continue<br/>service.go:262-267，且本轮不再走 phantom"]
+    D --> E["下一轮 ShardIDs() 不含该 id<br/>store.go:1389-1394 → Phase 2 碰不到"]
+    E --> F["phantom 循环直接 DropShardMetaRef<br/>service.go:284-300 → ShardInfo 被删"]
+    F --> G["data/db/rp/id 与 WAL 目录成为孤儿"]
+```
+
+排查命令：`ls data/<db>/<rp>/<id>` 与对应 WAL 目录，人工确认后删除。
+
+**案例 A: shard 42 本地仍在，但有查询持有 reader**
 
 1. Retention 先 `SetShardNewReadersBlocked(42, true)`，阻止新的 reader 进入。
 2. `ShardInUse(42)` 返回 true，说明旧查询还没释放。
-3. Retention 解除 block 或本轮跳过，不删除磁盘文件，也不删 meta ref。
+3. 匿名函数返回 `errors.New("can not delete an in-use shard")`，defer 解除 block，本轮跳过；
+   不删除磁盘文件，也不删 meta ref。
 4. 下一轮检查时，如果 reader 已释放，才执行 `DeleteShard(42)` 和 `DropShardMetaRef(42)`。
+
+**案例 B: shard 42 只在 metadata 中（phantom）**
+
+1. `DeletedShardGroups()` 仍返回含 shard 42 的组，于是 `deletedShardIDs[42]` 被填入。
+2. 本地 `ShardIDs()` 不含 42 → Phase 2 的循环根本不会碰到它。
+3. Phase 3 遍历剩余项，OSS 分支（`isOSS()`）直接 `DropShardMetaRef(42, owners=[])`
+   → `meta.Client.DropShard(42)` 删除 `ShardInfo`；磁盘上没有对应目录，无需删除。
+4. 组内最后一个 `ShardInfo` 被移除时，`DropShard` 会副作用置 `DeletedAt`（`data.go:313-321`）。
+
+> 若案例 B 的 shard 其实是“`DeleteShard` 中途失败但已摘除”的那种（见 4 步失败链），
+> 磁盘目录就会留成孤儿——这正是本编号为 P1 的风险。

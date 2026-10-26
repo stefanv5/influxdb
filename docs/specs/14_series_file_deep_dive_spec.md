@@ -18,7 +18,7 @@
 ### 1.1 SeriesFile 结构体
 
 ```go
-// tsdb/series_file.go:36 — SeriesFile
+// tsdb/series_file.go:40 — SeriesFile
 type SeriesFile struct {
     path       string
     partitions []*SeriesPartition
@@ -75,7 +75,7 @@ func (f *SeriesFile) SeriesPartitionPath(i int) string {
 ### 1.3 Open — 初始化 8 个分区
 
 ```go
-// tsdb/series_file.go:73 — Open
+// tsdb/series_file.go:77 — Open
 func (f *SeriesFile) Open() error {
     // Wait for all references to be released and prevent new ones from being acquired.
     f.refs.Lock()
@@ -112,7 +112,9 @@ func (f *SeriesFile) Open() error {
 **关键点**:
 - `f.refs.Lock()` 阻塞直到所有现有引用（`Retain()` 获取的读锁）释放
 - `compactionLimiter` 限制并发压缩数；默认来自 `NewSeriesFile()` 中的 `runtime.GOMAXPROCS(0)`，但调用方可以在 `Open()` 前用 `WithMaxCompactionConcurrency(n)` 覆盖，且小于 1 时会回退到默认值
-- 每个分区独立 Open，失败时回滚已打开的分区
+- 每个分区独立 Open，失败时回滚已打开的分区。典型失败源：SSEG 的 magic/version 校验
+  （`series_segment.go:105-113`、`:399-408`）或 SIDX header 校验（`series_index.go:70-95`）；
+  没有"跳过坏分区"的降级路径（详见 §11.5）
 
 ```mermaid
 sequenceDiagram
@@ -162,6 +164,105 @@ graph TD
     style P7 fill:#fff3e0
 ```
 
+### 1.5 SeriesPartition 生命周期与并发
+
+`SeriesPartition` 是 SeriesFile 里唯一同时拥有"可变内存状态 + mmap 文件 + 后台 goroutine"的对象。
+讲清它的锁与生命周期，才能解释写入、压缩、关闭三者之间的顺序。
+
+**字段与保护方式**（`tsdb/series_partition.go:30-58`）：
+
+| 字段 | 含义 | 谁保护 / 生命周期 |
+|------|------|------------------|
+| `mu sync.RWMutex` | 分区级读写锁 | 保护 `closed`/`segments`/`index`/`seq`/`compacting`；写路径与压缩交换用 `Lock`，查 key/查 id 用 `RLock` |
+| `wg sync.WaitGroup` | 压缩 goroutine 计数 | `Close` 里 `wg.Wait()`，确保压缩协程退出后才 unmap |
+| `closing chan struct{}` | 关闭信号 | `once.Do(close(closing))`；传给 `compactor.cancel` |
+| `once sync.Once` | 只关一次 channel | 防止重复 close panic |
+| `closed bool` | 分区是否已关闭 | 只在 `mu.Lock` 下读写 |
+| `segments []*SeriesSegment` | 按 id 升序的 SSEG | `mu` 保护；只在 `Close` 里置 nil |
+| `index *SeriesIndex` | 内存 + mmap 的 SIDX | `mu` 保护；压缩交换时 `Close`/`Open` 同一个对象 |
+| `seq uint64` | 下一个 series ID | `mu.Lock` 下的 `insert` 递增（`+= 8`） |
+| `compacting bool` | 是否有压缩在跑 | `mu` 保护；触发时置 true，goroutine 结束时复位 |
+| `compactionLimiter limiter.Fixed` | 全局并发压缩令牌 | `TryTake`/`Release`；为 nil 时 `compactionsEnabled()` 恒 false |
+| `compactionsDisabled int` | 禁用计数 | `mu` 保护；`EnableCompactions` 减一，`DisableCompactions` 加一 |
+| `CompactThreshold int` | 触发阈值 | 构造时默认 `1<<17`，测试可改 |
+
+**关闭顺序**（`tsdb/series_partition.go:145-169`）：
+
+```mermaid
+sequenceDiagram
+    participant C as Caller
+    participant P as SeriesPartition
+    participant WG as wg
+    participant Seg as SSEG segments
+    participant IDX as SeriesIndex
+
+    C->>P: Close()
+    P->>P: once.Do(close(closing))
+    P->>WG: wg.Wait()（等在跑的压缩退出）
+    P->>P: mu.Lock()
+    P->>P: closed = true
+    loop 每个 segment
+        P->>Seg: Close() = CloseForWrite()（Flush）+ Unmap
+    end
+    P->>P: segments = nil
+    P->>IDX: Close()（Unmap SIDX）
+    P->>P: index = nil；mu.Unlock()
+```
+
+`SeriesFile` 层再包一层引用计数：`Retain()` 取 `refs.RLock` 并返回 `RUnlock`；`Close()` 与 `Wait()`
+取 `refs.Lock`，所以 `Close` 会等到所有 `Retain` 释放后才真正关闭分区（`tsdb/series_file.go:109-167`）。
+
+**写路径的 segment 轮转**（`tsdb/series_partition.go:477-516`、`tsdb/series_segment.go:58-85`、`:214-216`）：
+
+```mermaid
+stateDiagram-v2
+    [*] --> Active
+    Active --> Active: writeLogEntry(data)<br/>CanWrite(data) == true
+    Active --> Rotating: CanWrite(data) == false
+    Rotating --> NewActive: CloseForWrite() 旧 segment<br/>id = lastID + 1<br/>%04x 文件名
+    NewActive --> Active: CreateSeriesSegment（.initializing → Truncate → Rename）<br/>InitForWrite()
+```
+
+- `CanWrite(data) = s.w != nil && s.size + len(data) <= SeriesSegmentSize(s.id)`；
+- `createSegment` 先 `CloseForWrite()` 旧 segment（flush + 置 `w=nil`），再用 `lastID+1` 生成
+  `%04x` 文件名，`CreateSeriesSegment` 在 `.initializing` 里写头、`Truncate` 到固定上限、`Sync`、`Rename`，
+  最后 `InitForWrite` 打开写句柄并 seek 到 `s.size`。
+
+**Flush 与 mmap 可见性**（`series_segment.go:218-227`）：`Flush = bufio.Flush + file.Sync`。
+mmap 的 `s.data` 是进程启动时映射的同一文件页；新写入只有在 `Flush`（至少 `bufio.Flush`）之后，
+读路径才能从 mmap 看到。`CreateSeriesListIfNotExists` 在写完后显式 `segment.Flush()`，再
+`p.index.Insert(p.seriesKeyByOffset(offset), ...)`——顺序不能反，否则 `seriesKeyByOffset` 读不到新 key。
+
+**压缩的并发契约**（`series_partition.go:294-322`）：
+
+- 触发时持 `mu.Lock`（调用点在 Phase 2 的写锁内），置 `compacting=true`、`wg.Add(1)`、取令牌；
+- goroutine 里 `defer wg.Done()` + `defer compactionLimiter.Release()`，结束时再 `mu.Lock` 复位 `compacting`；
+- 快照阶段 `RLock` 内只做 `CloneSeriesSegments` + `index.Clone()` + `Count()`，随后立刻 `RUnlock`；
+- 交换阶段 `Lock` 内 `index.Close()` → `os.Rename` → `index.Open()` → `index.Recover(p.segments)`。
+
+**交换失败窗口**：`index.Close()` 之后，`Rename`/`Open` 失败会直接 `return err`
+（`series_partition.go:566-573`）。`Close()` 把 `keyIDMap`/`idOffsetMap`/`tombstones` 全部置 nil
+（`series_index.go:95-106`），因此：
+
+- `FindIDBySeriesKey` 第一行就是 `idx.keyIDMap.Get(key)`（`series_index.go:185-186`），nil map 会在
+  `rhh.HashMap.index` 访问 `m.mask`/`m.hashes` 时 **panic**（`pkg/rhh/rhh.go:44-50`、`:144-161`）；
+- `FindOffsetByID` 读 nil map 得到 0，但 `idx.data` 并未置 nil、`idOffsetData` 已置 nil
+  （`series_index.go:96-105`），继续走磁盘分支会 panic；只有从未落盘过 SIDX 的分区才返回 0。
+
+也就是说**该分区不能继续写入或查询**：下一次 `CreateSeriesListIfNotExists` 的第一阶段就会调用
+`FindIDBySeriesKey`（`series_partition.go:211`）。压缩失败只记录日志并复位 `compacting`，进程内
+不会自动重新 `Open`，只能重启恢复（`series_partition.go:306-318`）。
+
+`Recover` 失败是另一类：此时 `Open()` 已成功，索引可读，只是缺少压缩期间新增的内存映射增量
+（`series_partition.go:575-578`）。
+
+**案例**：
+
+1. `DeleteSeriesID(id, flush=false)` 写 tombstone 后进程崩溃：entry 可能还在 bufio 缓冲里，重启后
+   `InitForWrite` 看不到它，删除丢失（tombstone 不复存在）。
+2. 压缩交换阶段 `os.Rename` 失败（如 Windows 上文件被占用）：`Close()` 已执行、`keyIDMap == nil`，
+   下一次写入在 `FindIDBySeriesKey` 处 panic；即使不写，查 key 的路径也不可用，必须重启重新 `Open`。
+
 ## 2. 交错 ID 分配方案
 
 ### 2.1 基本原理
@@ -181,7 +282,7 @@ p.seq = uint64(id) + 1
 ### 2.2 insert — 分配新 ID
 
 ```go
-// tsdb/series_partition.go:445 — insert
+// tsdb/series_partition.go:464 — insert
 func (p *SeriesPartition) insert(key []byte) (id uint64, offset int64, err error) {
     id = p.seq
     offset, err = p.writeLogEntry(AppendSeriesEntry(nil, SeriesEntryInsertFlag, id, key))
@@ -198,7 +299,7 @@ func (p *SeriesPartition) insert(key []byte) (id uint64, offset int64, err error
 ### 2.3 ID → 分区映射
 
 ```go
-// tsdb/series_file.go:280 — SeriesIDPartitionID
+// tsdb/series_file.go:313 — SeriesIDPartitionID
 func (f *SeriesFile) SeriesIDPartitionID(id uint64) int {
     return int((id - 1) % SeriesFilePartitionN)
 }
@@ -212,7 +313,7 @@ func (f *SeriesFile) SeriesIDPartitionID(id uint64) int {
 ### 2.4 Key → 分区映射
 
 ```go
-// tsdb/series_file.go:299 — SeriesKeyPartitionID
+// tsdb/series_file.go:333 — SeriesKeyPartitionID
 func (f *SeriesFile) SeriesKeyPartitionID(key []byte) int {
     return int(xxhash.Sum64(key) % SeriesFilePartitionN)
 }
@@ -291,15 +392,16 @@ graph LR
 
 | 序号 | Series Key | xxhash % 8 | 分区 | 分配的 ID |
 |------|-----------|------------|------|----------|
-| 1 | `cpu,host=web` | 3 | Partition 3 | ID=4 |
-| 2 | `cpu,host=db` | 1 | Partition 1 | ID=2 |
+| 1 | `cpu,host=web` | 0 | Partition 0 | ID=1 |
+| 2 | `cpu,host=db` | 4 | Partition 4 | ID=5 |
 | 3 | `mem,host=web` | 5 | Partition 5 | ID=6 |
-| 4 | `cpu,host=api` | 0 | Partition 0 | ID=1 |
-| 5 | `disk,host=web` | 2 | Partition 2 | ID=3 |
+| 4 | `cpu,host=api` | 7 | Partition 7 | ID=8 |
+| 5 | `disk,host=web` | 1 | Partition 1 | ID=2 |
 
-> **注意**: 以上 hash 值为示意。实际 xxhash 值取决于具体 key 内容。
+> 表中 hash 为 `github.com/cespare/xxhash/v2` 的 `xxhash.Sum64String(key)` 实测值
+> （`% 8` 与 `& 7` 结果相同），任意 Go 程序均可复现。
 
-每个分区的 seq 初始值为 `partitionID + 1`。假设所有 5 个 series 被并行创建（8 个 goroutine 各处理一个分区），每个分区独立分配自己的 ID。Partition 3 分配 ID=4（seq 从 4 开始），Partition 1 分配 ID=2（seq 从 2 开始），以此类推。
+每个分区的 seq 初始值为 `partitionID + 1`。假设所有 5 个 series 被并行创建（8 个 goroutine 各处理一个分区），每个分区独立分配自己的 ID：Partition 0 分配 ID=1（seq 从 1 开始），Partition 4 分配 ID=5（seq 从 5 开始），Partition 1 分配 ID=2（seq 从 2 开始），以此类推。
 
 ### 2.8 SeriesKeyPartitionID vs SeriesIDPartitionID 路由分叉
 
@@ -355,39 +457,39 @@ flowchart LR
 
 **case 说明 (同一个 series 的两条路由计算)**:
 
-假设 series key = `"cpu,host=web"`，且 `xxhash.Sum64([]byte("cpu,host=web")) % 8 == 3`，
-那么写入时它会被路由到 Partition 3。
+以 §2.7 实测的 series key = `"cpu,host=web"` 为例，`xxhash.Sum64([]byte("cpu,host=web")) % 8 == 0`，
+写入时它会被路由到 Partition 0。
 
 ```
 写入路径 (CreateSeriesListIfNotExists 调用):
   key = "cpu,host=web"
   SeriesKeyPartitionID(key):
-    h = xxhash.Sum64([]byte("cpu,host=web"))   // 例如 0x...某 64 位值
-    return int(h % 8)                           // = 3
-  → 路由到 Partition 3
-  Partition 3 此时 seq = 4 (初始 = partitionID+1 = 3+1 = 4)
+    h = xxhash.Sum64([]byte("cpu,host=web"))   // 实测 15473051847268686552
+    return int(h % 8)                           // = 0
+  → 路由到 Partition 0
+  Partition 0 此时 seq = 1 (初始 = partitionID+1 = 0+1 = 1)
   p.insert(key):
-    id = 4
-    写 SSEG: [0x01][0x0000000000000004][key bytes...]
-    p.seq += 8 → seq = 12
-  → 分配出的 series ID = 4
+    id = 1
+    写 SSEG: [0x01][0x0000000000000001][key bytes...]
+    p.seq += 8 → seq = 9
+  → 分配出的 series ID = 1
 
-验证 (id-1) % 8 == 3?
-  (4 - 1) % 8 = 3 % 8 = 3 ✓
+验证 (id-1) % 8 == 0?
+  (1 - 1) % 8 = 0 % 8 = 0 ✓
   → 与 key 路由结果一致, 这是交错分配方案 (§2.1) 保证的, 不是两个函数互逆
 
-查询/删除路径 (后续用 id=4 反查):
-  SeriesIDPartitionID(4):
-    return int((4 - 1) % 8) = 3
-  → 路由到 Partition 3 (与写入时同一个分区)
-  p.index.FindOffsetByID(4) → 返回 SSEG 偏移
+查询/删除路径 (后续用 id=1 反查):
+  SeriesIDPartitionID(1):
+    return int((1 - 1) % 8) = 0
+  → 路由到 Partition 0 (与写入时同一个分区)
+  p.index.FindOffsetByID(1) → 返回 SSEG 偏移
   → 能正确取回 key = "cpu,host=web"
 
 反例 (如果误用 SeriesKeyPartitionID 反查会怎样):
   假设有人错误地用 xxhash(id) % 8 反查分区:
-    xxhash.Sum64([]byte{0,0,0,0,0,0,0,4}) % 8   // 把 id 当 bytes
-    = 某个与 3 无关的值, 例如 5
-    → 路由到 Partition 5, FindOffsetByID(4) 返回 0
+    xxhash.Sum64([]byte{0,0,0,0,0,0,0,1}) % 8   // 把 id 当 bytes
+    = 某个与 0 无关的值, 例如 5
+    → 路由到 Partition 5, FindOffsetByID(1) 返回 0
     → 误判 series 不存在
 
   这正是源码用 (id-1) % 8 而不是 hash(id) 的原因:
@@ -403,8 +505,14 @@ flowchart LR
 
 ### 3.1 AppendSeriesKey — 序列化
 
+> **前置条件（必读）**: `tags` 必须**按 tag key 升序且无重复**。`AppendSeriesKey` 只做拼接，
+> 不排序、不去重；唯一的保证来自 `models.Tags` 的 sorted 约定（parser 的 `scanKey` 在
+> `models/points.go:550-585` 完成排序，`Tags` 的接口约定见 `models/points.go:1960`）。
+> 绕过 parser 直接调用时，`cpu,b=2,a=1` 与 `cpu,a=1,b=2` 会被编码成两个不同的 key，
+> 进而在 SeriesFile 里注册成两个 series。
+
 ```go
-// tsdb/series_file.go:312 — AppendSeriesKey
+// tsdb/series_file.go:347 — AppendSeriesKey
 func AppendSeriesKey(dst []byte, name []byte, tags models.Tags) []byte {
     buf := make([]byte, binary.MaxVarintLen64)
     origLen := len(dst)
@@ -489,7 +597,7 @@ func AppendSeriesKey(dst []byte, name []byte, tags models.Tags) []byte {
 ### 3.3 GenerateSeriesKeys — 批量序列化
 
 ```go
-// tsdb/series_file.go:491 — GenerateSeriesKeys
+// tsdb/series_file.go:541 — GenerateSeriesKeys
 func GenerateSeriesKeys(names [][]byte, tagsSlice []models.Tags) [][]byte {
     buf := make([]byte, 0, SeriesKeysSize(names, tagsSlice))
     keys := make([][]byte, len(names))
@@ -507,7 +615,7 @@ func GenerateSeriesKeys(names [][]byte, tagsSlice []models.Tags) [][]byte {
 ### 3.4 Key → 分区路由
 
 ```go
-// tsdb/series_file.go:299 — SeriesKeyPartitionID
+// tsdb/series_file.go:333 — SeriesKeyPartitionID
 func (f *SeriesFile) SeriesKeyPartitionID(key []byte) int {
     return int(xxhash.Sum64(key) % SeriesFilePartitionN)
 }
@@ -594,11 +702,19 @@ Tombstone 没有 Key 字段——只需要 ID 就够了。
 ### 4.4 ReadSeriesEntry — 解析 Entry
 
 ```go
-// tsdb/series_segment.go:415 — ReadSeriesEntry
+// tsdb/series_segment.go:426 — ReadSeriesEntry
 func ReadSeriesEntry(data []byte) (flag uint8, id uint64, key []byte, sz int64) {
+    // 空切片防御（InitForWrite 在文件刚好写满时会走到这里）
+    if len(data) <= 0 {
+        return 0, 0, nil, 1
+    }
     // If flag byte is zero then no more entries exist.
     flag, data = uint8(data[0]), data[1:]
     if !IsValidSeriesEntryFlag(flag) {
+        return 0, 0, nil, 1
+    }
+    // 剩余不足 8 字节（id 都不完整）同样视为结束
+    if len(data) < 8 {
         return 0, 0, nil, 1
     }
 
@@ -616,7 +732,7 @@ func ReadSeriesEntry(data []byte) (flag uint8, id uint64, key []byte, sz int64) 
 ### 4.5 AppendSeriesEntry — 构建 Entry
 
 ```go
-// tsdb/series_segment.go:430 — AppendSeriesEntry
+// tsdb/series_segment.go:447 — AppendSeriesEntry
 func AppendSeriesEntry(dst []byte, flag uint8, id uint64, key []byte) []byte {
     buf := make([]byte, 8)
     binary.BigEndian.PutUint64(buf, id)
@@ -638,7 +754,7 @@ func AppendSeriesEntry(dst []byte, flag uint8, id uint64, key []byte) []byte {
 ### 4.6 Segment 大小增长策略
 
 ```go
-// tsdb/series_segment.go:366 — SeriesSegmentSize
+// tsdb/series_segment.go:377 — SeriesSegmentSize
 func SeriesSegmentSize(id uint16) uint32 {
     const min = 22 // 4MB
     const max = 28 // 256MB
@@ -699,16 +815,19 @@ if s.data, err = mmap.Map(s.path, int64(SeriesSegmentSize(s.id))); err != nil {
 **InitForWrite — 扫描写入位置**:
 
 ```go
-// tsdb/series_segment.go:122 — InitForWrite
+// tsdb/series_segment.go:128 — InitForWrite
 func (s *SeriesSegment) InitForWrite() (err error) {
-    // Only calculcate segment data size if writing.
-    for s.size = uint32(SeriesSegmentHeaderSize); s.size < uint32(len(s.data)); {
-        flag, _, _, sz := ReadSeriesEntry(s.data[s.size:])
+    // 以文件头解析出的实际数据长度 s.size 为上界，而不是 mmap 的 len(s.data)：
+    // mmap 长度是 segment 的上限（4/8/…/256MB），未写满的部分全是 0。
+    var size uint32
+    for size = uint32(SeriesSegmentHeaderSize); size < s.size; {
+        flag, _, _, sz := ReadSeriesEntry(s.data[size:s.size])
         if !IsValidSeriesEntryFlag(flag) {
             break
         }
-        s.size += uint32(sz)
+        size += uint32(sz)
     }
+    s.size = size
 
     // Open file handler for writing & seek to end of data.
     if s.file, err = os.OpenFile(s.path, os.O_WRONLY|os.O_CREATE, 0666); err != nil {
@@ -1388,13 +1507,71 @@ sequenceDiagram
     end
 ```
 
+### 8.5 SeriesKey(id) — ID→key 读取链路
+
+写入时是 key→id，读取时（TSM 解码、查询结果组装、delete 过滤）要反过来走 id→key。
+
+```mermaid
+sequenceDiagram
+    participant Eng as tsm1 Engine
+    participant SF as SeriesFile
+    participant SP as SeriesPartition
+    participant SIDX as SeriesIndex(SIDX)
+    participant SSEG as SeriesSegment
+
+    Eng->>SF: SeriesKey(id)
+    SF->>SF: id == 0 → nil
+    SF->>SF: partitionID = (id-1) % 8
+    SF->>SP: partitions[partitionID].SeriesKey(id)
+    SP->>SP: RLock；closed → nil
+    SP->>SIDX: FindOffsetByID(id)
+    SIDX-->>SP: 内存 idOffsetMap 命中，或 SIDX RHH 探测命中；未命中 → 0
+    SP->>SP: seriesKeyByOffset(offset)：offset==0 → nil
+    SP->>SSEG: SplitSeriesOffset → segment.Slice(pos + SeriesEntryHeaderSize)
+    SSEG-->>SP: ReadSeriesKey(bytes) → key
+    SP-->>SF: key / nil
+    SF-->>Eng: key / nil
+```
+
+逐步骤（`tsdb/series_file.go:250-259`、`tsdb/series_partition.go:381-393`、`:518-535`、
+`tsdb/series_index.go:239-260`）：
+
+1. `SeriesFile.SeriesKey(id)`：`id == 0` 直接 nil；否则 `SeriesIDPartitionID(id) = (id-1) % 8`，
+   分区不存在（`SeriesIDPartition` 返回 nil）则 nil。
+2. `SeriesPartition.SeriesKey(id)`：`RLock`；`closed` → nil；
+   `seriesKeyByOffset(p.index.FindOffsetByID(id))`。
+3. `FindOffsetByID(id)`：先查内存 `idOffsetMap`，未命中再在 SIDX mmap 的 RHH 表里探测；
+   **它不查 `tombstones`**。
+4. `seriesKeyByOffset(0)` → nil；否则 `SplitSeriesOffset` 得到 `(segmentID, pos)`，
+   在 `p.segments` 里找到对应 segment，`segment.Slice(pos + SeriesEntryHeaderSize)`，
+   再 `ReadSeriesKey` 解出二进制 key。
+
+**三个必须写全的边界**：
+
+| 场景 | `SeriesKey(id)` | 原因 |
+|------|-----------------|------|
+| `id == 0` / 分区越界 / 分区已关闭 / `offset == 0` | nil | 显式守卫 |
+| **已 tombstone，但 SIDX 还没重写** | **仍返回原 key** | `Delete` 只写 `tombstones[id]`，不删 `idOffsetMap`/SIDX 中的 insert |
+| SIDX 重写（compact 后 `Recover`） | nil | 新 SIDX 跳过 `IsDeleted(id)` 的 insert；`Recover` 只重放 `maxOffset` 之后、且 tombstone entry 不写 offset |
+
+**#9444 的连锁反应**：`execSeriesEntry` 在 `cached=false` 时用 `f.sfile.SeriesKey(e.SeriesID)` 取 key
+（`log_file.go:700-712`）。如果 series 已被删除且服务重启，key 读不到，这条 insert entry 就被**静默跳过**——
+这正是 `seriesKey == nil { return }` 存在的原因。
+
+**案例**：`cpu,host=web` 写入分区 0，`insert` 返回 `offset = JoinSeriesOffset(0,5) = 5`，key 长 18B。
+
+1. `SeriesKey(1)`：partition 0 → `FindOffsetByID(1) = 5` → segment 0 的 `5+9=14` 处开始读 key
+   → `cpu,host=web`。
+2. `DeleteSeriesID(1, true)` 后：`SeriesKey(1)` **仍是** `cpu,host=web`（tombstones 不参与 offset 查找）。
+3. 压缩重建 SIDX 后：`FindOffsetByID(1) = 0` → `SeriesKey(1) == nil`。
+
 ## 9. SeriesPartition.CreateSeriesListIfNotExists — 批量创建
 
 ### 9.1 两阶段设计
 
 ```go
-// tsdb/series_partition.go:199 — CreateSeriesListIfNotExists
-func (p *SeriesPartition) CreateSeriesListIfNotExists(keys [][]byte, keyPartitionIDs []int, ids []uint64) error {
+// tsdb/series_partition.go:200 — CreateSeriesListIfNotExists
+func (p *SeriesPartition) CreateSeriesListIfNotExists(keys [][]byte, keyPartitionIDs []int, ids []uint64, tracker StatsTracker) error {
     var writeRequired bool
 
     // 阶段 1: 读锁快速路径
@@ -1459,6 +1636,16 @@ func (p *SeriesPartition) CreateSeriesListIfNotExists(keys [][]byte, keyPartitio
         ids[i] = id
         newIDs[string(key)] = id
         newKeyRanges = append(newKeyRanges, keyRange{id, offset})
+
+        // 统计上报（tracker 可能为 nil 字段，必须判空）
+        if tracker.AddedMeasurementSeries != nil {
+            _, remainder := ReadSeriesKeyLen(key)
+            if len(remainder) > 0 {
+                if measurement, _ := ReadSeriesKeyMeasurement(remainder); len(measurement) > 0 {
+                    tracker.AddedMeasurementSeries(measurement, 1)
+                }
+            }
+        }
     }
 
     // Flush active segment writes so we can access data in mmap.
@@ -1471,6 +1658,10 @@ func (p *SeriesPartition) CreateSeriesListIfNotExists(keys [][]byte, keyPartitio
     // Add keys to hash map(s).
     for _, keyRange := range newKeyRanges {
         p.index.Insert(p.seriesKeyByOffset(keyRange.offset), keyRange.id, keyRange.offset)
+    }
+
+    if tracker.AddedSeries != nil {
+        tracker.AddedSeries(int64(len(newKeyRanges)))
     }
 
     // Check if we've crossed the compaction threshold.
@@ -1558,7 +1749,7 @@ const DefaultSeriesPartitionCompactThreshold = 1 << 17 // 128K
 ### 10.2 Compact 流程
 
 ```go
-// tsdb/series_partition.go:528 — Compact
+// tsdb/series_partition.go:547 — Compact
 func (c *SeriesPartitionCompactor) Compact(p *SeriesPartition) error {
     // ① 快照（读锁）
     p.mu.RLock()
@@ -1627,7 +1818,7 @@ flowchart TD
 ### 10.3 compactIndexTo — 构建新索引
 
 ```go
-// tsdb/series_partition.go:568 — compactIndexTo
+// tsdb/series_partition.go:589 — compactIndexTo
 func (c *SeriesPartitionCompactor) compactIndexTo(index *SeriesIndex, seriesN uint64, segments []*SeriesSegment, path string) error {
     hdr := NewSeriesIndexHeader()
     var keyIDMap, idOffsetMap []byte
@@ -1704,7 +1895,7 @@ func (c *SeriesPartitionCompactor) compactIndexTo(index *SeriesIndex, seriesN ui
 ### 10.4 磁盘 RHH 插入
 
 ```go
-// tsdb/series_partition.go:658 — insertKeyIDMap
+// tsdb/series_partition.go:691 — insertKeyIDMap
 func (c *SeriesPartitionCompactor) insertKeyIDMap(dst []byte, capacity int64, segments []*SeriesSegment, key []byte, offset int64, id uint64) error {
     mask := capacity - 1
     hash := rhh.HashKey(key)
@@ -2009,6 +2200,33 @@ flowchart TD
 > 5. 第 1004-1005 个 entry 不存在（崩溃前未写入）
 > 6. 内存索引恢复完成，包含 1003 个 series
 
+### 11.5 损坏与降级恢复
+
+SeriesFile 的恢复策略是"能读多少读多少，读不了就整体失败"，没有校验和，也没有冗余副本。
+
+| 故障 | 行为 | 源码 |
+|------|------|------|
+| SSEG magic 不是 `SSEG` | `ErrInvalidSeriesSegment`，分区 Open 失败 | `series_segment.go:399-408` |
+| SSEG version != 1 | `ErrInvalidSeriesSegmentVersion`，分区 Open 失败 | `series_segment.go:105-113` |
+| SSEG 尾部半条 entry | `ReadSeriesEntry` 返回 flag=0 → `InitForWrite` 在此截断，`s.size` 设为最后一条完整 entry 的末尾 | `series_segment.go:128-145`、`:426-446` |
+| SIDX 不存在 | `os.Stat` 得到 `IsNotExist`，跳过 mmap；`maxOffset=0`，`Recover` 从所有 segment 的第一条 entry 全量重放 | `series_index.go:63-82`、`:110-134` |
+| SIDX magic/version/短读失败 | `ReadSeriesIndexHeader` 返回错误 → `idx.Close()` → 分区 Open 失败 | `series_index.go:70-95`、`:296-330` |
+| 分区 Open 失败 | `SeriesFile.Open` 调 `f.close()` 关闭已打开的分区后返回错误；不做"跳过坏分区"的降级 | `series_file.go:94-106` |
+
+**临时文件的语义**：
+
+- `CreateSeriesSegment` 先写 `<name>.initializing`（写头 + `Truncate` 到 segment 上限 + `Sync`），
+  再 `os.Rename` 成正式文件名（`series_segment.go:58-85`）。崩溃留下的 `.initializing` 文件不会被
+  `openSegments` 识别（`ParseSeriesSegmentFilename` 用 `strconv.ParseUint(name, 16, 32)`，含 `.` 的名称
+  解析失败；4 位十六进制约束在 `IsValidSeriesSegmentFilename` 的正则 `^[0-9a-f]{4}$`，
+  `series_segment.go:363-373`），因而不参与映射。
+- 压缩器写 `<index>.compacting`，成功后 `os.Rename` 覆盖 `<index>`（`series_partition.go:556-578`）。
+  崩溃留下的 `.compacting` 同样是垃圾文件，下次压缩会重新创建并覆盖。
+
+**没有 checksum 的代价**：SSEG entry 只有 flag + id + key，没有 CRC。若磁盘在 key 中间翻转一位，
+`ReadSeriesKey` 的 `uvarint` 长度可能仍然自洽，于是产生一个**内容错误但结构合法**的 series key，
+只能靠上层（TSI/查询结果异常）发现。这与 LogFile 的 CRC32 校验形成对比（D02 §4.4）。
+
 ## 12. Tombstone 删除机制
 
 ### 12.1 DeleteSeriesID
@@ -2053,10 +2271,11 @@ func (p *SeriesPartition) DeleteSeriesID(id uint64, flush bool) error {
 
 **关键点**:
 - Tombstone entry 只有 9 字节：1B flag (0x02) + 8B ID，没有 key
-- 写入 SSEG 后立即 flush，然后在内存中标记
+- 写入后只有 `flush=true` 才调用 `segment.Flush()`（fsync）；否则 entry 只进 bufio 缓冲、崩溃可能丢失，
+  之后才在内存中标记（`series_partition.go:353-363`）
 - `Delete` 调用 `execEntry(SeriesEntryTombstoneFlag, ...)` 将 ID 加入 `tombstones` map
 
-### 12.2 删除 → 压缩清理流程图
+### 12.2 删除 → SIDX 压缩清理流程图
 
 ```mermaid
 sequenceDiagram
@@ -2085,17 +2304,31 @@ sequenceDiagram
 
 ```
 WritePoints(points, tracker)
-  → Shard.validateSeriesAndFields(points)
-    → Engine.CreateSeriesListIfNotExists(keys, names, tags)
-      → SeriesFile.CreateSeriesListIfNotExists(names, tagsSlice)
+  → Shard.validateSeriesAndFields(points)                     // shard.go:613
+    → Engine.CreateSeriesListIfNotExists(keys, names, tags)    // engine.go:1945
+      → Index.CreateSeriesListIfNotExists                      // tsi1/index.go:646（按 partitionIdx 分组并发）
+        → Partition.createSeriesListIfNotExists                // partition.go:720（seriesIDSet 去重）
+          → LogFile.AddSeriesList                              // log_file.go:525（写 WAL entry）
+            → SeriesFile.CreateSeriesListIfNotExists           // series_file.go:178（8 分区 fan-out）
 ```
+
+每层职责：
+
+| 层 | 职责 | 源码 |
+|----|------|------|
+| Shard | 校验 tag/field、丢弃非法点 | `tsdb/shard.go:613-760` |
+| Engine | 纯委托给 `e.index` | `tsdb/engine/tsm1/engine.go:1945-1947` |
+| TSI Index | 按 `partitionIdx` 把 key 分组，用 goroutine 池并发处理各分区 | `tsdb/index/tsi1/index.go:646-679` |
+| Partition | 空批/长度守卫 + `RetainFileSet` + `LogFile.AddSeriesList` + `CheckLogFile` | `tsdb/index/tsi1/partition.go:720-749` |
+| LogFile | `seriesIDSet` 去重、追加 WAL entry、更新内存索引、`FlushAndSync` | `tsdb/index/tsi1/log_file.go:525-575` |
+| SeriesFile | 按 `SeriesKeyPartitionID` 再分 8 个分区，`errgroup` 并发 | `tsdb/series_file.go:178-200` |
 
 **Step 2: 路由到分区**
 
 ```go
 key := AppendSeriesKey(nil, []byte("cpu"), models.Tags{{Key: []byte("host"), Value: []byte("web")}})
-// 假设 xxhash.Sum64(key) % 8 = 3
-partitionID := 3
+// 实测 xxhash.Sum64(key) % 8 = 0（见 §2.7）
+partitionID := 0
 ```
 
 **Step 3: Phase 1 — 读锁检查**
@@ -2114,29 +2347,32 @@ p.mu.RUnlock()
 p.mu.Lock()
 // 双重检查：id == 0
 id, offset, err := p.insert(key)
-// id = p.seq = 4 (Partition 3, seq 从 4 开始)
-// p.seq += 8 → p.seq = 12
-// 写入 SSEG: [0x01][0x0000000000000004][key bytes...]
-ids[i] = 4
+// id = p.seq = 1 (Partition 0, seq 从 1 开始)
+// p.seq += 8 → p.seq = 9
+// 写入 SSEG: [0x01][0x0000000000000001][key bytes...]
+ids[i] = 1
 ```
 
 **Step 5: 更新内存索引**
 
 ```go
 segment.Flush()
-p.index.Insert(key, 4, offset)
-// keyIDMap.Put(key, 4)
-// idOffsetMap[4] = offset
+p.index.Insert(key, 1, offset)
+// keyIDMap.Put(key, 1)
+// idOffsetMap[1] = offset
 ```
 
 **Step 6: 查询**
 
 ```go
 // SELECT value FROM cpu WHERE host='web'
-// TSI Index 查找 → SeriesID = 4
-// SeriesFile.SeriesKey(4) → "cpu,host=web"
+// TSI Index 查找 → SeriesID = 1
+// SeriesFile.SeriesKey(1) → "cpu,host=web"
 // TSM 读取路径通过 tsm1.SeriesFieldKeyBytes(seriesKey, field) 生成 composite key
-// FileStore.KeyCursor(ctx, tsm1.SeriesFieldKeyBytes(seriesKey, []byte("value")), ...)
+// 注意第二参是 string，不是 []byte（tsdb/engine/tsm1/engine.go:3581）
+// FileStore.KeyCursor(ctx, key, t, ascending) 四个参数都不能省（file_store.go:839）
+// key := tsm1.SeriesFieldKeyBytes(string(seriesKey), "value")
+// cur := e.FileStore.KeyCursor(ctx, key, math.MaxInt64, true)
 ```
 
 **Step 7: 后续更多 series → 压缩**
@@ -2153,19 +2389,19 @@ InMemCount() >= 128K → 触发压缩
 **Step 8: 删除**
 
 ```go
-DeleteSeriesID(4, flush)
-// 写入 SSEG: [0x02][0x0000000000000004] (9 字节)
-// tombstones[4] = struct{}{}
-// 后续 FindIDBySeriesKey → IsDeleted(4) → true → 返回 0
+DeleteSeriesID(1, flush)
+// 写入 SSEG: [0x02][0x0000000000000001] (9 字节)
+// tombstones[1] = struct{}{}
+// 后续 FindIDBySeriesKey → IsDeleted(1) → true → 返回 0
 ```
 
 **Step 9: 下次压缩清理**
 
 ```
 // 压缩时：
-// Entry: Insert ID=4 → IsDeleted(4) → true → 跳过
-// Entry: Tombstone ID=4 → flag==Tombstone → 跳过
-// ID=4 彻底从新 SIDX 中消失
+// Entry: Insert ID=1 → IsDeleted(1) → true → 跳过
+// Entry: Tombstone ID=1 → flag==Tombstone → 跳过
+// ID=1 彻底从新 SIDX 中消失
 ```
 
 ### 13.2 生命周期图
@@ -2174,35 +2410,35 @@ DeleteSeriesID(4, flush)
 sequenceDiagram
     participant W as 写入请求
     participant SF as SeriesFile
-    participant P3 as Partition 3
+    participant P0 as Partition 0
     participant SSEG as SSEG Segment
     participant IDX as SeriesIndex
 
     W->>SF: CreateSeriesListIfNotExists(["cpu"], [host=web])
-    SF->>SF: xxhash(key) % 8 = 3
-    SF->>P3: CreateSeriesListIfNotExists
+    SF->>SF: xxhash(key) % 8 = 0
+    SF->>P0: CreateSeriesListIfNotExists
 
-    Note over P3: Phase 1: RLock
-    P3->>IDX: FindIDBySeriesKey(key)
-    IDX-->>P3: 0 (不存在)
-    Note over P3: RUnlock, writeRequired=true
+    Note over P0: Phase 1: RLock
+    P0->>IDX: FindIDBySeriesKey(key)
+    IDX-->>P0: 0 (不存在)
+    Note over P0: RUnlock, writeRequired=true
 
-    Note over P3: Phase 2: Lock
-    P3->>P3: insert(key)
-    P3->>SSEG: WriteLogEntry(Insert, ID=4, key)
-    P3->>IDX: Insert(key, 4, offset)
-    P3->>IDX: Flush
+    Note over P0: Phase 2: Lock
+    P0->>P0: insert(key)
+    P0->>SSEG: WriteLogEntry(Insert, ID=1, key)
+    P0->>IDX: Insert(key, 1, offset)
+    P0->>IDX: Flush
 
-    Note over P3: ... 128K entries later ...
-    P3->>P3: 触发压缩 (异步)
-    Note over P3: 快照 → 构建 → 交换
+    Note over P0: ... 128K entries later ...
+    P0->>P0: 触发压缩 (异步)
+    Note over P0: 快照 → 构建 → 交换
 
-    W->>SF: DeleteSeriesID(4, flush)
-    SF->>P3: DeleteSeriesID(4, flush)
-    P3->>SSEG: WriteLogEntry(Tombstone, ID=4)
-    P3->>IDX: Delete(4) → tombstones[4] = {}
+    W->>SF: DeleteSeriesID(1, flush)
+    SF->>P0: DeleteSeriesID(1, flush)
+    P0->>SSEG: WriteLogEntry(Tombstone, ID=1)
+    P0->>IDX: Delete(1) → tombstones[1] = {}
 
-    Note over P3: 下次压缩时 ID=4 被清理
+    Note over P0: 下次压缩时 ID=1 被清理
 ```
 
 ## 14. 架构设计意图
@@ -2245,7 +2481,10 @@ sequenceDiagram
 
 ### 14.7 为什么 128K 压缩阈值
 
-- **内存平衡**: 128K 个 entry 在内存中约占 128K * 16B = 2MB（idOffsetMap）+ keyIDMap 开销
+- **内存平衡**: 128K × 16B = 2MB 只是 `idOffsetMap`（`map[uint64]int64`）**裸数据的下界**；
+  Go map 的桶/溢出桶/装载因子，加上 `keyIDMap`（`rhh.HashMap` 的 `hashes`/`hashElem`）与 key 副本，
+  会显著放大这个数字（`tsdb/series_index.go:145-170`、`pkg/rhh/rhh.go:13-23`、`:206-210`）。
+  如需给出倍数，必须附 `runtime.MemStats` 或 benchmark，本文不写经验倍数。
 - **压缩频率**: 不会太频繁（每次压缩有 I/O 开销），也不会太久（内存占用过高）
 - **经验值**: 128K 是在内存使用和压缩开销之间的经验值
 
@@ -2259,7 +2498,7 @@ sequenceDiagram
 | **崩溃恢复** | SSEG append-only + maxOffset 机制，重启后只需重放少量 entry |
 | **空间效率** | 90% 负载因子 RHH，交错 ID 无浪费 |
 | **压缩效率** | 异步压缩，快照+交换，最小化锁持有时间 |
-| **删除效率** | Tombstone 标记 O(1)，压缩时批量清理 |
+| **删除效率** | Tombstone 标记 O(1)，压缩时从 SIDX 移除（SSEG 不回收） |
 
 ## 16. 潜在隐患与瓶颈
 
@@ -2281,7 +2520,12 @@ SSEG 中的 entry 是原始字节，没有压缩。对于大量相似的 series 
 
 ### 16.5 Tombstone 累积
 
-删除操作只写入 9 字节的 tombstone entry，但被删除 series 的 Insert entry 仍然占据空间。只有在压缩时才会清理。如果删除速率很高，SSEG 文件会快速膨胀。
+删除操作只写入 9 字节的 tombstone entry，但被删除 series 的 Insert entry 仍然占据空间，且**永远不会被运行时压缩回收**（运行时压缩只重建 SIDX，见 §10 / D02 §4.3）。
+
+关于"文件膨胀"要区分两件事：
+
+- segment 在**创建时**就 `Truncate` 到 `SeriesSegmentSize(id)` 的固定上限（4/8/…/256MB，`tsdb/series_segment.go:60-85`）。删除不会让任何文件变大，只会让写入更早轮转到下一个 segment。
+- 已有 SSEG 里的 Insert entry 只能由离线工具 `influx_inspect buildtsi` 调用 `SeriesSegment.CompactToPath`（`series_segment.go:280`）重写；在线进程不做这件事。
 
 ### 16.6 Phase 2 的 O(n) 查找
 
@@ -2289,7 +2533,9 @@ SSEG 中的 entry 是原始字节，没有压缩。对于大量相似的 series 
 
 ### 16.7 SIDX Header 固定字段大小
 
-SIDX header 使用 8 字节字段存储 count 和 capacity。对于超大部署（数十亿 series），这些字段不会溢出（uint64 最大 1.8e19），但 RHH 表的 capacity 如果接近 2^63，`pow2()` 函数会 panic。
+SIDX header 用 8 字节字段存 count/capacity，uint64 本身不会在数十亿 series 时溢出。真正会先撞到的是 **`SeriesIDSet` 的 uint32 上限**（roaring bitmap，约 5.36e8 个 series 后 ID 会被 `uint32(id)` 截断，见 D02 §8.4）。
+
+`pow2()` 的 panic 阈值也要纠正：循环上界写死为 `i < 1<<62`，所以当 `v > 2^61` 时循环结束并 `panic("unreachable")`（`pkg/rhh/rhh.go:262-271`），**不是 2^63**。
 
 ## 17. 关键文件索引
 

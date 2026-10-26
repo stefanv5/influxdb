@@ -16,6 +16,8 @@
 sequenceDiagram
     participant Client as 写入客户端
     participant HTTP as HTTP Handler
+    participant PW as PointsWriter
+    participant Store as Store
     participant Point as models.Point
     participant Shard as Shard
     participant Engine as TSM1 Engine
@@ -25,7 +27,10 @@ sequenceDiagram
 
     Client->>HTTP: POST /write?db=mydb&rp=autogen
     HTTP->>HTTP: 1 解析 Line Protocol -> []models.Point
-    HTTP->>Shard: 2 Shard.WritePoints(points, tracker)
+    HTTP->>PW: 2 WritePointsPrivileged(writeCtx, ...)
+    PW->>PW: 2a MapShards → 每个 shard 一个 goroutine
+    PW->>Store: 2b WriteToShard(writeCtx, shardID, points)
+    Store->>Shard: 2c epoch guard → Shard.WritePoints(points, tracker)
     Shard->>Shard: 3 validateSeriesAndFields<br/>字段类型/series 校验
     Shard->>Shard: 4 saveFieldsAndMeasurements<br/>保存字段与 measurement 元数据
     Shard->>Engine: 5 Engine.WritePoints(points, tracker)
@@ -59,7 +64,7 @@ sequenceDiagram
 #### 步骤 1: Line Protocol 解析
 
 ```go
-// models/points.go:1630 — MakeKey
+// models/points.go:1641 — MakeKey
 func MakeKey(name []byte, tags Tags) []byte {
     // 格式: "measurement,tag1=val1,tag2=val2"
     // tags 按字典序排列
@@ -106,7 +111,7 @@ func (p *point) Key() []byte {
 **models.Point 内部结构**:
 
 ```go
-// models/points.go:221 — point (未导出)
+// models/points.go:228 — point (未导出)
 type point struct {
     time          time.Time
     key           []byte                    // "measurement,tag1=val1,tag2=val2"
@@ -119,11 +124,44 @@ type point struct {
 }
 ```
 
+#### 步骤 2a–2e: PointsWriter → Store → Shard（HTTP 与 Shard 之间的两层）
+
+真实调用链比总览图多两层，而且一条请求会按 shard 拆成多路并发写入：
+
+```mermaid
+flowchart TD
+    H["HTTP Handler"] --> P["PointsWriter.WritePointsPrivileged<br/>points_writer.go:474"]
+    P --> M["MapShards()<br/>points_writer.go:486"]
+    M --> G["每个 shard 一个 goroutine<br/>points_writer.go:494-506"]
+    G --> W["writeToShard()<br/>points_writer.go:545"]
+    W --> S["Store.WriteToShard(writeCtx, shardID, points)<br/>store.go:1861"]
+    S --> E["epoch.StartWrite() + guard.Wait()<br/>store.go:1882-1891"]
+    E --> I["sh.IsIdle() → SetCompactionsEnabled(true)<br/>store.go:1894-1896"]
+    I --> SP["Shard.WritePoints(points, tracker)<br/>store.go:1898"]
+```
+
+- **每 shard 一个 goroutine，首个错误即返回**：`WritePointsPrivileged` 用 `chan error` 收集，任一 shard 返回非 nil 立即返回（`points_writer.go:494-510`），其余 goroutine 不会被取消；整体还受 `w.WriteTimeout` 约束，超时返回 `ErrTimeout`（`points_writer.go:512-537`）。
+- **ErrShardNotFound 重试一次**：`writeToShard` 在 `WriteToShard` 返回 `tsdb.ErrShardNotFound` 时先 `CreateShard(database, retentionPolicy, shard.ID, true)`，再重写一次（`points_writer.go:551-562`）。
+- **epoch guard**：`Store.WriteToShard` 先 `epoch.StartWrite()`，对每个返回的 guard 调用 `guard.Wait()`，等待进行中的 drop/snapshot 完成后再写（`store.go:1882-1891`），末尾 `defer epoch.EndWrite(gen)`。
+- **冷 shard 被写路径顺手唤醒**：`if isIdle, _ := sh.IsIdle(); isIdle { sh.SetCompactionsEnabled(true) }`（`store.go:1894-1896`）。
+- **WriteContext 只服务统计**：`WriteContext` 当前只有 `UserId`（`store.go:1855-1859`），只在 `s.statsTracker(sh.database, sh.retentionPolicy, writeCtx.UserId)` 处被消费（`store.go:1898`）。`Store.WriteToShard`、`Shard.WritePoints`、`Engine.WritePoints` 都**没有** `context.Context` 形参，因此不存在"可取消的写路径"。
+
 #### 步骤 3-5: Shard.WritePoints — 字段元数据校验与保存
 
 ```go
-// tsdb/shard.go — WritePoints
+// tsdb/shard.go:562-609 — WritePoints
 func (s *Shard) WritePoints(points []models.Point, tracker StatsTracker) error {
+    s.mu.RLock()
+    defer s.mu.RUnlock()
+
+    engine, err := s.engineNoLock()
+    if err != nil {
+        return err
+    }
+
+    var writeError error
+    atomic.AddInt64(&s.stats.WriteReq, 1)
+
     points, fieldsToCreate, err := s.validateSeriesAndFields(points, tracker)
     if err != nil {
         if _, ok := err.(PartialWriteError); !ok {
@@ -139,9 +177,23 @@ func (s *Shard) WritePoints(points []models.Point, tracker StatsTracker) error {
         atomic.AddInt64(&s.stats.FieldsCreated, int64(numFieldsCreated))
     }
 
+    // 包装 tracker: 先转发外层 AddedPoints，再累加本 shard 的统计。
+    engineTracker := tracker
+    engineTracker.AddedPoints = func(points, values int64) {
+        if tracker.AddedPoints != nil {
+            tracker.AddedPoints(points, values)
+        }
+        atomic.AddInt64(&s.stats.WritePointsOK, points)
+        atomic.AddInt64(&s.stats.WriteValuesOK, values)
+    }
+
     if err := engine.WritePoints(points, engineTracker); err != nil {
+        atomic.AddInt64(&s.stats.WritePointsErr, int64(len(points)))
+        atomic.AddInt64(&s.stats.WriteReqErr, 1)
         return fmt.Errorf("engine: %w", err)
     }
+
+    atomic.AddInt64(&s.stats.WriteReqOK, 1)
     return writeError
 }
 ```
@@ -151,11 +203,12 @@ func (s *Shard) WritePoints(points []models.Point, tracker StatsTracker) error {
 #### 步骤 6-9: Engine.WritePoints — Point 到 Value 的转换
 
 ```go
-// tsdb/engine/tsm1/engine.go — WritePoints
+// tsdb/engine/tsm1/engine.go:1346 — WritePoints
 func (e *Engine) WritePoints(points []models.Point, tracker tsdb.StatsTracker) error {
     values := make(map[string][]Value, len(points))
     var keyBuf []byte
     var seriesErr error
+    var npoints, nvalues int64
 
     for _, p := range points {
         // 步骤 3: 构建 composite key
@@ -165,6 +218,9 @@ func (e *Engine) WritePoints(points []models.Point, tracker tsdb.StatsTracker) e
 
         iter := p.FieldIterator()  // 零分配的字段迭代器
         t := p.Time().UnixNano()
+
+        npoints++
+        var nValuesForPoint int64
 
         // 步骤 4: 遍历每个 field
         for iter.Next() {
@@ -178,24 +234,19 @@ func (e *Engine) WritePoints(points []models.Point, tracker tsdb.StatsTracker) e
             // 默认为 nil，此分支不会执行
             if e.seriesTypeMap != nil {
                 if v, ok := e.seriesTypeMap.Get(keyBuf); !ok {
-                    // Key 不在 map 中: 检查引擎中是否已有此 key 的类型
                     if typ, err := e.Type(keyBuf); err != nil {
                         // 类型未知，可以尝试插入
                     } else if typ != iter.Type() {
-                        // 引擎中已有不同类型，冲突
                         seriesErr = tsdb.ErrFieldTypeConflict
                         e.seriesTypeMap.Insert(keyBuf, int(typ))
                         continue
                     }
-                    // 尝试插入新类型
                     vv, ok := e.seriesTypeMap.Insert(keyBuf, int(iter.Type()))
                     if !ok || vv != int(iter.Type()) {
-                        // 插入失败且已有类型不匹配，冲突
                         seriesErr = tsdb.ErrFieldTypeConflict
                         continue
                     }
                 } else if v != int(iter.Type()) {
-                    // Key 存在但类型不匹配，冲突
                     seriesErr = tsdb.ErrFieldTypeConflict
                     continue
                 }
@@ -222,9 +273,17 @@ func (e *Engine) WritePoints(points []models.Point, tracker tsdb.StatsTracker) e
                 bv, err := iter.BooleanValue()
                 if err != nil { return err }
                 v = NewBooleanValue(t, bv)
+            default:
+                return fmt.Errorf("unknown field type for %s: %s", string(iter.FieldKey()), p.String())
             }
 
+            nValuesForPoint++
             values[string(keyBuf)] = append(values[string(keyBuf)], v)
+        }
+
+        nvalues += nValuesForPoint
+        if tracker.AddedMeasurementPoints != nil {
+            tracker.AddedMeasurementPoints(models.ParseName(keyBuf), 1, nValuesForPoint)
         }
     }
 
@@ -244,6 +303,9 @@ func (e *Engine) WritePoints(points []models.Point, tracker tsdb.StatsTracker) e
         }
     }
 
+    if tracker.AddedPoints != nil {
+        tracker.AddedPoints(npoints, nvalues)
+    }
     return seriesErr
 }
 ```
@@ -291,7 +353,7 @@ type FieldIterator interface {
 #### 步骤 7-11: Cache.WriteMulti — 16 分区并发写入
 
 ```go
-// tsdb/engine/tsm1/cache.go:320 — WriteMulti
+// tsdb/engine/tsm1/cache.go:319-371 — WriteMulti
 func (c *Cache) WriteMulti(values map[string][]Value) error {
     c.init()  // 懒初始化 ring store
 
@@ -301,29 +363,47 @@ func (c *Cache) WriteMulti(values map[string][]Value) error {
         addedSize += uint64(Values(v).Size())
     }
 
-    limit := c.maxSize
+    limit := c.maxSize // maxSize 读取无需加锁
     n := c.Size() + addedSize  // Size() = size + snapshotSize
     if limit > 0 && n > limit {
+        atomic.AddInt64(&c.stats.WriteErr, 1)
         return ErrCacheMemorySizeLimitExceeded(n, limit)
         // 没有驱逐! 直接拒绝写入!
     }
 
-    // 步骤 9: 乐观增加 size (原子操作)
+    // 步骤 9: 先取出 store 引用 (只有 RLock)，随后乐观增加 size
+    c.mu.RLock()
+    store := c.store
+    c.mu.RUnlock()
+
     c.increaseSize(addedSize)
 
     // 步骤 10: 写入 ring 分区
-    c.mu.RLock()
-    store := c.store  // 快照 store 引用
-    c.mu.RUnlock()
-
     var werr error
     for k, v := range values {
-        newKey, err := store.write([]byte(k), v)
+        newKey, err := store.write(k, v)   // k 本身就是 string，不再做 []byte 转换
         if err != nil {
             werr = err
+            addedSize -= uint64(Values(v).Size())
             c.decreaseSize(uint64(Values(v).Size()))
         }
+        if newKey {                       // 新 key 还要为 map key 记账
+            addedSize += uint64(len(k))
+            c.increaseSize(uint64(len(k)))
+        }
     }
+
+    // 步骤 11: 统计与 lastWriteTime
+    if werr != nil {
+        atomic.AddInt64(&c.stats.WriteDropped, 1)
+        atomic.AddInt64(&c.stats.WriteErr, 1)
+    }
+    c.updateMemSize(int64(addedSize))
+    atomic.AddInt64(&c.stats.WriteOK, 1)
+
+    c.mu.Lock()
+    c.lastWriteTime = time.Now()
+    c.mu.Unlock()
 
     return werr
 }
@@ -340,12 +420,12 @@ const partitions = 16  // ring 支持的最大分区数 (并非实际使用数)
 // tsdb/engine/tsm1/cache.go:22 — 实际使用的分区数
 const ringShards = 16  // 默认使用 16 个分区
 
-// tsdb/engine/tsm1/ring.go:34 — ring
+// tsdb/engine/tsm1/ring.go:32 — ring
 type ring struct {
     partitions []*partition  // len = n；Cache 默认传入 ringShards=16
 }
 
-// tsdb/engine/tsm1/ring.go:86 — getPartition
+// tsdb/engine/tsm1/ring.go:79 — getPartition
 func (r *ring) getPartition(key []byte) *partition {
     h := xxhash.Sum64(key)
     return r.partitions[h%uint64(len(r.partitions))]
@@ -359,7 +439,7 @@ func (r *ring) getPartition(key []byte) *partition {
 > 因此 `n=3`、`n=15`、`n=32` 都会失败。Cache 固定使用 16（2 的幂）。
 
 ```go
-// tsdb/engine/tsm1/ring.go:237 — partition.write
+// tsdb/engine/tsm1/ring.go:227 — partition.write
 func (p *partition) write(key []byte, values Values) (bool, error) {
     // 热路径: RLock 检查 entry 是否存在
     p.mu.RLock()
@@ -427,6 +507,8 @@ func (e *entry) add(values []Value) error {
     return nil
 }
 ```
+
+**已知边界（代码缺陷，不是设计保证）**：`valueType` 没有覆盖 `UnsignedValue`（`cache.go:798-812` 的 `default: return 0`），所以 unsigned entry 的 `vtype` 始终是 0，`entry.add` 里 `if e.vtype != 0` 的类型守卫被整体跳过。触发链：`fields.idx` 打开失败只 Warn 后继续（`engine.go:779-787`）→ WAL 重放 unsigned 值后 `vtype` 停在 0 → 再写同 field 的 float 不会被拦截 → snapshot 时 `encodeUnsignedBlockUsing` 的 `v.(UnsignedValue)` 断言 panic（`encoding.go:740-752`）。正常路径由 Shard 的字段元数据校验兜住，所以这是元数据损坏场景下的缺陷。
 
 > **小白解释**: Cache 就像一个有 16 个抽屉的大柜子。每个 key 通过哈希决定放进哪个抽屉。
 > 不同抽屉可以同时操作（并发），但同一个抽屉内要排队（锁）。
@@ -579,7 +661,7 @@ func (l *WAL) rollSegment() {
     }
 }
 
-// tsdb/engine/tsm1/wal.go:560 — newSegmentFile
+// tsdb/engine/tsm1/wal.go:561 — newSegmentFile
 func (l *WAL) newSegmentFile() error {
     l.currentSegmentID++
     fileName := filepath.Join(l.path, fmt.Sprintf("%s%05d.%s",
@@ -663,11 +745,11 @@ syncDelay time.Duration
 ```mermaid
 flowchart TD
     subgraph "WAL Segment 文件格式"
-        A["Header: Type(1B) + Length(4B)"] --> B["Compressed Payload (Snappy)"]
+        A["Segment Entry Header:<br/>WalEntryType(1B): 1=Write, 2=Delete, 3=DeleteRange<br/>Compressed Length(4B，压缩后长度)"] --> B["Compressed Payload (Snappy)"]
     end
 
-    subgraph "WriteWALEntry 编码 (压缩前)"
-        C["Type: 1B (1=Write, 2=Delete, 3=DeleteRange)"]
+    subgraph "WriteWALEntry 编码 (压缩前；每个 key 前 1B 值类型)"
+        C["Value Type: 1B<br/>1=Float, 2=Integer, 3=Boolean, 4=String, 5=Unsigned"]
         C --> D["Key Len: 2B"]
         D --> E["Key: NB (如 'cpu,host=web#!~#value')"]
         E --> F["Count: 4B (值的数量)"]
@@ -713,7 +795,7 @@ func (e *Engine) ShouldCompactCache(t time.Time) bool {
     if sz > e.CacheFlushMemorySizeThreshold {
         return true
     }
-    // 条件 3: 写入冷超过时长 (默认 1s)
+    // 条件 3: 写入冷超过时长 (默认 10m，仅在未达 25MB 阈值时生效)
     // 注意: 使用 e.Cache.LastWriteTime() 而非 e.lastWriteTime
     return t.Sub(e.Cache.LastWriteTime()) > e.CacheFlushWriteColdDuration
 }
@@ -722,8 +804,10 @@ func (e *Engine) ShouldCompactCache(t time.Time) bool {
 **Snapshot 流程**:
 
 ```go
-// tsdb/engine/tsm1/cache.go:376 — Snapshot
+// tsdb/engine/tsm1/cache.go:375-421 — Snapshot
 func (c *Cache) Snapshot() (*Cache, error) {
+    c.init()
+
     c.mu.Lock()
     defer c.mu.Unlock()
 
@@ -732,6 +816,16 @@ func (c *Cache) Snapshot() (*Cache, error) {
         return nil, ErrSnapshotInProgress
     }
     c.snapshotting = true
+    c.snapshotAttempts++
+
+    // 懒创建 snapshot Cache（首次调用时 c.snapshot 为 nil）
+    if c.snapshot == nil {
+        store, err := newring(ringShards)
+        if err != nil {
+            return nil, err
+        }
+        c.snapshot = &Cache{store: store}
+    }
 
     // 如果上次 snapshot 失败且有数据，返回旧 snapshot 重试
     if c.snapshot.Size() > 0 {
@@ -748,10 +842,16 @@ func (c *Cache) Snapshot() (*Cache, error) {
 
     c.store.reset()
     atomic.StoreUint64(&c.size, 0)  // 原子操作重置 live cache 大小
+    c.lastSnapshot = time.Now()
+
+    c.updateCachedBytes(snapshotSize)
+    c.updateSnapshots()
 
     return c.snapshot, nil
 }
 ```
+
+> 注意顺序：`c.init()`、`snapshotAttempts++` 与懒创建 `c.snapshot` 都必须在访问 `c.snapshot.Size()` **之前**完成；否则首次快照会在 nil 指针上调用 `Size()` 直接 panic。
 
 > **小白解释**: Snapshot 就像"拍照"——把当前暂存区的数据冻结起来，然后清空暂存区继续接新货。
 > 关键技巧：不是复制数据，而是直接**交换两个柜子的指针**（O(1) 操作，极快）。
@@ -870,7 +970,7 @@ BlockUnsigned = byte(4)
 ### 2.3 Values 集合操作
 
 ```go
-// tsdb/engine/tsm1/encoding.gen.go:26 — Values
+// tsdb/engine/tsm1/encoding.gen.go:17 — Values
 type Values []Value
 
 // tsdb/engine/tsm1/encoding.gen.go:36 — Size
@@ -882,11 +982,11 @@ func (a Values) Size() int {
     return sz
 }
 
-// tsdb/engine/tsm1/encoding.gen.go:70 — Deduplicate
+// tsdb/engine/tsm1/encoding.gen.go:61 — Deduplicate
 func (a Values) Deduplicate() Values {
-    // 排序 (按时间戳)
-    // 去重: 相同时间戳保留最后一个
-    // 返回新切片
+    // 已排序且无重复时直接返回原切片 (零分配)
+    // 否则原地 sort.Stable(a)，再就地压缩重复项 (相同时间戳保留最后一个)
+    // 返回 a[:i+1] —— 与原切片共享底层数组，不是"新切片"
 }
 ```
 
@@ -945,8 +1045,14 @@ Version     byte   = 1
 ```go
 // tsdb/engine/tsm1/encoding.go:943 — packBlock
 func packBlock(buf []byte, typ byte, ts []byte, values []byte) []byte {
+    sz := 1 + binary.MaxVarintLen64 + len(ts) + len(values)
+    if cap(buf) < sz {
+        buf = make([]byte, sz)
+    }
+    b := buf[:sz]
     b[0] = typ                           // 字节 0: block 类型
-    i := binary.PutUvarint(b[1:], uint64(len(ts)))  // varint: 时间戳块长度
+    i := binary.PutUvarint(b[1:1+binary.MaxVarintLen64], uint64(len(ts)))
+    i += 1                               // 跳过 type 字节
     copy(b[i:], ts)                      // 时间戳压缩字节
     copy(b[i+len(ts):], values)          // 值压缩字节 (无长度前缀)
     return b[:i+len(ts)+len(values)]
@@ -967,7 +1073,7 @@ func packBlock(buf []byte, typ byte, ts []byte, values []byte) []byte {
 **IndexEntry (28 字节)**:
 
 ```go
-// tsdb/engine/tsm1/writer.go:179 — IndexEntry
+// tsdb/engine/tsm1/writer.go:180 — IndexEntry
 type IndexEntry struct {
     MinTime int64   // 8 字节
     MaxTime int64   // 8 字节
@@ -1006,13 +1112,13 @@ flowchart TD
     A["压缩算法选择"] --> B{"数据类型?"}
     B -->|"Float"| C["Gorilla XOR 编码"]
     B -->|"Integer/Unsigned"| D["Delta + ZigZag + Simple8b/RLE"]
-    B -->|"Timestamp"| E["Delta + Scale + Simple8b/RLE"]
+    B -->|"Timestamp"| E["Delta + 10 的幂缩放 + Simple8b/RLE"]
     B -->|"Boolean"| F["位打包 (1 bit/值)"]
     B -->|"String"| G["Snappy 压缩"]
 
     C --> H["首值: 64 bits 原始<br>后续: 0-bit (相同) / 1+leading+trailing (不同)"]
     D --> I["差值 → ZigZag 编码 → Simple8b 打包"]
-    E --> J["时间差值 → 缩放到纳秒 → Simple8b 打包"]
+    E --> J["差值 ÷ 10 的幂（缩小）→ Simple8b 打包"]
 ```
 
 **Gorilla XOR 编码示例**:
@@ -1045,18 +1151,21 @@ flowchart TD
 ### 4.1 tsmWriter.Write — 逐步写入
 
 ```go
-// tsdb/engine/tsm1/writer.go:592 — tsmWriter.Write
+// tsdb/engine/tsm1/writer.go:592-644 — tsmWriter.Write
 func (t *tsmWriter) Write(key []byte, values Values) error {
-    // 1. 验证 key 长度
-    if len(key) > maxKeyLength { return fmt.Errorf("key too long") }
-    if len(values) == 0 { return nil }
+    // 1. 验证 key 长度 (maxKeyLength = 65535)
+    if len(key) > maxKeyLength {
+        return ErrMaxKeyLengthExceeded
+    }
+    if len(values) == 0 {
+        return nil
+    }
 
     // 2. 写入 header (首次)
     if t.n == 0 {
-        var buf [5]byte
-        binary.BigEndian.PutUint32(buf[:4], MagicNumber)
-        buf[4] = Version
-        t.w.Write(buf[:])
+        if err := t.writeHeader(); err != nil {
+            return err
+        }
     }
 
     // 3. 编码 values 为 block，并从编码后的 block 读取类型
@@ -1085,39 +1194,59 @@ func (t *tsmWriter) Write(key []byte, values Values) error {
 
     // 6. 记录到索引
     t.index.Add(key, blockType,
-        values[0].UnixNano(),           // MinTime
+        values[0].UnixNano(),             // MinTime
         values[len(values)-1].UnixNano(), // MaxTime
-        t.n,                            // Offset
-        uint32(n))                      // Size
+        t.n,                              // Offset
+        uint32(n))                        // Size
 
     // 7. 更新偏移量
     t.n += int64(n)
+
+    // 8. 单个 key 的 block 数达到上限 (maxIndexEntries = 65535)
+    if len(t.index.Entries(key)) >= maxIndexEntries {
+        return ErrMaxBlocksExceeded
+    }
     return nil
 }
 ```
 
+> 两个常量都在 `writer.go:97-100`：`maxIndexEntries = (1 << (indexCountSize*8)) - 1`（=65535）、`maxKeyLength = (1 << (2*8)) - 1`（=65535）；对应错误 `ErrMaxBlocksExceeded` / `ErrMaxKeyLengthExceeded` 在 `writer.go:114-118`。
+
 ### 4.2 tsmWriter.WriteIndex — 写入索引
 
 ```go
-// tsdb/engine/tsm1/writer.go:708 — WriteIndex
+// tsdb/engine/tsm1/writer.go:708-734 — WriteIndex
 func (t *tsmWriter) WriteIndex() error {
     // 1. 记录当前偏移量 (Index 起始位置)
     indexPos := t.n
 
-    // 2. 写入所有 key 的索引
-    t.index.WriteTo(t.w)
+    // 2. 没有任何索引条目 → ErrNoValues (调用方据此丢弃空文件)
+    if t.index.KeyCount() == 0 {
+        return ErrNoValues
+    }
 
-    // 3. 写入 Footer: 8 字节 Index 偏移量
+    // 3. 让 directIndex 在写索引期间周期性 fsync
+    if f, ok := t.wrapped.(syncer); ok {
+        t.index.(*directIndex).f = f
+    }
+
+    // 4. 写入所有 key 的索引 (error 必须返回)
+    if _, err := t.index.WriteTo(t.w); err != nil {
+        return err
+    }
+
+    // 5. 写入 Footer: 8 字节 Index 偏移量 (error 必须返回)
     var buf [8]byte
     binary.BigEndian.PutUint64(buf[:], uint64(indexPos))
-    t.w.Write(buf[:])
+    _, err := t.w.Write(buf[:])
+    return err
 }
 ```
 
 ### 4.3 directIndex.Add — 索引构建
 
 ```go
-// tsdb/engine/tsm1/writer.go:273 — directIndex.Add
+// tsdb/engine/tsm1/writer.go:274 — directIndex.Add
 func (d *directIndex) Add(key []byte, blockType byte, minTime, maxTime int64,
     offset int64, size uint32) {
 
@@ -1273,72 +1402,134 @@ flowchart TD
 > 然后调用 `Write(math.NaN())` 写入内部 NaN sentinel；`Bytes()` 只返回
 > 当前 buffer 和 error。
 
-### 5.2 Integer: Delta + ZigZag + Simple8b
+### 5.2 Integer: Delta + ZigZag + Simple8b / RLE
 
 ```go
-// tsdb/engine/tsm1/int.go:40 — IntegerEncoder
+// tsdb/engine/tsm1/int.go:31-37 — 三种编码类型（写在 block 首字节高 4 位）
+const (
+    intUncompressed     = 0 // 每个 ZigZag 差值 8B 原样存储
+    intCompressedSimple = 1 // simple8b 位打包
+    intCompressedRLE    = 2 // 游程编码
+)
+
+// tsdb/engine/tsm1/int.go:40-45 — IntegerEncoder
 type IntegerEncoder struct {
     prev   int64
-    rle    bool      // 是否可以使用游程编码 (RLE)
-    values []uint64  // ZigZag 编码后的差值
-    // 注意: 没有 enc *simple8b.Encoder 字段
-    // simple8b 编码在 Bytes() 方法中按需创建
+    rle    bool     // 到目前为止所有 ZigZag 差值是否相同（初始 true）
+    values []uint64 // ZigZag 编码后的差值
+    // 没有 enc *simple8b.Encoder 字段：simple8b 只在 Bytes() 里按需编码
 }
 ```
 
 ```go
-// tsdb/engine/tsm1/int.go:65 — Write
+// tsdb/engine/tsm1/int.go:65-77 — Write
 func (e *IntegerEncoder) Write(v int64) {
-    // 计算差值
-    delta := v - e.prev
+    delta := v - e.prev          // 先差分，差值可能为负
     e.prev = v
-
-    // ZigZag 编码: 有符号 → 无符号
-    // -1 → 1, 0 → 0, 1 → 2, -2 → 3, 2 → 4, ...
-    zigzag := (delta << 1) ^ (delta >> 63)
-
-    e.values = append(e.values, zigzag)
+    enc := ZigZagEncode(delta)   // -1→1, 0→0, 1→2, -2→3
+    if len(e.values) > 1 {       // 至少有两个差值后才更新 rle
+        e.rle = e.rle && e.values[len(e.values)-1] == enc
+    }
+    e.values = append(e.values, enc)
 }
 ```
+
+**Bytes() 的三路选择**（`int.go:79-93`）：
 
 ```mermaid
-flowchart LR
-    A["输入: [100, 102, 105, 103]"] --> B["差值: [100, 2, 3, -2]"]
-    B --> C["ZigZag: [200, 4, 6, 3]"]
-    C --> D["Simple8b 打包: 10 个值/64-bit word"]
-    D --> E["压缩结果"]
+flowchart TD
+    A["Bytes()"] --> B{"rle && len(values) > 2 ?"}
+    B -->|"是"| C["encodeRLE()"]
+    B -->|"否"| D{"存在 value > simple8b.MaxValue ?"}
+    D -->|"是"| E["encodeUncompressed()"]
+    D -->|"否"| F["encodePacked()"]
 ```
 
-### 5.3 Timestamp: Delta + Scale + Simple8b
+| 输出 | 头 1B（高 4 位） | 后续字节 |
+|------|------------------|----------|
+| RLE | `2 << 4` = 0x20 | 首个差值 8B（大端） + 首个增量 uvarint + 重复次数 uvarint（`len-1`） |
+| Uncompressed | `0 << 4` = 0x00 | 每个 ZigZag 差值 8B（大端） |
+| Packed | `1 << 4` = 0x10 | 首个差值 8B（不压缩） + `simple8b.EncodeAll(values[1:])` 的 64-bit words |
+
+> 阈值是 `simple8b.MaxValue`（`1<<60 - 1`）；RLE 分支要求 `len(values) > 2`，只有两个相同差值时仍走 packed。每个 64-bit word 装 **1–240** 个值（随位宽自适应，`int.go:158`），不是固定 10 个。
+
+**案例**：输入 `[100, 102, 105, 103]`
+- 差值 `[100, 2, 3, -2]` → ZigZag `[200, 4, 6, 3]`
+- `rle` 在第二个差值处变为 false（200 ≠ 4）
+- `Bytes()`：不满足 RLE；最大值 200 < `MaxValue` → **Packed**
+- 输出 = `0x10` + `200` 的 8B 大端 + `simple8b([4, 6, 3])`
+
+### 5.3 Timestamp: Delta + Scale + Simple8b / RLE
 
 ```go
-// tsdb/engine/tsm1/timestamp.go:59 — encoder
-type encoder struct {
-    ts    []uint64           // 原始时间戳 (Write 时追加)
-    bytes []byte             // 编码输出缓冲区
-    enc   *simple8b.Encoder  // simple8b 编码器
-}
-```
-
-```go
-// tsdb/engine/tsm1/timestamp.go:85 — reduce
+// tsdb/engine/tsm1/timestamp.go:85-117 — reduce（逆序原地差分）
 func (e *encoder) reduce() (max, divisor uint64, rle bool, deltas []uint64) {
-    // 1. 差分编码: deltas[i] = ts[i] - ts[i-1]
-    // 2. 计算最大值 max 和 10 的幂次缩放因子 divisor
-    //    divisor 从 1e12 开始，逐步除以 10 直到找到所有差值的公约数
-    //    例如: [0, 1000000000, 2000000000, 3000000000] → divisor=1e9 → [0, 1, 2, 3]
-    // 3. 检测是否可以 RLE (所有差值相等)
+    deltas = e.ts                 // 原地差分，不新分配
+    max, divisor = 0, 1e12        // divisor 从 1e12 开始，单调除 10
+    rle = true
+    for i := len(deltas) - 1; i > 0; i-- {   // 必须逆序，否则会覆盖前一个原值
+        deltas[i] = deltas[i] - deltas[i-1]
+        v := deltas[i]
+        if v > max { max = v }
+        for divisor > 1 && v%divisor != 0 { divisor /= 10 }
+        rle = i == len(deltas)-1 || rle && (deltas[i+1] == deltas[i])
+    }
     return
 }
 ```
 
-### 5.4 Boolean: 位打包
+> **关键**：`deltas[0]` 仍是**第一个原始时间戳**，不是差值；差值从 `deltas[1]` 开始。
 
-每个 boolean 值只占 1 bit。8 个 boolean 值打包成 1 个字节。
+```go
+// tsdb/engine/tsm1/timestamp.go:119-139 — Bytes
+if len(e.ts) == 0 { return e.bytes[:0], nil }
+max, div, rle, dts := e.reduce()
+if rle && len(e.ts) > 1 {                       // 注意：时间戳 RLE 是 len > 1
+    return e.encodeRLE(e.ts[0], e.ts[1], div, len(e.ts))
+}
+if max > simple8b.MaxValue {                    // 1<<60 - 1
+    return e.encodeRaw()
+}
+return e.encodePacked(div, dts)
+```
 
-### 5.5 String: Snappy 压缩
+| 输出 | 头 1B | 后续字节 | 源码 |
+|------|-------|----------|------|
+| RLE | `2<<4 \| log10(div)` | 首个时间戳 8B + `delta/div` uvarint + 个数 uvarint | `timestamp.go:194-216` |
+| Raw | `0<<4` | 每个原始时间戳 8B | `timestamp.go:181-192` |
+| Packed | `1<<4 \| log10(div)` | 首个时间戳 8B（不压缩） + `simple8b(dts[1:]/div)` | `timestamp.go:141-179` |
 
-字符串直接使用 Snappy 压缩（不使用差值编码）。
+> 低 4 位存 `log10(divisor)`；解码时用 `v * div` 乘回去。原先"缩放到纳秒"的说法方向相反：编码是**除以** 10 的幂把差值变小。
+
+**案例**：`[0, 1e9, 2e9, 3e9]`
+- `reduce()`：差值全为 `1e9`，`divisor=1e9`（1e12→…→1e9），`max=1e9`，`rle=true`
+- `len>1` → **RLE**：头 `0x20 | log10(1e9)=9` → `0x29`；首时间戳 0（8B）；`delta/div=1`（1B）；个数 4（1B）→ 共 11B。
+
+### 5.4 Boolean: 1B 头 + uvarint 计数 + MSB-first 位图
+
+```
+┌──────────────┬──────────────────┬─────────────────────────┐
+│ Type<<4 (1B) │ Count (uvarint)  │ packed bits (⌈n/8⌉ 字节) │
+│ 0x10         │ n = 值总数        │ MSB-first               │
+└──────────────┴──────────────────┴─────────────────────────┘
+```
+
+- `Write` 逐位左移并置最低位（`e.b = e.b<<1; if b { e.b |= 1 }`），所以第一个值落在字节的 bit7（`bool.go:48-66`）。
+- `flush()` 在 8 位未满时补 0 对齐；`Bytes()` 先 flush，再写 `booleanCompressedBitPacked<<4`（=0x10）与 `uvarint(n)`（`bool.go:67-99`）。
+- 解码端靠 `uvarint(n)` 界定有效位数，位序为 `pos := 7 - (i & 0x7)`（`bool.go:149-160`）。
+
+### 5.5 String: 1B 头 + 整块 Snappy
+
+```
+┌──────────────┬──────────────────────────────────────────────────┐
+│ Type<<4 (1B) │ snappy( uvarint(len₁)‖s₁ ‖ uvarint(len₂)‖s₂ ‖ … ) │
+│ 0x10         │                                                  │
+└──────────────┴──────────────────────────────────────────────────┘
+```
+
+- `Write` 只做 `PutUvarint(len)` + 原始字节追加，**不排序、不差分**（`string.go:42-50`）。
+- `Bytes()` 对**整个累积缓冲**做一次 `snappy.Encode`，前缀 1 字节 `stringCompressedSnappy<<4`（`string.go:53-58`）。
+- 因此压缩单位是 block（同一 key 的一段值），不是单个字符串。
 
 ## 6. Cache Snapshot → TSM 写入
 
@@ -1367,8 +1558,20 @@ func (e *encoder) reduce() (max, divisor uint64, rle bool, deltas []uint64) {
 > 写入成功后通过 `WAL.Remove(closedFiles)` 删除已处理的 WAL segment。
 
 ```go
-// tsdb/engine/tsm1/compact.go:888 — WriteSnapshot
-func (c *Compactor) WriteSnapshot(cache *Cache) ([]string, error) {
+// tsdb/engine/tsm1/compact.go:888-958 — WriteSnapshot
+func (c *Compactor) WriteSnapshot(cache *Cache, logger *zap.Logger) ([]string, error) {
+    // 1. 入口先检查 snapshots 是否被禁用
+    c.mu.RLock()
+    enabled := c.snapshotsEnabled
+    intC := c.snapshotsInterrupt
+    c.mu.RUnlock()
+
+    if !enabled {
+        return nil, errSnapshotsDisabled
+    }
+
+    start := time.Now()
+
     // 注意: 使用 cache.Count() 而非 cache.Cardinality()
     card := cache.Count()
 
@@ -1389,45 +1592,186 @@ func (c *Compactor) WriteSnapshot(cache *Cache) ([]string, error) {
 
     // 按 partition 分片，并行写入
     splits := cache.Split(concurrency)
+    type res struct {
+        files []string
+        err   error
+    }
+    resC := make(chan res, concurrency)
     for i := 0; i < concurrency; i++ {
         go func(sp *Cache) {
             iter := NewCacheKeyIterator(sp, tsdb.DefaultMaxPointsPerBlock, intC)
-            files, err := c.writeNewFiles(c.FileStore.NextGeneration(), 0, nil, iter, throttle)
-            // ...
+            files, err := c.writeNewFiles(c.FileStore.NextGeneration(), 0, nil, iter, throttle, logger)
+            resC <- res{files: files, err: err}
         }(splits[i])
     }
+
+    // join 所有 goroutine 的结果
+    var errs []error
+    files := make([]string, 0, concurrency)
+    for i := 0; i < concurrency; i++ {
+        result := <-resC
+        if result.err != nil {
+            errs = append(errs, result.err)
+        }
+        files = append(files, result.files...)
+    }
+
+    // 2. 写完后再次检查 enabled: 期间可能被 DisableSnapshots()
+    c.mu.Lock()
+    enabled = c.snapshotsEnabled
+    c.lastSnapshotDuration = time.Since(start).Truncate(time.Second)
+    c.snapshotLatencies.add(time.Since(start))
+    c.mu.Unlock()
+
+    if !enabled {
+        return nil, errSnapshotsDisabled
+    }
+
+    return files, errors.Join(errs...)
 }
 ```
 
 ### 6.2 CacheKeyIterator — 从 Cache 到 TSM Block
 
 > **小白解释**: CacheKeyIterator 就像一个"翻译官"——把 Cache 中的内存数据翻译成 TSM 文件格式。
-> 先按 key 排序（保证 TSM 文件内部有序），然后每个 key 的数据编码成一个 block。
+> 它按 key 排序（保证 TSM 文件内部有序），再把每个 key 的数据按 `DefaultMaxPointsPerBlock` 切成多个 block 并**提前编码**。
+
+真实接口分两层，理解时必须分开：
+
+```mermaid
+flowchart TD
+    subgraph "层 1: 编排 (Engine / Compactor)"
+        E1["Engine.WriteSnapshot()<br/>e.mu.Lock"] --> E2["WAL.CloseSegment() + ClosedSegments()<br/>Cache.Snapshot()"]
+        E2 --> E3["snapshot.Deduplicate()"]
+        E3 --> E4["Compactor.WriteSnapshot(cache, logger)"]
+        E4 --> E5["Cache.Split(concurrency)"]
+        E5 --> E6["n × NewCacheKeyIterator(subCache, 1000, intC)"]
+    end
+
+    subgraph "层 2: 编码与落盘"
+        K1["cache.Keys() → 已排序的 key 列表"] --> K2["go encode() × GOMAXPROCS"]
+        K2 --> K3["cache.values(key)<br/>只 entry.mu.RLock，不取 Cache 锁"]
+        K3 --> K4["按 size=1000 切块<br/>encode*BlockUsing"]
+        K4 --> K5["blocks[i] (已编码字节)"]
+        K5 --> K6["Next() / Read()"]
+        K6 --> K7["writeNewFiles → Compactor.write"]
+        K7 --> K8["TSMWriter.WriteBlock + WriteIndex"]
+    end
+
+    E6 --> K1
+```
+
+**接口要点**（与早期版本不同）：
+- `Cache` **没有** `Read(key) []Value` 这样的导出方法；编码器用的是未导出的 `cache.values(key)`（`cache.go:661-670`），它只对 `entry.mu` 加读锁，不加 `Cache.mu`。
+- `CacheKeyIterator.Read()` 返回的是 `(key, minTime, maxTime, block, err)`，其中 `block` 是**已经编码好的字节**（`compact.go:1891-1919`），不是 `[]Value`。
+- 一个 key 可能对应**多个** block，`Next()` 会在同一个 key 上被返回多次。
+
+### 6.3 CacheKeyIterator + writeNewFiles：从 Cache 到 TSM 的字节流
+
+**阶段 1：生成快照并切分（`engine.go:1976-2014`、`compact.go:888-957`）**
+
+1. `Engine.WriteSnapshot` 在 `e.mu.Lock()` 内完成 `WAL.CloseSegment()`、`WAL.ClosedSegments()` 与 `Cache.Snapshot()`（`engine.go:1976-1994`）。这三步必须原子，否则 WAL 与 Cache 的交界处会漏数据。
+2. 释放 `e.mu` 之后才做 `snapshot.Deduplicate()`（`engine.go:2000-2009`），因为它要遍历整个快照，不能阻塞写入。
+3. `Compactor.WriteSnapshot` 用 `cache.Count()` 得到 series 基数，算出 `concurrency`，再 `cache.Split(concurrency)`；每个子 Cache 一个 goroutine。
+
+**阶段 2：按 key 编码（`compact.go:1780-1882`）**
+
+- `NewCacheKeyIterator` 先 `cache.Keys()` 拿到**已排序**的 key 列表，随后启动 `GOMAXPROCS(0)` 个 `encode()` goroutine，用原子 `idx` 把 key 空间分片。
+- 每个 key 调 `c.cache.values(key)` 取到 `Values` 的**别名**（不加 Cache 锁，只 `entry.mu.RLock`），再按 `c.size` 切块：
+
+```go
+// tsdb/engine/tsm1/compact.go:1841-1878（节选）
+key := c.order[i]
+values := c.cache.values(key)
+
+for len(values) > 0 {
+    end := len(values)
+    if end > c.size {                  // c.size = tsdb.DefaultMaxPointsPerBlock = 1000
+        end = c.size
+    }
+    minTime, maxTime := values[0].UnixNano(), values[end-1].UnixNano()
+
+    switch values[0].(type) {          // 按类型选择 encode*BlockUsing
+    case FloatValue:
+        b, err = encodeFloatBlockUsing(nil, values[:end], tenc, fenc)
+    // ... Integer / Unsigned / Boolean / String
+    }
+
+    values = values[end:]
+    c.blocks[i] = append(c.blocks[i], cacheBlock{k: key, minTime: minTime, maxTime: maxTime, b: b, err: err})
+}
+```
+
+- `blocks[i]` 是该 key 的 block 队列；`Next()` 逐块交付，`Read()` 返回队首。因此同一个 key 会被返回多次（每个 block 一次）。
+
+**阶段 3：写文件（`compact.go:1143-1300`）**
+
+| 常量 / 分支 | 值 | 源码 |
+|-------------|----|------|
+| `DefaultMaxPointsPerBlock` | 1000 | `tsdb/config.go:53` |
+| 激进压缩每块点数 `DefaultAggressiveMaxPointsPerBlock` | 10000 | `tsdb/config.go:57` |
+| 单个 TSM 文件上限 `MaxTSMFileSize` | 2GB | `tsdb/config.go:86` |
+| 索引估算超过 64MB → 磁盘缓冲索引 | `64*1024*1024` | `compact.go:1224` |
+| `throttle` 为真 → `limiter.NewWriterWithRate` | — | `compact.go:1218` |
+
+- `w.Size() > tsdb.MaxTSMFileSize` 或 `WriteBlock` 返回 `ErrMaxBlocksExceeded` → `rollToNext=true`，`writeNewFiles` 递增 `sequence` 后新建 `.tsm.tmp`（`compact.go:1275-1291`、`1152-1163`）。
+- 整个 key 都被 tombstone 覆盖时写出 0 个 block → `WriteIndex()` 返回 `ErrNoValues` → 空 `.tsm.tmp` 被 `os.RemoveAll`（`compact.go:1164-1172`）。
+
+**案例（2500 个 FloatValue，t=1..2500）**：
+
+| 块 | 值范围 | 点数 | minTime | maxTime | 编码后首字节 |
+|----|--------|------|---------|---------|--------------|
+| 0 | `values[0:1000]` | 1000 | 1 | 1000 | `0x00`（BlockFloat64） |
+| 1 | `values[1000:2000]` | 1000 | 1001 | 2000 | `0x00` |
+| 2 | `values[2000:2500]` | 500 | 2001 | 2500 | `0x00` |
+
+同一个 key 被 `Next()` 返回 3 次，每次 `Read()` 给出一块。
+
+> 注意：block 的首字节是 `packBlock` 写入的块类型（`BlockFloat64 = 0x00`，见 `encoding.go:15-28`）；Gorilla 的编码类型位于后续 value 负载的首字节（`0x10`），不要与 block 类型混淆。
+
+> **依赖关系**：`cache.values(key)` 的注释明确写着 "assumes the data is already sorted"（`cache.go:661-670`）。这个前提由 `Engine.WriteSnapshot` 先调用 `snapshot.Deduplicate()` 保证（`engine.go:2000-2009`）；如果绕过它直接调用 `CacheKeyIterator`，`minTime > maxTime` 的校验会失败（`compact.go:1270-1272`）。
+
+### 6.4 Snapshot 的失败与重试
+
+Snapshot 有四条非成功路径，任何一条都不会静默丢数据，但会改变后续重试行为：
 
 ```mermaid
 sequenceDiagram
-    participant Cache as Cache (snapshot)
-    participant CKI as CacheKeyIterator
-    participant Encoder as Value Encoder
-    participant Writer as TSM Writer
-    participant Disk as TSM 文件
+    participant E as Engine.WriteSnapshot
+    participant C as Cache
+    participant Comp as Compactor
+    participant FS as FileStore
+    participant WAL as WAL
 
-    Cache->>CKI: 遍历所有 key (已排序)
-    loop 每个 key
-        CKI->>Cache: Read(key) → []Value
-        Cache-->>CKI: [t1:10.0, t2:20.0, t3:30.0]
-
-        CKI->>Encoder: Encode(values) → block bytes
-        Note over Encoder: Float → Gorilla XOR 编码<br>Integer → Simple8b 编码<br>...
-
-        Encoder-->>CKI: encoded block
-
-        CKI->>Writer: Write(key, values)
-        Writer->>Disk: CRC32(4B) + block(NB)
+    E->>C: Snapshot()
+    alt snapshot.Size() == 0
+        E->>C: ClearSnapshot(true)（engine.go:2000-2003）
+        Note over E: 空快照直接返回，不写 TSM
+    else 有数据
+        E->>Comp: WriteSnapshot(snapshot, logger)
+        alt 写 TSM 失败
+            Comp-->>E: err
+            E->>C: defer ClearSnapshot(false)（engine.go:2046-2051）
+            Note over C: 只把 snapshotting 置 false；snapshotSize 保留
+        else 写 TSM 成功
+            E->>FS: FileStore.Replace(nil, newFiles)（engine.go:2064）
+            alt Replace 失败
+                FS-->>E: err
+                E->>E: 逐个 os.Remove(newFiles)（engine.go:2067-2074）
+                E->>C: ClearSnapshot(false)
+                Note over E: 返回错误；下轮 WriteSnapshot 重试
+            else Replace 成功
+                E->>C: ClearSnapshot(true)（engine.go:2077）
+                E->>WAL: WAL.Remove(closedFiles)（engine.go:2080-2084）
+            end
+        end
     end
-
-    Writer->>Disk: WriteIndex() + Footer
 ```
+
+- **空 snapshot 短路**：`snapshot.Size() == 0` 时只 `ClearSnapshot(true)` 就返回（`engine.go:2000-2003`）。
+- **写 TSM 失败**：`writeSnapshotAndCommit` 的 `defer` 在 `err != nil` 时调用 `ClearSnapshot(false)`（`engine.go:2046-2051`）。
+- **Replace 失败**：把刚写出的文件逐个 `os.Remove`，再走同一个 `defer`（`engine.go:2064-2081`）。下一轮 `WriteSnapshot` 会重新写。
+- **重试语义**：`ClearSnapshot(false)` 只把 `snapshotting` 置 false，**不清** `snapshotSize`（`cache.go:449-468`）；下一轮 `Snapshot()` 读到 `c.snapshot.Size() > 0` 会直接返回旧 snapshot（`cache.go:400-404`），于是同一批数据被重新写一次。
 
 ## 7. TSM 文件读取 — 从磁盘到查询结果
 
@@ -1589,33 +1933,64 @@ func (d *indirectIndex) Seek(key []byte) int {
 ### 7.3 Block 解码 — 从原始字节到 Value
 
 ```go
-// tsdb/engine/tsm1/reader.go:1548 — mmapAccessor.readBlock
+// tsdb/engine/tsm1/reader.go:1630-1646 — mmapAccessor.readBlock
 func (m *mmapAccessor) readBlock(entry *IndexEntry, values []Value) ([]Value, error) {
-    // 直接从 mmap 切片: 跳过 4 字节 CRC
-    raw := m.b[entry.Offset+4 : entry.Offset+int64(entry.Size)]
-    return DecodeBlock(raw, values)
+    m.incAccess()
+
+    m.mu.RLock()
+    defer m.mu.RUnlock()
+
+    // mmap 已被 Close/Unmap 时长度会不足，必须返回 ErrTSMClosed
+    if int64(len(m.b)) < entry.Offset+int64(entry.Size) {
+        return nil, ErrTSMClosed
+    }
+    //TODO: Validate checksum
+    var err error
+    values, err = DecodeBlock(m.b[entry.Offset+4:entry.Offset+int64(entry.Size)], values)
+    if err != nil {
+        return nil, err
+    }
+
+    return values, nil
 }
 ```
 
-**DecodeBlock 分发**:
+**DecodeBlock 分发**（`tsdb/engine/tsm1/encoding.go:251-319`，是包级函数，不是 `mmapAccessor` 的方法）：
 
 ```go
-func DecodeBlock(b []byte, vals []Value) ([]Value, error) {
-    switch b[0] {  // 第一个字节是 block 类型
-    case BlockFloat64:
-        decodeFloatBlock(b, &vals)
-    case BlockInteger:
-        decodeIntegerBlock(b, &vals)
-    case BlockUnsigned:
-        decodeUnsignedBlock(b, &vals)
-    case BlockBoolean:
-        decodeBooleanBlock(b, &vals)
-    case BlockString:
-        decodeStringBlock(b, &vals)
+func DecodeBlock(block []byte, vals []Value) ([]Value, error) {
+    if len(block) <= encodedBlockHeaderSize {
+        return nil, fmt.Errorf("decode of short block: got %v, exp %v", len(block), encodedBlockHeaderSize)
     }
-    return vals, nil
+
+    blockType, err := BlockType(block)
+    if err != nil {
+        return nil, fmt.Errorf("error decoding block type: %v", err)
+    }
+
+    switch blockType {
+    case BlockFloat64:
+        var buf []FloatValue
+        decoded, err := DecodeFloatBlock(block, &buf)
+        if len(vals) < len(decoded) {
+            vals = make([]Value, len(decoded))
+        }
+        for i := range decoded {
+            vals[i] = decoded[i]
+        }
+        return vals[:len(decoded)], err
+
+    // BlockInteger / BlockUnsigned / BlockBoolean / BlockString 的代码结构完全相同：
+    // 分别调用 DecodeIntegerBlock / DecodeUnsignedBlock / DecodeBooleanBlock /
+    // DecodeStringBlock，逐值拷贝进 []Value，并以 return vals[:len(decoded)], err 返回。
+
+    default:
+        return nil, fmt.Errorf("unknown block type: %d", blockType)
+    }
 }
 ```
+
+> 注意：每个分支都把解码错误原样返回（`return vals[:len(decoded)], err`），不会把错误吞掉后返回半截结果。
 
 ### 7.4 KeyCursor — 多文件定位
 
@@ -1653,7 +2028,7 @@ sequenceDiagram
 #### FileStore.locations — 查找所有匹配位置
 
 ```go
-// tsdb/engine/tsm1/file_store.go:1000 — locations
+// tsdb/engine/tsm1/file_store.go:1136 — locations
 // 注意: ascending 参数决定扫描方向，影响 readMin/readMax 的设置
 func (f *FileStore) locations(key []byte, t int64, ascending bool) []*location {
     var cache []IndexEntry
@@ -1715,8 +2090,9 @@ func (f *FileStore) locations(key []byte, t int64, ascending bool) []*location {
 查询时 Cache 中的数据（未 snapshot 的最新写入）与 TSM 文件中的数据归并。Cache 数据优先级更高。
 
 ```go
-// tsdb/engine/tsm1/array_cursor_iterator.gen.go — buildFloatArrayCursor
+// tsdb/engine/tsm1/array_cursor_iterator.gen.go:18-44 — buildFloatArrayCursor
 func (q *arrayCursorIterator) buildFloatArrayCursor(ctx context.Context, name []byte, tags models.Tags, field string, opt query.IteratorOptions) (tsdb.FloatArrayCursor, error) {
+    var err error
     key := q.seriesFieldKeyBytes(name, tags, field)
 
     // 1. Cache.Values 同时读取 snapshot cache 和 live cache。
@@ -1726,9 +2102,26 @@ func (q *arrayCursorIterator) buildFloatArrayCursor(ctx context.Context, name []
     // 2. KeyCursor 从 TSM 文件读取冷数据。
     keyCursor := q.e.KeyCursor(ctx, key, opt.SeekTime(), opt.Ascending)
 
-    // 3. ArrayCursor reset 时把 cacheValues 放在 TSM cursor 之上。
-    //    相同时间戳时 Cache 数据覆盖 TSM 数据。
-    return q.asc.Float, q.asc.Float.reset(opt.SeekTime(), opt.StopTime(), cacheValues, keyCursor)
+    // 3. asc / desc 两条分支各自懒创建 cursor，并检查 reset 返回的 error。
+    if opt.Ascending {
+        if q.asc.Float == nil {
+            q.asc.Float = newFloatArrayAscendingCursor()
+        }
+        err = q.asc.Float.reset(opt.SeekTime(), opt.StopTime(), cacheValues, keyCursor)
+        if err != nil {
+            return nil, err
+        }
+        return q.asc.Float, nil
+    }
+
+    if q.desc.Float == nil {
+        q.desc.Float = newFloatArrayDescendingCursor()
+    }
+    err = q.desc.Float.reset(opt.SeekTime(), opt.StopTime(), cacheValues, keyCursor)
+    if err != nil {
+        return nil, err
+    }
+    return q.desc.Float, nil
 }
 ```
 
@@ -1757,9 +2150,45 @@ flowchart LR
 
 ### 8.3 为什么当前实现先写 Cache 再写 WAL
 
-- **写入速度**: 先写入未压缩数据，异步压缩
-- **批量压缩**: 多个 entry 一起压缩，压缩率更高
-- **fsync 批量**: 多个写入共享一次 fsync
+顺序的直接后果与合理性：
+
+- **可见性优先**：Cache 是查询可见性的来源（查询同时读 Cache 与 TSM），WAL 是崩溃恢复的来源。先写 Cache 让数据立刻可查，再同步写 WAL 保证重启可恢复（`engine.go:1443-1452`）。
+- **WAL 侧是同步成本**：`WAL.writeToLog` 在调用者 goroutine 内同步完成 `entry.Encode` 与 `snappy.Encode`（`wal.go:398-420`），一次 `WriteMulti` 只产生 1 个 entry（`wal.go:311-324`）；没有"异步压缩"，也没有"多个 entry 一起压缩"。
+- **只有 fsync 是批量的**：写入者把 `syncErr` 放入 `syncWaiters`（容量 1024），CAS 选出的负责人执行一次 `sync()`（`bw.Flush + f.Sync`）并通知所有等待者（`wal.go:439-461`）。
+- **代价**：WAL 失败时 Cache 已写入，写放大与延迟全部落在 WAL 上；这正是 `Engine.WritePoints` 返回错误但数据仍可见的原因。
+
+### 8.4 跨层锁、所有权与文件生命周期
+
+**操作 × 锁**（R = 读锁，L = 写锁，— = 不涉及）：
+
+| 操作 | `Engine.e.mu` | `Cache.mu` | `partition.mu` | `entry.mu` | `FileStore.mu` | `file.refs` | `WAL.mu` | `Tombstoner.mu` |
+|------|---------------|------------|----------------|------------|----------------|-------------|----------|-----------------|
+| WritePoints | R（`engine.go:1440-1452`） | R（只读 store 指针，`cache.go:335-337`） | R/L（`ring.go:227-234`） | L/R（`cache.go:87-97`） | — | — | L（`wal.go:398-420`） | — |
+| WriteSnapshot 阶段 1 | L（`engine.go:1976-1994`） | L（`Snapshot`）+ R（`ClearSnapshot`） | — | — | — | — | L（`CloseSegment`） | — |
+| Dedup + Compactor | — | — | — | L（`entry.deduplicate`） | R（`NextGeneration`） | — | — | — |
+| FileStore.Replace | R（`engine.go:2063-2064`） | — | — | — | L（`file_store.go`） | — | — | — |
+| DELETE | **不取** | L（`DeleteRange`，`cache.go:619-621`） | R/L | L（`filter`） | R（`Apply`） | — | L（`DeleteRange`） | L（`AddRange`） |
+| Query KeyCursor | — | R（`Values`） | R | R | R（`locations`） | Ref/Unref（`file_store.go:1443-1477`） | — | R |
+| Compaction | — | — | — | — | L（`Replace`） | Ref/Unref | — | L |
+
+**三个并发场景的结论**：
+
+- **写 vs snapshot**：snapshot 只在换指针与关 WAL segment 时短暂持有 `e.mu` 写锁；`Deduplicate` 与 `Compactor.WriteSnapshot` 都在锁外（`engine.go:2000-2014`），不阻塞写入。但 `Deduplicate` 要遍历全部快照数据，期间写入继续进入新的 live ring。
+- **写 vs DELETE**：DELETE 不取 `e.mu`，停的是 compaction 而不是 `WritePoints`；但 `Cache.DeleteRange` 持有 Cache 全局写锁（`cache.go:619-621`），期间所有写入的 `c.mu.RLock` 都被阻塞。
+- **查询 vs Replace**：`KeyCursor` 对每个命中文件 `Ref()`，`Close()` 时 `Unref()`（`file_store.go:1443-1477`）；被 `Ref` 的文件不会被 `Replace` 删除，查询结束 `Unref` 后才可回收。
+
+**snapshot / split 的所有权**：`Cache.Split` 返回的子 Cache 只带 `store` 指针，不继承 `size/maxSize/snapshot`（`cache.go:506-520`）。所有子 goroutine 必须在 `ClearSnapshot(true)` 之前 join（`compact.go:924-950`），否则 `snapStore.reset()` 会与仍在读子 ring 的编码 goroutine 竞争。
+
+```mermaid
+flowchart LR
+    WP["WritePoints"] -->|"RLock，一次请求"| EMU["Engine.e.mu"]
+    WS["WriteSnapshot 阶段 1"] -->|"Lock，一次快照"| EMU
+    DEL["DELETE"] -->|"不取 e.mu，改为停 compaction"| SFL["sfile.DisableCompactions + Wait"]
+    QRY["Query KeyCursor"] -->|"Ref / Unref"| REF["file.refs"]
+    EMU -->|"RLock"| CMU["Cache.mu"]
+    CMU -->|"RLock / Lock"| PMU["partition.mu"]
+    PMU -->|"Lock / RLock"| ENMU["entry.mu"]
+```
 
 ## 9. 架构收益
 
@@ -1781,27 +2210,27 @@ if limit > 0 && n > limit {
 }
 ```
 
-没有驱逐机制，Cache 满时写入直接失败。可能导致数据丢失。
+没有驱逐机制，Cache 满时写入直接失败。判定点是 `Cache.WriteMulti` 的 `if limit > 0 && n > limit`（`cache.go:328-332`），其中 `n = Size() + addedSize`；`limit` 来自 `cache-max-memory-size`，默认 **1GB**（`tsdb/config.go:25`，`engine.go:248` 传入 `NewCache`）。
 
-### 10.2 Snapshot 期间内存翻倍
+### 10.2 Snapshot 期间内存占用不会额外翻倍
 
-Cache.Size() = size + snapshotSize。Snapshot 和 live store 同时存在于内存中。
+`Cache.Size()` = `size + snapshotSize`（`cache.go:471-474`）。默认 `maxSize` 是 **1GB**、快照阈值是 **25MB**（`tsdb/config.go:25,29`），所以 snapshot 期间旧数据继续占用 `Size()` 预算，而不是"额外再送一份 25MB"。
 
 ### 10.3 WAL fsync 批量延迟
 
-CAS 批量机制导致单个写入可能等待整个 flush 周期。
+CAS 批量机制导致单个写入可能等待整个 flush 周期。`syncWaiters` 容量为 **1024**（`wal.go:128`）；`syncDelay` 默认 **0**（`wal.go:101-105`），即每次写入都立即 fsync，只有显式配置非零值才会合并 fsync。
 
 ### 10.4 分区写锁竞争
 
-高基数场景下，同一分区的写操作串行化。
+高基数场景下，同一分区的写操作串行化：热路径只持 `p.mu.RLock`，但 `entry.add` 还要竞争 `entry.mu`（`cache.go:87-97`）；`partition.write` 的完整临界区见 `ring.go:227-252`。
 
 ### 10.5 Gorilla 编码的 CPU 开销
 
-XOR + leading/trailing zeros 计算在每次 Write 时执行。
+XOR + leading/trailing zeros 计算在每次 Write 时执行：后续值与前一值 XOR 后先写 1 bit 标志；需要新窗口时再写 5-bit leading + 6-bit sigbits + payload（`float.go:101-135`）。最坏情况一个值约 `1+5+6+64 = 76` bit，值完全相同时只需 1 bit。
 
 ### 10.6 Simple8b 的打包效率
 
-当差值分布不均匀时，Simple8b 可能无法有效打包。
+当差值分布不均匀时，Simple8b 可能无法有效打包：每个 64-bit word 装 **1–240** 个值，随位宽自适应（`int.go:158` 的注释）；只要有一个差值超过 `simple8b.MaxValue`（`1<<60 - 1`）就整体退回 8B/值的未压缩格式（`int.go:85-90`）。
 
 ## 11. TSM-to-TSM 压缩流程
 
@@ -1833,7 +2262,7 @@ flowchart TD
 
 > **注意**: Cache Snapshot（`WriteSnapshot()`）不是 compaction 级别，而是由 `ShouldCompactCache()` 触发的
 > 独立流程，将 Cache 数据写入新的 generation。`Compactor.writeNewFiles` 会先递增 sequence，
-> 因此首个输出通常是 `000001-01.tsm` 这类文件；后续 compaction level 由 sequence 和 planner 解释。
+> 因此首个输出通常是 `000000001-000000001.tsm` 这类文件；后续 compaction level 由 sequence 和 planner 解释。
 > 当前实现没有可调度的 Level 0：sequence=1 的 cache snapshot 文件被 `tsmGeneration.level()`
 > 归为 Level 1。
 
@@ -1843,6 +2272,18 @@ flowchart TD
 - Level 3 (`PlanLevel(3)`): 合并多个 L2 文件，低优先级 (`compactLoPriorityLevel`)
 - Level 4 (`Plan(e.LastModified())`): Full compaction，合并所有级别文件为一个最终文件
 - Level 5 (`PlanOptimize(e.LastModified())`): Optimize compaction，经过 holdoff 后由 `compactOptimize` 执行，权重最低
+
+**触发所需的 generation 数**（`compact.go:352-381`）：
+
+| 层级 | Planner | 触发所需 generation 数 | 说明 |
+|------|---------|------------------------|------|
+| Level 1 | `PlanLevel(1)` | **8** | 小 TSM 文件攒够 8 个才合并 |
+| Level 2 | `PlanLevel(2)` | 4 | 由 L1 输出攒够 4 个 |
+| Level 3 | `PlanLevel(3)` | 4 | 由 L2 输出攒够 4 个 |
+| Level 4 | `Plan(...)` | 4 | Full compaction，另受写冷时长（默认 4h）约束 |
+| Level 5 | `PlanOptimize(...)` | 4 | Optimize，另有 1h/5min holdoff（`engine.go:2171-2175`） |
+
+`PlanLevel` 先按 `group.chunk(minGenerations)` 切组，再判断 `len(chunk) < minGenerations && !hasTombstones`。这种"不够数"的组不会立即丢弃：只要它**后面还存在 `groups[j].level() >= level` 的更高层 generation**，这一组仍会被加入待办、往上升一层（`compact.go:370-379`）。带 tombstone 的组不受 `minGenerations` 限制，直接参与合并。
 
 ## 12. Scheduler 组件
 
@@ -1866,12 +2307,63 @@ Scheduler 负责决定何时执行哪种 compaction:
 - 使用加权评分算法（`queues[i] * weights[i]`）选择下一个任务，权重为 `[0.4, 0.3, 0.2, 0.1, 0.01]`（低级别优先，Optimize 最低）
 - 优先执行低级别的 compaction（L1→L2），保持写入路径畅通
 
+**并发限额 `limits()`**（`scheduler.go:73-91`）：
+
+- `hiLimit = maxConcurrency * 4 / 5`、`loLimit = maxConcurrency / 5 + 1`（两者至少为 1）。
+- 当 `level3Running + level4Running + level5Running >= loLimit` 且 `maxConcurrency - (level1Running + level2Running) == 0` 时，把候选范围截断为 `end = 2`，本轮只在 L1/L2 里挑（`scheduler.go:52-56`）。目的是把剩余的并发名额留给写入路径依赖的低级别 compaction，避免 L3+ 把并发占满。
+- 当前 `nextByQueueDepths` 只消费 `loLimit`；`hiLimit` 由 `limits()` 一并返回但未被该函数使用，属于为后续策略预留的接口。
+
 ## 13. Tombstone 处理
 
-Tombstone 用于标记已删除的数据。当执行 `DELETE` 或 `DELETE RANGE` 时：
-1. WAL 写入 DeleteWALEntry / DeleteRangeWALEntry
-2. Cache 中的数据被清除
-3. TSM 文件中的数据通过 tombstone 文件标记为已删除
+### 13.1 DELETE 的外层编排
+
+`DELETE`/`DELETE RANGE` 在 TSM1 Engine 里的入口是 `DeleteSeriesRange`（`engine.go:1461`），它把 `min/max` 包装成 predicate 后调用 `DeleteSeriesRangeWithPredicate`（`engine.go:1469`）。真正的外层编排都在后者里，顺序不能调换：
+
+```mermaid
+sequenceDiagram
+    participant Client as DELETE 请求
+    participant Engine as TSM1 Engine
+    participant TSI as TSI Index
+    participant FS as FileStore
+    participant Cache as Cache
+    participant WAL as WAL
+
+    Client->>Engine: DeleteSeriesRange(itr, min, max)
+    Engine->>Engine: DeleteSeriesRangeWithPredicate(itr, predicate)
+    Engine->>TSI: ① DisableCompactions() + Wait()（engine.go:1474-1477）
+    Engine->>TSI: ② RetainFileSet()（engine.go:1479-1483）
+    Note over Engine: 第一个待删 series 到来时只执行一次
+    Engine->>Engine: ③ disableLevelCompactions(true)（engine.go:1539-1540）
+    Engine->>FS: ④ sfile.DisableCompactions() + sfile.Wait()（engine.go:1542-1544）
+    loop 每累计 50MB 或 min/max 变化
+        Engine->>Engine: ⑤ deleteSeriesRange(batch, min, max)（engine.go:1549-1556）
+        Engine->>FS: ⑥ FileStore.Apply → tombstone → Cache → WAL（§13.2）
+    end
+    Engine->>Engine: ⑦ index.Rebuild()（engine.go:1575）
+    Engine->>TSI: ⑧ EnableCompactions() + fileSet.Release()（defer）
+```
+
+1. **停压缩是 DELETE 正确性的前置条件**：`DeleteSeriesRangeWithPredicate` 先对 TSI 索引 `DisableCompactions()` + `Wait()` + `RetainFileSet()`（`engine.go:1474-1484`）。第一个待删 series 到来时，再 `e.disableLevelCompactions(true)`、`e.sfile.DisableCompactions()`、`e.sfile.Wait()`，并用 `defer` 恢复（`engine.go:1533-1547`）。源码注释说明：不停止正在运行的 compaction，刚写入现有 TSM 文件的 tombstone 会被 compaction 抹掉，删除的 measurement/series 在 compaction 完成后会重新出现；这里**只停 level compaction、不停 snapshot**，否则写 tombstone 耗时过长会把 Cache 写满并导致写入被拒。
+2. **50MB 分批**：`sz` 累计 `len(key)`；当 `sz >= deleteFlushThreshold`（= `50*1024*1024`，`engine.go:97-98`）或 batch 的 min/max 发生变化时，先调用 `deleteSeriesRange(batch, min, max)` 并清空 batch（`engine.go:1549-1557`）。循环结束后再删一次尾批（`engine.go:1568-1573`）。
+3. **删除后索引对账**：所有批次结束后 `e.index.Rebuild()`（`engine.go:1575`）。
+4. **空操作短路**：`deleteSeriesRange` 先 `FileStore.Apply` 检查 `r.OverlapsTimeRange(min,max)`；若没有任何 TSM 文件重叠且 `e.Cache.store.count() == 0`，直接 `return nil`——不写 tombstone、不写 WAL（`engine.go:1595-1612`）。注意 Cache 侧只看"有没有值"，**不判断时间范围**，所以 cache 非空时一定走慢路径。
+5. **Cache.DeleteRange 逐步代码**：`c.init()` → `c.mu.Lock()` → 对每个 key `c.store.entry(k)`；全时间范围 `[MinInt64, MaxInt64]` 直接 `decreaseSize(origSize+len(k))` + `store.remove(k)`；部分范围先 `e.filter(min,max)`，`e.count()==0` 才 remove，否则 `decreaseSize(origSize-e.size())`（`cache.go:619-649`）。
+
+**案例（可手工推演）**：
+
+- 100 万个 series，composite key 平均 50B：`sz` 累计到 `50MB / 50B = 1,048,576` 个 key 附近触发一次 flush；不足 50MB 的尾批在循环结束后再删一次。
+- 删除范围 `[2020-01-01, 2020-12-31]`，所有 TSM 文件时间范围都是 2024 年且 Cache 为空：`overlapsTimeRangeMinMax=false`，`deleteSeriesRange` 直接返回，`.tombstone` 不产生、WAL 不追加。
+
+### 13.2 单文件 tombstone 写入
+
+Tombstone 用于标记已删除的数据。一次 `DELETE`/`DELETE RANGE` 的副作用顺序与写入路径**相反**：先让 TSM 上的删除持久化，再清 Cache，最后才写 WAL。单个文件的真实顺序（`tsdb/engine/tsm1/engine.go:1634-1685`）是：
+
+1. **TSM tombstone 先落盘**：`FileStore.Apply` 对每个重叠文件调用 `r.BatchDelete()`（`engine.go:1634`）→ `batch.DeleteRange(...)`（`reader.go:718-739`，内部即 `Tombstoner.AddRange`，`reader.go:734`）→ `batch.Commit()`（`reader.go:741-746`：`Flush()` + `applyTombstones()`）。任一文件失败则 `batch.Rollback()`（`engine.go:1650`）。
+2. **再挑出 Cache 中的 key**：`e.Cache.ApplyEntryFn(...)` 按已排序的 seriesKeys 匹配（`engine.go:1665`）。
+3. **清 Cache**：`e.Cache.DeleteRange(deleteKeys, min, max)`（`engine.go:1681`，Cache 全局写锁）。
+4. **最后写 WAL**：`e.WAL.DeleteRange(deleteKeys, min, max)`（`engine.go:1685`，仅 `WALEnabled` 时）。
+
+顺序动机：tombstone 是 TSM 上删除的唯一持久记录；先提交它，即使随后 Cache/WAL 失败，重启后磁盘上的删除仍然生效。WAL 放在最后用于重放加速与记录，**不是**"先写日志"。
 
 ```go
 // tsdb/engine/tsm1/tombstone.go
@@ -1884,7 +2376,7 @@ type Tombstone struct {
 
 **Tombstone 文件格式**: 每个 TSM 文件对应一个 `.tombstone` 文件。
 读取数据时，`FileStore.locations()` 会检查 tombstone 范围，
-跳过完全被 tombstone 覆盖的 block。
+跳过完全被 tombstone 覆盖的 block（`file_store.go:1160-1165`）。
 
 > **注意**: Tombstone 不会立即物理删除数据。只有在 compaction 时，
 > 被 tombstone 标记的数据才会被真正移除。
@@ -1895,41 +2387,35 @@ type Tombstone struct {
 sequenceDiagram
     participant Client as DELETE 请求
     participant Engine as TSM1 Engine
+    participant FS as FileStore / TSMFile
+    participant Tomb as Tombstoner
     participant Cache as Cache
     participant WAL as WAL
-    participant Tomb as Tombstoner
-    participant TSM as TSM 文件
     participant Disk as .tombstone 文件
 
     Client->>Engine: DELETE FROM cpu WHERE time >= '10:00' AND time < '11:00'
-    Engine->>WAL: ① 写入 DeleteRangeWALEntry
-    Engine->>Cache: ② 清除匹配的数据
-    Cache->>Cache: 遍历 ring 分区，删除匹配 key+时间范围的 entry
+    Engine->>Engine: DeleteSeriesRange → deleteSeriesRange(keys, min, max)
+    Engine->>FS: FileStore.Apply(逐个重叠文件)
+    FS->>Tomb: ① BatchDelete().DeleteRange() → Tombstoner.AddRange()
+    Tomb->>Disk: ② prepareV4 / writeTombstoneV3：复制现有 tombstone 到 tmp
+    FS->>Tomb: ③ batch.Commit()：Flush() + applyTombstones()
+    Tomb->>Disk: ④ gz.Close → bw.Flush → tmp.Sync → rename(tmp, .tombstone) → SyncDir
+    Note over FS,Tomb: 任一文件失败：batch.Rollback() 并返回错误（engine.go:1650）
+    Engine->>Cache: ⑤ ApplyEntryFn 按已排序 seriesKeys 挑出 cache key（engine.go:1665）
+    Engine->>Cache: ⑥ DeleteRange(deleteKeys, min, max)（cache.go:619）
+    Engine->>WAL: ⑦ WAL.DeleteRange(deleteKeys, min, max)（engine.go:1685，仅 WALEnabled）
+    Note over Engine: ⑧ index.Rebuild() 对账（engine.go:1575）
 
-    Engine->>Tomb: ③ Tombstoner.AddRange(keys, minTime, maxTime)
-
-    alt v4 格式 (append-friendly)
-        Tomb->>Disk: ④a 直接追加写入 .tombstone 文件
-        Note over Disk: v4 header (0x1504)<br>gzip 压缩的 tombstone 条目
-    else v3 格式 (不兼容时 fallback)
-        Tomb->>Tomb: ④b 读取现有 tombstone
-        Tomb->>Disk: ④c 创建临时文件，写入全部 tombstone
-        Tomb->>Disk: ④d 原子 rename → .tombstone
-    end
-
-    Note over Engine: 下次查询时
-    Engine->>TSM: ⑤ FileStore.locations() 检查 tombstone
-    TSM->>Disk: 读取 .tombstone 文件
-    Disk-->>TSM: tombstone 范围列表
-    TSM->>TSM: 跳过完全被覆盖的 block
+    Note over Engine: 查询时
+    Engine->>FS: ⑨ FileStore.locations() 读取 TombstoneRange
+    FS->>Disk: 读取 .tombstone
+    FS->>FS: 整块被覆盖 → 跳过；部分覆盖 → 解码后 Exclude
 
     Note over Engine: Compaction 时
-    Engine->>TSM: ⑥ Compactor.compact() 打开 TSMReader
-    Engine->>Engine: ⑦ NewTSMBatchKeyIterator(...)
-    Engine->>Engine: ⑧ tsmBatchKeyIterator.Next() 收集同 key blocks
-    Engine->>TSM: ⑨ BlockIterator.Read() + TSMReader.TombstoneRange(key)
-    Engine->>Engine: ⑩ compact.gen.go 的 merge*/combine* 应用 tombstone
-    Note over Engine: combineFloat/combineInteger/... 中<br>v.Exclude(ts.Min, ts.Max)<br>再 chunk*/Encode*ArrayBlock 重写输出
+    Engine->>Engine: ⑩ NewTSMBatchKeyIterator(...)
+    Engine->>Engine: ⑪ Next() 收集同 key blocks + blk.tombstones
+    Engine->>Engine: ⑫ merge*/combine* 执行 v.Exclude(ts.Min, ts.Max)
+    Engine->>FS: ⑬ chunk*/Encode*ArrayBlock 重写输出
 ```
 
 当前 compaction 路径在 `Compactor.compact()` 中创建
@@ -1940,6 +2426,8 @@ sequenceDiagram
 `combine*`。当需要解码归并或 block 带 tombstone 时，`combine*` 会对解码后的类型化数组执行
 `v.Exclude(ts.Min, ts.Max)`，最后 `chunk*` 重新编码输出；如果一个 key 的 merged 输出为空，
 `Next()` 会继续读取下一个 key。
+
+### 13.3 Tombstoner 与 v3/v4 格式
 
 **Tombstoner 结构** (`tombstone.go:32-59`):
 
@@ -1977,16 +2465,16 @@ type Tombstoner struct {
 ```
 
 **v4 vs v3 格式**:
-- **v4** (`0x1504`): append-friendly，新 tombstone 直接追加到文件末尾，无需重写
-- **v3** (`0x1503`): 需要读取现有文件 → 合并 → 重写整个文件
-- `prepareV4()` 先尝试 v4，如果现有文件是 v3 则 fallback 到 `writeTombstoneV3()`
+- **v4**（header `0x1504`）：`prepareV4()` 创建 `<tsm>.tombstone.tmp`；若已有 v4 文件，用 `io.Copy` 把旧内容整段复制到 tmp，之后 `AddRange` 复用同一个 `pendingFile`/`gz` 追加新条目（`tombstone.go:302-340`）。
+- **v3**（header `0x1503`）：`writeTombstoneV3()` 每次把所有 tombstone 全量重写到新的临时文件（`tombstone.go:271-300`）；`prepareV4()` 遇到非 v4 header 返回 `errIncompatibleVersion` 时走这条回退路径。
+- 两者的 `commit()` 完全相同：`gz.Close → bw.Flush → tmp.Sync → rename(tmp, .tombstone) → SyncDir`（`tombstone.go:372-403`）。**没有任何一版是"直接追加到 .tombstone 文件"**——写入始终发生在 tmp 文件上，最后一次原子 rename 生效。
 
 ## 14. WAL 恢复流程
 
 Engine 启动时，`Open()` 调用 `reloadCache()` 从 WAL 文件恢复 Cache：
 
 ```go
-// tsdb/engine/tsm1/engine.go:2391 — reloadCache
+// tsdb/engine/tsm1/engine.go:2740 — reloadCache
 func (e *Engine) reloadCache() error {
     // 1. 获取所有 WAL segment 文件
     files, err := segmentFileNames(e.WAL.Path())
@@ -2014,6 +2502,24 @@ func (e *Engine) reloadCache() error {
 顺序重放。同一个 key 的多次写入会追加到 Cache entry 中，
 最终在 compaction 时去重。
 
+**WALSegmentReader 的字节语义**（`wal.go:1131-1213`）：
+
+`CacheLoader` 不直接解析字节，它通过 `WALSegmentReader` 逐条还原 entry：
+
+1. `Next()` 先读 `Type(1B) + Length(4B)`（`wal.go:1131-1150`）；`Length` 是 **Snappy 压缩后**的长度。
+2. 按 `Length` 读满 payload，再 `snappy.DecodedLen` + `snappy.Decode`（`wal.go:1155-1175`）。
+3. 按 `WalEntryType` 实例化 `WriteWALEntry`/`DeleteWALEntry`/`DeleteRangeWALEntry`，再调用 `UnmarshalBinary`（`wal.go:1177-1191`）。
+4. **只有 `UnmarshalBinary` 成功才累加 `r.n`**（`wal.go:1191-1195`），所以 `Count()` 永远停在"最后一条完整 entry 之后"的安全截断点。
+
+> **注意**：`Next()` 在读取/解压失败时仍返回 `true`（源码注释写明要让调用方去 `Read()` 取错误），错误放在 `r.err`，必须由随后的 `Read()` 返回（`wal.go:1141-1145`、`1200-1206`）。只调 `Next()` 不调 `Read()` 会静默跳过错误。
+
+**字节案例**：`_00002.wal` 在偏移 `131072` 处只剩半条记录（`Type+Length` 已读、payload 不足）：
+- `r.Next()` 的 `io.ReadFull` 返回 `io.ErrUnexpectedEOF`，`r.err` 置位，`r.n` 不变；
+- `r.Count()` 仍是 `131072`（上一条完整 entry 的末尾）；
+- `CacheLoader.Load` 用 `f.Truncate(131072)` 截掉这半条，前面已重放的数据保留，该 entry 整体丢弃。
+
+WAL 段文件的写入、`syncDelay` 批量 fsync 与 segment 滚动见 **15 号文档 §7.2**；本节的 `CacheLoader.Load` 与那边的 `WALSegmentReader` 是同一套字节格式。
+
 **WAL 恢复流程 Mermaid 图**:
 
 ```mermaid
@@ -2027,7 +2533,7 @@ sequenceDiagram
     Open->>WAL: ① segmentFileNames(path)
     Note over WAL: 扫描目录，按文件名排序:<br>_00001.wal, _00002.wal, _00003.wal
 
-    Open->>Cache: ② 保存 MaxSize (如 25MB)
+    Open->>Cache: ② 保存 MaxSize (默认 1GB)
     Open->>Cache: ③ SetMaxSize(0) — 临时禁用限制
     Note over Cache: 恢复过程中不受容量限制<br>防止 ErrCacheMemorySizeLimitExceeded
 
@@ -2085,30 +2591,48 @@ sequenceDiagram
 ## 15. Engine.Open() 初始化序列
 
 ```go
-// tsdb/engine/tsm1/engine.go:723 — Open
+// tsdb/engine/tsm1/engine.go:771-817 — Open
 func (e *Engine) Open() error {
-    // 1. 创建数据目录
-    os.MkdirAll(e.path, 0777)
-
-    // 2. 清理临时文件
-    e.cleanup()
-
-    // 3. 加载字段元数据 (fields.idx)
-    fields, err := tsdb.NewMeasurementFieldSet(filepath.Join(e.path, "fields.idx"))
-    e.fieldset = fields
-    e.index.SetFieldSet(fields)
-
-    // 4. 打开 WAL
-    if e.WALEnabled {
-        e.WAL.Open()
+    // 1. 创建数据目录 (error 必须返回)
+    if err := os.MkdirAll(e.path, 0777); err != nil {
+        return err
     }
 
-    // 5. 打开 FileStore (mmap 所有 TSM 文件)
-    e.FileStore.Open()
+    // 2. 清理临时文件 (error 必须返回)
+    if err := e.cleanup(); err != nil {
+        return err
+    }
 
-    // 6. 从 WAL 恢复 Cache
+    // 3. 加载字段元数据 (fields.idx)；失败只 Warn，不中断启动
+    fieldPath := filepath.Join(e.path, "fields.idx")
+    fields, err := tsdb.NewMeasurementFieldSet(fieldPath, e.logger)
+    if err != nil {
+        e.logger.Warn("error opening fields.idx: Rebuilding.", zap.String("path", fieldPath), zap.Error(err))
+    }
+
+    e.mu.Lock()
+    e.fieldset = fields
+    e.mu.Unlock()
+
+    e.index.SetFieldSet(fields)
+
+    // 4. 打开 WAL (error 必须返回)
     if e.WALEnabled {
-        e.reloadCache()
+        if err := e.WAL.Open(); err != nil {
+            return fmt.Errorf("error opening WAL for %q: %w", e.WAL.Path(), err)
+        }
+    }
+
+    // 5. 打开 FileStore (mmap 所有 TSM 文件, error 必须返回)
+    if err := e.FileStore.Open(); err != nil {
+        return err
+    }
+
+    // 6. 从 WAL 恢复 Cache (error 必须返回)
+    if e.WALEnabled {
+        if err := e.reloadCache(); err != nil {
+            return err
+        }
     }
 
     // 7. 打开 Compactor

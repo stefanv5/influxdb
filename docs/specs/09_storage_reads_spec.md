@@ -79,6 +79,14 @@ type GroupCursor interface {
 }
 ```
 
+> **审计校准（错误传播）**: `storage/reads/resultset.go:33` 的
+> `func (r *resultSet) Err() error { return nil }` 与
+> `group_resultset.go:108` 的 `func (g *groupResultSet) Err() error { return nil }`
+> 都**恒返回 nil**：ReadFilter / ReadGroup 路径上的 shard/cursor 错误不会通过
+> `Err()` 上抛，读失败与「无数据」不可区分。唯一会传播错误的结果集是
+> `windowAggregateResultSet`（`aggregate_resultset.go:148` 返回 `r.err`）。
+> 详见 §6.4。
+>
 > **小白解释**: `ResultSet` 像一个平铺的列表——每个 series 独立返回。
 > `GroupResultSet` 像一个分组的列表——先按 tag 分组，每组内有多个 series。
 > `GroupCursor.Aggregate()` 会影响输出 table 的列定义，例如 `mean` 需要同时理解 sum/count，
@@ -120,9 +128,10 @@ sequenceDiagram
     participant Table as Flux Table
 
     Flux->>Reader: ReadFilter(spec{db, rp, predicate, bounds})
-    Reader->>Reader: toStoragePredicate(spec.Predicate)
+    Reader->>Reader: （无转换）req.Predicate = spec.Predicate
     Reader->>Store: ReadFilter(ctx, req)
 
+    Store->>Store: validateArgs → findShardIDs → newIndexSeriesCursor
     Store->>TSI: 查找匹配的 series
     TSI-->>Store: SeriesCursor (遍历匹配 series)
 
@@ -227,7 +236,7 @@ func (fi *filterIterator) Do(f func(flux.Table) error) error {
     // 2. 构建 protobuf 请求
     var req datatypes.ReadFilterRequest
     req.ReadSource = any  // protobuf Any 类型
-    req.Predicate = predicate  // 转换后的 predicate
+    req.Predicate = fi.spec.Predicate  // 已是 *datatypes.Predicate，直传
     req.Range.Start = int64(fi.spec.Bounds.Start)
     req.Range.End = int64(fi.spec.Bounds.Stop)
 
@@ -300,7 +309,7 @@ func (fi *filterIterator) handleRead(f func(flux.Table) error, rs ResultSet) err
         fi.stats.ScannedBytes += stats.ScannedBytes
         table.Close()
     }
-    return rs.Err()
+    return rs.Err()  // 注意: filter 路径的 resultSet.Err() 恒为 nil, 见 §6.4
 }
 ```
 
@@ -343,6 +352,62 @@ func determineTableColsForSeries(tags models.Tags, typ flux.ColType) ([]flux.Col
 | 10:00 | 11:00 | 10:00:01 | 87.3 | web01 | us-east |
 | 10:00 | 11:00 | 10:00:02 | 88.1 | web01 | us-east |
 | 10:00 | 11:00 | 10:00:03 | 86.9 | web01 | us-east |
+
+### 3.5 services/storage.Store — 从 Flux 请求到 reads.ResultSet
+
+`storage/flux.storeReader` 只做协议搬运；真正的适配在 `services/storage.Store`
+（它实现 `reads.Store` 接口，同时把 TSI/TSDB 的 shard 定位接进来）。
+
+```mermaid
+flowchart TD
+    A["fi.Do<br/>reader.go:130"] --> B["Store.ReadFilterLimit<br/>store.go:126"]
+    B --> C["GetReadSource + validateArgs<br/>store.go:88-105"]
+    C --> D["findShardIDs<br/>store.go:63-86"]
+    D --> E{"len(shardIDs)==0?"}
+    E -->|"是"| F["return (nil, nil)"]
+    E -->|"否"| G["newIndexSeriesCursor<br/>series_cursor.go:33"]
+    G --> H["reads.NodeToExpr<br/>series_cursor.go:65"]
+    H --> I{"HasFieldKeyOrValue?"}
+    I -->|"否"| J["opt.Condition = cond<br/>measurementCond = cond"]
+    I -->|"是"| K["RewriteExprRemoveFieldValue /<br/>RewriteExprRemoveFieldKeyAndValue"]
+    J --> L["HasSingleMeasurementNoOR<br/>→ FieldKeysByMeasurement 快路径"]
+    K --> L
+    L --> M["CreateSeriesCursor"]
+    M --> N["reads.NewFilteredResultSet"]
+```
+
+**代码锚点**:
+
+- `store.go:126-176` `ReadFilterLimit`：`missing read source` → `validateArgs`
+  （默认 RP、把 start/end clamp 到 `models.MinNanoTime/MaxNanoTime`）→
+  `findShardIDs(database, rp, false, start, end)` → 空则 `(nil, nil)` →
+  `newIndexSeriesCursor` → `NewFilteredResultSet(start, end, cur)`；
+- `store.go:64-105` `findShardIDs`/`validateArgs`；
+- `series_cursor.go:40-100`：`NodeToExpr`、`HasFieldKeyOrValue` 分流、
+  `HasSingleMeasurementNoOR` + `FieldKeysByMeasurement` 快路径。
+
+**三条兄弟路径**:
+
+| 路径 | 入口 | 特点 |
+|---|---|---|
+| `ReadGroupLimit` | `store.go:177-232` | `descending := !reads.IsAscendingGroupAggregate(req)`；`newCursor` 闭包每次重建 series cursor；`reads.NewGroupResultSet` |
+| `WindowAggregateLimit` | `store.go:234-277` | `descending := !reads.IsAscendingWindowAggregate(req)`；`NewWindowAggregateResultSet` |
+| `TagKeys` / `TagValues` | `store.go:280/345` | `TagValues` 对 `_measurement` 走 `MeasurementNames` 快路径 |
+
+**案例**: `filter(host=="web" and _value>50)` → `shardIDs=[3,4]`、
+`measurementCond=host='web'`、`opt.Condition=host='web'`、
+`SeriesRow.ValueCond=_value>50`。若时间范围内没有 shard，`ReadFilterLimit` 返回
+`(nil, nil)`，`filterIterator.Do` 的 `if rs == nil { return nil }`
+（`reader.go:287-289`）直接结束，不产生 Table。
+
+**错误表**:
+
+| 条件 | 返回值 |
+|---|---|
+| `req.ReadSource == nil` | `errors.New("missing read source")` |
+| database / retention policy 不存在 | `validateArgs` 返回 `no database` / `invalid retention policy`（`store.go:88-101`） |
+| `findShardIDs` 出错 | 原样返回 |
+| 无 shard / `newIndexSeriesCursor` 返回 nil | `(nil, nil)`（上层当无数据） |
 
 ## 4. GroupResultSet — 聚合/分组查询
 
@@ -437,19 +502,101 @@ sequenceDiagram
     end
 ```
 
+### 4.4 groupIterator.handleRead — GroupCursor 到 Flux Table
+
+```mermaid
+sequenceDiagram
+    participant Flux as Flux
+    participant GI as groupIterator
+    participant Store as services/storage.Store
+    participant RS as GroupResultSet
+    participant GC as GroupCursor
+    participant Table as GroupTable
+
+    Flux->>GI: Do(f)
+    GI->>GI: GetSource + 校验 GroupModeNone/GroupKeys
+    GI->>GI: convertGroupMode + determineAggregateMethod
+    GI->>Store: ReadGroup(ctx, req)
+    Store-->>GI: rs (可能为 nil)
+    GI->>GI: rs == nil ? return nil
+    GI->>RS: Next() → gc
+    loop 每个 GroupCursor
+        loop gc.Next()
+            GC->>GC: Cursor()
+        end
+        alt cur 为空
+            GI->>GC: Close() 后 gc = rs.Next()
+        else 有数据
+            GI->>GI: groupKeyForGroup(gc.PartitionKeyVals())<br/>determineTableColsForGroup(gc.Keys(), ...)
+            GI->>Table: new*GroupTable(done, gc, typedCur, ...)
+            GI->>Flux: f(table)
+            GI->>GC: 等 done 或 ctx.Done()
+            GI->>GI: 累计 stats 后 gc = rs.Next()
+        end
+    end
+    GI-->>Flux: return rs.Err() (group 路径恒 nil)
+```
+
+**`handleRead` 逐段**（`storage/flux/reader.go:293-378`）:
+
+1. `gc = rs.Next()`；`for gc != nil` 外层循环；
+2. 内层 `for gc.Next()` 找到第一个 `Cursor() != nil` 的 series；若整组都无数据，
+   `gc.Close()` 后取下一组；
+3. `key := groupKeyForGroup(gc.PartitionKeyVals(), &gi.spec, bnds)`；
+4. `cols, defs := determineTableColsForGroup(gc.Keys(), flux.T<Type>, gc.Aggregate(), key)`；
+5. `new<Type>GroupTable(...)` 把 `gc` 与 typed cursor 一起交给 table；
+6. **所有权转移**: `cur = nil; gc = nil`（`reader.go:355-356`），由 `table.Close()`
+   负责释放 cursor/group cursor；
+7. `f(table)` 回调 Flux；`select { case <-done: case <-gi.ctx.Done(): table.Cancel(); break READ }`；
+8. `stats` 累加后 `table.Close()`，再 `gc = rs.Next()`；
+9. 末尾 `return rs.Err()`——对 `groupResultSet` 恒为 nil（见 §6.4）。
+
+**案例**: 3 个 series，`web01` 有 100 点、`web02` 无点、`web03` 有 50 点，
+查询 `group(columns: ["host"]) |> count()`。`groupIterator.Do` 构造 `ReadGroupRequest` 时
+**未设置 `Hints`**，故 `HintSchemaAllTime()` 为 false，`groupBySort` 会对每个 series 调
+`seriesHasPoints`（`group_resultset.go:120-149 / 230-234`）：`web02` 首块时间戳为空被直接
+丢弃，最终只得到 **2 个 GroupCursor**（`PartitionKeyVals` 分别为 `web01/web03`），
+不会为 `web02` 产生空分组（与 §11.4.4 一致）。
+
+**注意**: `Cursor()` 为 nil **不**表示「该 series 无点」。`createCursor`
+（`storage/reads/array_cursor.go:108-146`）只在所有 shard 的 `shard.Next` 都返回 nil 时返回 nil；
+无点的 series 会返回**非 nil 的空游标**。真正触发「`gc.Next()` 为 true 而 `Cursor()` 为 nil」的
+情形是 `arrayCursorIterator.Next` 返回 `(nil, nil)`——即 `SeriesRow` 引用的 measurement/field
+不在该 shard 的 fieldset 中（`tsdb/engine/tsm1/array_cursor_iterator.go:41-50`），此时
+内层 `for gc.Next()` 循环耗尽后整组 `gc.Close()` 跳过。非 selector 聚合的输出列为
+`_start, _stop, _value, host`；若是 `last()`（selector），列定义会多出 `_time`。
+
+**错误/取消**: `rs == nil` 表示无数据（直接返回 nil）；`gc.Next() == false` 表示该组
+无 series；`ctx.Done()` 时 `table.Cancel()` 并 `break READ`。
+
 ## 5. Predicate 求值 — 条件过滤
 
-### 5.1 Predicate 转换流程
+### 5.1 Predicate 的来源与下推分层
 
 ```mermaid
 flowchart LR
-    A["Flux Predicate<br>(influxdb.Predicate)"] --> B["toStoragePredicate()"]
-    B --> C["datatypes.Predicate<br>(Protobuf Node 树)"]
-    C --> D["NodeToExpr()"]
-    D --> E["influxql.Expr<br>(Go AST)"]
-    E --> F["IndexSet.seriesByExprIterator()"]
-    F --> G["匹配的 SeriesID 集合"]
+    A["Flux planner<br/>flux_predicate.go:20<br/>toStoragePredicateHelper"] --> B["*datatypes.Predicate<br/>存入 ReadFilterSpec.Predicate"]
+    B --> C["storage/flux/reader.go:145<br/>req.Predicate = fi.spec.Predicate（直传）"]
+    C --> D["services/storage/series_cursor.go:65<br/>reads.NodeToExpr(root, measurementRemap)"]
+    D --> E{"HasFieldKeyOrValue?"}
+    E -->|"否：纯 tag 条件"| F["opt.Condition = cond"]
+    E -->|"是：含 field/value"| G["measurementCond = RewriteExprRemoveFieldValue<br/>opt.Condition = RewriteExprRemoveFieldKeyAndValue"]
+    F --> H["CreateSeriesCursor<br/>→ SeriesCursor"]
+    G --> H
+    H --> I["SeriesRow.ValueCond<br/>（field 条件只留在 cursor 层）"]
 ```
+
+`storage/flux` 只负责搬运 predicate：`req.Predicate = fi.spec.Predicate`
+（`storage/flux/reader.go:145`），本包内**不存在** `toStoragePredicate`
+（它只作为测试闭包出现在 `flux/stdlib/influxdata/influxdb/rules_test.go:164`）。真正的转换发生在 Flux planner
+（`flux/stdlib/influxdata/influxdb/flux_predicate.go:20` 的
+`toStoragePredicateHelper`），把 Flux 表达式变成 `*datatypes.Predicate`。
+
+`NodeToExpr` 也不在 Flux reader，而在 `services/storage/series_cursor.go:65`：
+它把 protobuf 节点转回 `influxql.Expr`，然后按是否含 field/value 条件分流——
+纯 tag 条件整体下推到索引（`opt.Condition`）；含 field 条件时拆成
+`measurementCond`（去 field/value）与 `opt.Condition`（去 field key/value），
+`_value > 50` 这类条件以 `SeriesRow.ValueCond` 留在 cursor 层过滤。
 
 ### 5.2 datatypes.Predicate — Protobuf 表示
 
@@ -546,6 +693,47 @@ func NodeToExpr(node *datatypes.Node, remap map[string]string) (influxql.Expr, e
 > `Node_Comparison…`、`Node_Logical…`。裸的 `NodeTypeComparisonExpression` /
 > `ComparisonEqual` / `LogicalAnd` 等命名不存在。
 
+### 5.5 Predicate 求值语义（storage/reads.evalBinaryExpr）
+
+Predicate 下推到 cursor 层后由 `storage/reads` 自己的求值器执行——它与查询结果
+表达式用的 `influxql.ValuerEval` 是**两份不同实现**，不能混用。
+
+```mermaid
+flowchart TD
+    A["astExpr.EvalBool<br/>influxql_expr.go:17"] --> B["EvalExprBool<br/>influxql_eval.go:281"]
+    B --> C["evalExpr<br/>influxql_eval.go:11"]
+    C --> D["evalBinaryExpr<br/>influxql_eval.go:41"]
+    C --> E["BinaryExpr / BooleanLiteral / IntegerLiteral /<br/>UnsignedLiteral / NumberLiteral / ParenExpr /<br/>RegexLiteral / StringLiteral / VarRef → m.Value"]
+    E --> F["default → nil"]
+```
+
+**语义表**:
+
+| 类型 | 支持 | 除零/边界 | 类型不符 |
+|---|---|---|---|
+| bool | AND/OR/BITWISE/EQ/NEQ | 两侧先求值（**非短路**），结果 `ok && ...` | `ok=false` → false |
+| float64 | 比较/四则/MOD | `/0 → float64(0)`；`MOD 0 → NaN`（`math.Mod`） | 返回 nil |
+| int64 | 比较/四则/MOD/位运算 | `/0 → float64(0)`；`%0 → int64(0)` | 返回 nil |
+| string | EQ/NEQ/EQREGEX/NEQREGEX | — | 返回 nil |
+| []byte | 同 string（先转 string） | — | 返回 nil |
+| uint64 | **无 `case uint64`** | 二元运算落到 `nil` → `EvalBool` 为 false | — |
+
+**nil 规则**: `lhs == nil && rhs != nil` 且 rhs 是 bool 时把 lhs 隐式转 false；
+反之 lhs 非 nil 且 rhs 为 nil 且 lhs 是 bool 时把 rhs 转 false
+（`influxql_eval.go:44-54`）。因此 `WHERE host='web' AND active` 中缺失的
+`active` 按 false 参与 AND。
+
+**案例**:
+
+- `WHERE value / 0 > 1`：`value/0 → float64(0)`，`0 > 1` 为 false，不报错。
+- `WHERE host =~ /web[0-9]+/ AND active`：`active` 若缺失，`nil → false`，整体 false。
+- `WHERE uint_field > 1`（若 unsigned 进入谓词）：没有 `uint64` case，返回 `nil`，
+  `EvalBool` 当 false——这是当前实现的限制。
+
+> **注意**: 本节只讲**谓词**。查询结果表达式（`SELECT a/b`）见 03 号文档 §9.2，
+> 那里使用 `influxql.ValuerEval{IntegerFloatDivision: true}`，所有 int/int 除法都是
+> float64；不要把两套语义混写。
+
 ## 6. 多 Shard 游标管理
 
 ### 6.1 multiShardCursors 接口
@@ -579,26 +767,36 @@ flowchart TD
 
 | 类型 | 说明 |
 |------|------|
-| `AggregateTypeNone` | 无聚合 (原始数据) |
-| `AggregateTypeSum` | 求和 |
-| `AggregateTypeCount` | 计数 |
-| `AggregateTypeFirst` | 第一个值 (selector) |
-| `AggregateTypeLast` | 最后一个值 (selector) |
-| `AggregateTypeMin` | 最小值 |
-| `AggregateTypeMax` | 最大值 |
-| `AggregateTypeMean` | 平均值 |
+| `datatypes.Aggregate_AggregateTypeNone` | 无聚合 (原始数据) |
+| `datatypes.Aggregate_AggregateTypeSum` | 求和 |
+| `datatypes.Aggregate_AggregateTypeCount` | 计数 |
+| `datatypes.Aggregate_AggregateTypeFirst` | 第一个值 (selector) |
+| `datatypes.Aggregate_AggregateTypeLast` | 最后一个值 (selector) |
+| `datatypes.Aggregate_AggregateTypeMin` | 最小值 |
+| `datatypes.Aggregate_AggregateTypeMax` | 最大值 |
+| `datatypes.Aggregate_AggregateTypeMean` | 平均值 |
 
 WindowAggregate 还支持 `mean,count` 双 aggregate 组合，用于同时输出 mean
 语义所需的平均值和计数信息。
 
 ### 6.3 Multi-Shard 游标链式实现
 
+**关键常量**:
+
+| 常量 | 值 | 位置 | 作用 |
+|---|---|---|---|
+| `MaxPointsPerBlock` | 1000 | `storage/reads/array_cursor.gen.go:24` | 聚合游标每批最多输出点数；缓冲满时用 `c.tmp` 续读 |
+| 零窗口 `resLen` | 1 | `array_cursor.gen.go:645-652` | 零窗口聚合只保留一个输出槽 |
+| `defaultMaxLengthForTagsCache` | 100 | `storage/flux/tags_cache.go` | tagsCache LRU 上限 |
+
+`DefaultChunkSize=10000` 属于 Flux 引擎，不是本模块常量。
+
 > **小白解释**: 多 Shard 游标就像**接力赛**——第一个 Shard 的数据读完后，自动切换到第二个 Shard，对上层完全透明。
 
 #### 6.3.1 multiShardArrayCursors — 工厂实现
 
 ```go
-// storage/reads/array_cursor.go:75 — multiShardArrayCursors
+// storage/reads/array_cursor.go:65 — multiShardArrayCursors
 type multiShardArrayCursors struct {
     ctx context.Context
     req cursors.CursorRequest
@@ -612,7 +810,7 @@ type multiShardArrayCursors struct {
     }
 }
 
-// storage/reads/array_cursor.go:119 — createCursor
+// storage/reads/array_cursor.go:108 — createCursor
 func (m *multiShardArrayCursors) createCursor(row SeriesRow) cursors.Cursor {
     m.req.Name = row.Name
     m.req.Tags = row.SeriesTags
@@ -687,7 +885,7 @@ sequenceDiagram
 ```
 
 ```go
-// storage/reads/array_cursor.gen.go:310 — floatMultiShardArrayCursor.Next
+// storage/reads/array_cursor.gen.go:317 — floatMultiShardArrayCursor.Next
 // 注意: 以下为简化版本 — 实际代码还包含 filter 包装、类型断言错误处理和 c.err 设置
 func (c *floatMultiShardArrayCursor) Next() *cursors.FloatArray {
 	for {
@@ -757,7 +955,7 @@ multi-shard array cursor 不会同时持有多个 shard 的数据 cursor；它�
 #### 6.3.3 聚合下推 — Count/Sum/Selector/Min/Max/Mean 在存储层执行
 
 ```go
-// storage/reads/array_cursor.go:19 — newAggregateArrayCursor
+// storage/reads/array_cursor.go:20 — newAggregateArrayCursor
 func newAggregateArrayCursor(ctx context.Context, agg []*datatypes.Aggregate, cursor cursors.Cursor) (cursors.Cursor, error) {
     switch agg[0].Type {
     case datatypes.Aggregate_AggregateTypeFirst, datatypes.Aggregate_AggregateTypeLast:
@@ -793,14 +991,16 @@ func NewWindowAggregateArrayCursor(ctx context.Context, agg []*datatypes.Aggrega
 }
 ```
 
-**Sum 游标行为** (`array_cursor.gen.go:637-747` — `floatWindowSumArrayCursor`):
+**Sum 游标行为** (`array_cursor.gen.go:637-760` — `floatWindowSumArrayCursor`):
 
 > **审计校准**: 该游标的真实类型名是 `floatWindowSumArrayCursor` (window 版)，
-> 不是 `floatArraySumCursor`。它的 `Next()` 是**多窗口**实现——通过
-> `window.GetLatestBounds` 枚举窗口，每个窗口产出一个点
-> (`c.res.Timestamps[pos] = windowEnd`)，并在窗口内累加 `acc`。当输出缓冲满
-> `MaxPointsPerBlock` 时，把剩余输入点暂存到 `c.tmp`，下次 `Next()` 继续处理。
-> 这**不是**单点累加返回一个聚合结果。
+> 不是 `floatArraySumCursor`。它有两种模式，由 `window.IsZero()` 决定：
+>
+> - **零窗口**（`ReadGroup` 的 `GROUP BY tag` 路径、无 window 的 `WindowAggregate`）：
+>   构造时 `resLen = 1`（`array_cursor.gen.go:645-652`），`windowEnd = math.MaxInt64`
+>   （`672-678`），整条 series 累加为**一个**点。**这就是「单点累加返回一个聚合结果」**。
+> - **非零窗口**（`aggregateWindow(every: 1m)`）：用 `window.GetLatestBounds` 逐窗口
+>   产点；缓冲满 `MaxPointsPerBlock=1000` 时把剩余输入存入 `c.tmp`，下次 `Next()` 续读。
 
 ```go
 // storage/reads/array_cursor.gen.go:637 — floatWindowSumArrayCursor
@@ -809,6 +1009,19 @@ type floatWindowSumArrayCursor struct {
     res    *cursors.FloatArray
     tmp    *cursors.FloatArray   // 跨 Next() 调用的 carry-over 缓冲
     window interval.Window
+}
+
+func newFloatWindowSumArrayCursor(cur cursors.FloatArrayCursor, window interval.Window) *floatWindowSumArrayCursor {
+    resLen := MaxPointsPerBlock
+    if window.IsZero() {
+        resLen = 1
+    }
+    return &floatWindowSumArrayCursor{
+        FloatArrayCursor: cur,
+        res:              cursors.NewFloatArrayLen(resLen),
+        tmp:              &cursors.FloatArray{},
+        window:           window,
+    }
 }
 
 func (c *floatWindowSumArrayCursor) Next() *cursors.FloatArray {
@@ -828,15 +1041,20 @@ func (c *floatWindowSumArrayCursor) Next() *cursors.FloatArray {
 
     rowIdx := 0
     var acc float64 = 0
-    // 通过 window.GetLatestBounds 计算当前点的窗口结束时间
-    windowEnd := int64(c.window.GetLatestBounds(values.Time(a.Timestamps[rowIdx])).Stop())
+    // 零窗口用 MaxInt64 作为唯一窗口的结束时间; 非零窗口按 GetLatestBounds 计算
+    var windowEnd int64
+    if !c.window.IsZero() {
+        windowEnd = int64(c.window.GetLatestBounds(values.Time(a.Timestamps[rowIdx])).Stop())
+    } else {
+        windowEnd = math.MaxInt64
+    }
     windowHasPoints := false
 
 WINDOWS:
     for {
         for ; rowIdx < a.Len(); rowIdx++ {
             ts := a.Timestamps[rowIdx]
-            if ts >= windowEnd {
+            if !c.window.IsZero() && ts >= windowEnd {
                 // 进入新窗口: 先关闭旧窗口 (若有数据则产出一点)
                 if windowHasPoints {
                     c.res.Timestamps[pos] = windowEnd
@@ -885,12 +1103,17 @@ WINDOWS:
 > **小白解释**: 聚合下推就像**在仓库里先打包**——不用把所有原始货物都运到店里再数，
 > 而是在仓库里直接数好（Count）、称好总重量（Sum）、挑出首尾/最大最小值，
 > 或计算平均值（Mean），只把结果运回来。
-> 这大大减少了数据传输量。Sum 游标尤其要按窗口切分：每个 `aggregateWindow(every: 1m)`
-> 窗口产出一个和值点，而不是把整条 series 压成单个总和。
+> 这大大减少了数据传输量。非零窗口按 `aggregateWindow(every: 1m)` 每窗口一个和值点；
+> 零窗口（`GROUP BY tag`）则整条 series 压成一个点。
 
 #### 6.3.4 辅助组件
 
-**limitSeriesCursor** (`storage/reads/series_cursor.go:27`):
+**limitSeriesCursor** (`storage/reads/series_cursor.go:32`；**dead code，仅作设计参考**):
+
+> **审计校准**: `NewLimitSeriesCursor` 全仓库没有任何调用点（`rg` 只命中定义本身）；
+> `ReadFilterLimit/ReadGroupLimit/WindowAggregateLimit` 的 `limitShardIDs` 参数在
+> OSS 内部调用中一律传 `nil`（`store.go:174/231/277`）。因此本版本 OSS **没有**
+> series limit / shard limit 下推，下面这段只是保留的设计参考。
 
 ```go
 type limitSeriesCursor struct {
@@ -936,6 +1159,46 @@ type KeyMerger struct {
 | 存储内容 | Arrow `*array.String` tag 数组，以及 `_start/_stop` 使用的 `*array.Int` 数组 |
 | 复用策略 | 长度匹配直接复用, 更大则切片, 更小则替换 |
 | 驱逐时机 | `GetTag()` 插入时, 超过 max 则驱逐尾部 |
+
+### 6.4 错误传播矩阵
+
+`ResultSet.Err()` / `GroupResultSet.Err()` 在 filter/group 路径上恒为 nil，
+这是当前实现最重要的语义之一：
+
+| 路径 | `Err()` 来源 | shard/cursor 错误最终表现 |
+|---|---|---|
+| ReadFilter (`resultSet`) | `resultset.go:33` 恒 nil | series 提前结束，无错误 |
+| ReadGroup (`groupResultSet`) | `group_resultset.go:108` 恒 nil；`groupBySort/groupNoneSort` 出错时 `return nil`（`81-97`） | 返回 `(nil,nil)`，上层当无数据 |
+| WindowAggregate (`windowAggregateResultSet`) | `aggregate_resultset.go:148` 返回 `r.err` | 可传播到 reader |
+| multiShard array cursor | `storage/reads/array_cursor.gen.go:311` 等 `Err() { return c.err }` | 仅 `nextArrayCursor` 设置；上层多为 nil |
+
+两个相关细节:
+
+```go
+// storage/reads/array_cursor.go:81-91 — [start, stop) → 闭区间
+req := cursors.CursorRequest{
+    Ascending: asc,
+    StartTime: start,
+    EndTime:   end - 1,   // CursorRequest 两端都 inclusive
+}
+
+// storage/reads/array_cursor.go:108-118 — createCursor
+var shard cursors.CursorIterator
+var cur cursors.Cursor
+var err error
+for cur == nil && len(row.Query) > 0 {
+    shard, row.Query = row.Query[0], row.Query[1:]
+    cur, err = shard.Next(m.ctx, &m.req)
+}
+if cur == nil || err != nil {
+    return nil                       // 错误被折叠为「该 series 无数据」
+}
+```
+
+**结论**: 在 ReadFilter / ReadGroup 路径上，"读失败"与"无数据"不可区分；
+不要写成"错误会通过 `Err()` 返回"。只有 WindowAggregate 路径会把
+`windowAggregateResultSet.err` 传播到 `storage/flux/reader.go:233` 的
+`return rs.Err()`。
 
 ## 7. TagKeys / TagValues 查询
 
@@ -988,6 +1251,58 @@ func (ti *tagKeysIterator) Do(f func(flux.Table) error) error {
 | `models.MeasurementTagKey` | `_measurement` | measurement 名称 |
 | `models.FieldKeyTagKey` | `_field` | field 名称 |
 | 其他 | 原样返回 | 如 `host`, `region` |
+
+### 7.3 tagValuesIterator — 与 tagKeys 的关键差异
+
+```mermaid
+sequenceDiagram
+    participant TI as tagValuesIterator
+    participant Store as services/storage.Store
+    participant TSDB as TSDBStore
+    participant Table as Flux Table
+
+    TI->>TI: TagKey 反向映射<br/>_measurement→models.MeasurementTagKey<br/>_field→models.FieldKeyTagKey
+    TI->>Store: TagValues(ctx, TagValuesRequest)
+    alt TagKey == _measurement
+        Store->>Store: MeasurementNames 快路径
+    else 普通 tag
+        Store->>TSDB: TagValues(ctx, auth, shardIDs, tagKey, expr)
+        TSDB-->>Store: StringIterator
+    end
+    Store-->>TI: cursors.StringIterator
+    TI->>Table: handleRead: 只建一列 _value
+```
+
+**`tagValuesIterator.Do`**（`storage/flux/reader.go:938-970`）先把 Flux 的
+`_measurement` / `_field` 反向映射成内部 key，再发 `TagValuesRequest`。
+**`handleRead`**（`972-1000`）只 `AddCol` 一列 `_value`（`flux.TString`），
+然后逐条 `rs.Value()` 写入——**不追加 `_start/_stop`，也不做 key 反向映射**。
+这是与 tagKeys 的关键差异：tagKeys 会追加 `_start/_stop` 并把 `_measurement`/
+`_field` 映射成 Flux 名，tagValues 的值原样返回。
+
+| 维度 | tagKeysIterator（`reader.go:853-930`） | tagValuesIterator（`938-1004`） |
+|---|---|---|
+| 预置行 | `_start`、`_stop` 两个哨兵值 | 无 |
+| key 反向映射 | `MeasurementTagKey → _measurement`、`FieldKeyTagKey → _field` | 请求方向映射（`_measurement → MeasurementTagKey`） |
+| 输出列 | 单列 `_value` | 单列 `_value` |
+| 来源 | `Store.TagKeys` | `Store.TagValues`（`_measurement` 走 `MeasurementNames`） |
+
+### 7.4 key 重映射与下推限制
+
+`services/storage/store.go:345-390` 的 `TagValues`:
+
+1. `measurementRemap[req.TagKey] == "_name"` 时直接走 `MeasurementNames` 快路径
+   （`store.go:347-353`）；`_measurement` 在 `measurementRemap` 中映射为 `_name`。
+2. 否则 `TagsSource == nil` → `missing read source`；`validateArgs` + `findShardIDs`；
+3. 无 shard → 返回空 `StringSliceIterator`（不是 nil）；
+4. `NodeToExpr` 后若 `HasFieldValueKey(expr)` → `field values unsupported`；
+5. 普通 tag 走 `TagValues` + `_tagKey = ?` 条件。
+
+**案例**:
+
+- `tagValues(tag: "_measurement")` → `MeasurementNames` 快路径，返回所有 measurement 名；
+- `tagValues(tag: "host", predicate: _value > 50)` → `field values unsupported`；
+- `tagValues(tag: "host")` → `TSDBStore.TagValues` 返回去重排序的 tag 值。
 
 ## 8. 关键文件索引
 
@@ -1100,6 +1415,10 @@ func newAggregateArrayCursor(
 ) (cursors.Cursor, error)
 ```
 
+> **审计校准（限制下推）**: 本版本 OSS 不存在 series limit / shard limit 下推。
+> `NewLimitSeriesCursor` 无调用点；`ReadFilterLimit/ReadGroupLimit/WindowAggregateLimit`
+> 的 limit 参数只在内部以 `nil` 传入（`store.go:174/231/277`）。
+
 **案例**: Flux 查询 `range |> filter |> aggregateWindow(every: 1m, fn: mean)`
 会被转换成 `ReadWindowAggregateRequest`。storage 层创建每个 series 的
 array cursor 后，再用 `mean` 聚合 cursor 输出每个窗口的值。`last` 这类
@@ -1110,7 +1429,7 @@ selector 可以利用降序读取减少扫描；`mean` 则需要 sum/count 语�
 ### 10.1 Predicate 转换的 StartsWith 未实现
 
 ```go
-case datatypes.ComparisonStartsWith:
+case datatypes.Node_ComparisonStartsWith:
     v.err = errors.New("startsWith not implemented")
 ```
 
@@ -1636,7 +1955,7 @@ flowchart TD
 > ```
 > nAggs == 2
 > req.Aggregate[0].Type == Aggregate_AggregateTypeMean  ✓
-> req.Aggregate[1].Type == Aggregate_AggregateTypeSum   ✗ (期望 Count)
+> req.Aggregate[1].Type == datatypes.Aggregate_AggregateTypeSum   ✗ (期望 Count)
 > → 返回 error: "attempt to create a windowAggregateResultSet with MEAN, SUM aggregates"
 > ```
 >

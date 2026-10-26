@@ -184,6 +184,21 @@ const (
 > **注意**: 时间戳压缩有三种自适应模式: **RLE** (所有差值相按时), **Simple8b** (差值适合 60 位时), **Uncompressed** (差值过大时)。
 > 值压缩中 Integer/Unsigned 使用相同的 IntegerEncoder，先做 Delta 编码，再 ZigZag 编码，最后 Simple8b 打包。
 
+**编码器决策表**:
+
+| 输入特征 | 编码类型 | 首字节位域 / 关键常量 |
+|---|---|---|
+| 时间戳 delta 全相等且 len>1 | `timeCompressedRLE` (2) | `2<<4 \| log10(divisor)`，随后 8B t0 + 8B delta |
+| 时间戳 delta 最大值 ≤ `simple8b.MaxValue` | `timeCompressedPackedSimple` (1) | `1<<4 \| log10(divisor)`，8B 首 delta + Simple8b |
+| 时间戳 delta 最大值 > `1<<60-1` | `timeUncompressed` (0) | `0<<4`，逐 8B |
+| float 值 | Gorilla XOR | `0x10`；`math.NaN()`（`0x7FF8000000000001`）作哨兵 |
+| int/uint 值 | Simple8b / RLE / Raw | 首字节 `0/1/2 << 4` + 8B 首值 |
+| bool 值 | bit-packed | `booleanCompressedBitPacked << 4` + uvarint 数量 |
+| string 值 | Snappy | `stringCompressedSnappy << 4` + Snappy |
+
+**常量数值表**: `maxKeyLength=65535`、`maxIndexEntries=65535`、`fsyncEvery=25MiB`、
+`indexEntrySize=28`、`indexCountSize=2`、`indexTypeSize=1`（`writer.go:88-104`）。
+
 ### 3.5 unpackBlock — packBlock 的读侧逆运算
 
 `packBlock`（§3.2）把 `type + varint(tsLen) + ts + values` 拼成一段字节流。
@@ -227,9 +242,15 @@ func unpackBlock(buf []byte) (ts, values []byte, err error) {
 }
 ```
 
-调用链固定为两步：先 `BlockType(block)` 取类型，再 `unpackBlock(block[1:])` 拆 ts/values。
-`tsdb/engine/tsm1/encoding.go:242` 的 `BlockCount` 和 `:251` 的 `DecodeBlock` 都遵循
-这个模式（`tb, _, err := unpackBlock(block[1:])`）。
+调用链按用途分派，不能混为一谈（`encoding.go:237-320`、`399-404`）：
+
+- `BlockCount(block)`：先检查 `len(block) > encodedBlockHeaderSize`（=1），
+  再 `unpackBlock(block[1:])`，最后 `CountTimestamps(tb)`。它只数时间戳，不做类型分派。
+- `DecodeBlock(block, vals)`：先 `BlockType(block)` 校验类型，再按类型分派到
+  `DecodeFloatBlock` / `DecodeIntegerBlock` / ...；这些函数自己先 `block = block[1:]`，
+  再 `unpackBlock(block)` 拆出 `tb/vb`，最后用对应 decoder 解码。
+- 两者都做最小长度检查：`len(block) <= encodedBlockHeaderSize` 时返回
+  “short block” 错误；`encodedBlockHeaderSize = 1`。
 
 ```mermaid
 flowchart LR
@@ -255,38 +276,140 @@ flowchart LR
 
 **case 说明 (拆解一个 float block)**:
 
-假设有一个 `BlockFloat64` block，由 `packBlock` 写出，内容是 `[0x00][uvarint tsLen=8][8B ts][Gorilla XOR values]`。
-
 ```
-encodedBlock (hex, 已跳过 CRC):
-  00 08 01 00 00 00 00 00 03 e8  [ts=8B] [values=...Gorilla...]
+encodedBlock (hex, 已跳过 4B CRC):
+  00 09 1? 00 00 00 00 00 00 03 e8 ...   [values ...]
+
+  byte 0      = 0x00 → BlockFloat64
+  byte 1      = 0x09 → uvarint tsLen = 9
+  bytes 2..10 = ts 段 9B: 首字节 0x1?（高 4 位=1 Simple8b，低 4 位=log10(divisor)）
+                + 8B 首个 delta
+  bytes 11..  = values 段: 首字节 0x10（floatCompressedGorilla<<4）
+                + Gorilla 位流 + math.NaN() 哨兵
 
 BlockType(block):
   block[0] = 0x00 → BlockFloat64 ✓
 
 unpackBlock(block[1:]):
-  buf = block[1:] = 08 01 00 00 00 00 00 03 e8 ...
-  binary.Uvarint(buf):
-    buf[0] = 0x08 (< 0x80, 单字节 uvarint)
-    → tsLen = 8, i = 1
-  tsIdx = 1 + 8 = 9
-  tsIdx(9) > len(buf)? 假设 buf 至少 9 字节 → 否
-  ts = buf[1:9] = 01 00 00 00 00 00 03 e8   (8 字节时间戳压缩流)
-  values = buf[9:] = ... (Gorilla XOR 压缩的 float 值流, 长度 = len(buf)-9)
+  buf = block[1:] = 09 1? ...
+  binary.Uvarint(buf): buf[0] = 0x09 → tsLen = 9, i = 1
+  tsIdx = 1 + 9 = 10
+  ts     = buf[1:10]   (9B 时间戳段)
+  values = buf[10:]    (Gorilla 值流)
 
-后续 DecodeBlock 分支:
-  switch typ {
-  case BlockFloat64:
-      var buf []FloatValue
-      // 用 ts (IntegerDecoder 解时间戳) + values (FloatDecoder 解 Gorilla XOR)
-      // 重建 []FloatValue
-  }
+DecodeFloatBlock(block):
+  block = block[1:]                  // 跳过 type
+  tb, vb, err := unpackBlock(block)  // tb=9B, vb=Gorilla 流
+  tdec.Init(tb)                      // TimeDecoder，不是 IntegerDecoder
+  vdec.SetBytes(vb)                  // FloatDecoder: Gorilla XOR
+  // 边界: ts 段至少 9B（1B 编码头 + 8B 首 delta）；values 段以 0x10 开头、以 NaN 哨兵结尾
 ```
 
 关键边界行为：
 - `unpackBlock` **不校验 type 字节**——传入 `block[1:]` 是调用方契约，传错（比如传整个 `block`）会把 type 字节当成 uvarint 第一字节解析，得到错误的 `tsLen`。
 - `values = buf[tsIdx:]` 可能是空切片（如果 `tsLen` 恰好等于剩余长度），这对应 0 个值的 block；解码器会进一步处理。
 - `binary.Uvarint` 在 `buf` 全零或损坏时返回 `i = 0`（重新读）或负数（溢出），`unpackBlock` 统一通过 `i <= 0` 拦截，避免 `ts = buf[0:tsIdx]` 用非法 `tsIdx` 越界。
+
+### 3.5.1 ts/values 段的内部字节布局
+
+`Block = CRC32(4B) + Data`，`Data = type(1B) + uvarint(tsLen) + ts(tsLen B) + values(剩余)`。
+
+**时间戳 ts**（`timestamp.go:46-49, 95-176`）:
+
+```
+首字节 = (编码类型 << 4) | log10(divisor)
+  编码类型: 0=timeUncompressed, 1=timeCompressedPackedSimple, 2=timeCompressedRLE
+随后 8B 首个 delta；其余 delta/divisor 进 Simple8b（或 RLE/Raw）
+阈值: delta 最大值 > simple8b.MaxValue (1<<60 - 1) → Raw
+```
+
+**float values**（`float.go:17-19, 29-36, 77-90`）:
+
+```
+首字节 = floatCompressedGorilla << 4 (0x10)
+随后 Gorilla XOR 位流；Flush() 写入 math.NaN() 哨兵（0x7FF8000000000001）
+→ NaN 不能作为数据值
+```
+
+**integer/unsigned values**（`int.go:25-36, 125-134`）:
+
+```
+首字节高 4 位 = intUncompressed(0)/intCompressedSimple(1)/intCompressedRLE(2)
+随后 8B 首个值 + Simple8b/RLE/Raw
+```
+
+**boolean values**（`bool.go:86-96`）:
+
+```
+首字节高 4 位 = booleanCompressedBitPacked
++ uvarint 数量 + 位打包字节
+```
+
+**string values**（`batch_string.go:70-89`）:
+
+```
+首字节高 4 位 = stringCompressedSnappy(1) + Snappy 压缩的拼接字符串
+```
+
+**阈值/常量**（`writer.go:88-104`）:
+
+```
+maxKeyLength    = 65535  (2B)
+maxIndexEntries = 65535  (2B)
+fsyncEvery      = 25 * 1024 * 1024
+indexEntrySize=28, indexCountSize=2, indexTypeSize=1
+```
+
+**段布局图**（以 `packBlock` 的输出为视角）:
+
+```mermaid
+flowchart LR
+    B["Block = CRC32(4B) + Data"] --> D["Data"]
+    D --> T["type(1B)<br/>BlockFloat64=0"]
+    D --> L["uvarint tsLen"]
+    D --> TS["ts(tsLen B)"]
+    D --> V["values(剩余字节)"]
+    TS --> E1["TimeEncoder.Bytes()<br/>首字节: 编码类型<<4 | log10(divisor)"]
+    E1 --> E2["首 delta(8B)"]
+    E1 --> E3["Simple8b / RLE / Raw 尾部"]
+    V --> F1["FloatEncoder.Bytes()<br/>0x10 头 + Gorilla XOR"]
+    F1 --> F2["NaN 哨兵结束"]
+```
+
+`packBlock`（`encoding.go:943-961`）按 `<type><uvarint(len(ts))><ts><values>` 拼接；
+`unpackBlock`（`encoding.go:963-982`）是逆操作，它只读 uvarint 与 tsLen，
+values 长度由“剩余字节”隐式确定:
+
+```go
+// tsdb/engine/tsm1/encoding.go:943-961 — packBlock
+sz := 1 + binary.MaxVarintLen64 + len(ts) + len(values)
+b[0] = typ
+i := binary.PutUvarint(b[1:1+binary.MaxVarintLen64], uint64(len(ts)))
+i += 1
+copy(b[i:], ts)
+copy(b[i+len(ts):], values)
+return b[:i+len(ts)+len(values)]
+```
+
+**真实字节案例**（§11.3 生成的 cpu block，1 个 FloatValue @t=1000000000）:
+
+```
+Data (30B):
+  00                              type = BlockFloat64
+  09                              uvarint tsLen = 9
+  1C 00 00 00 00 3B 9A CA 00      ts (9B)
+  10 40 14 00 00 00 00 00 00 ...  values (19B)
+```
+
+逐步解析:
+1. `BlockType(Data) = 0x00` → `BlockFloat64`。
+2. `unpackBlock(Data[1:])`: `Uvarint(0x09)` → `tsLen=9, i=1`；`ts = Data[2:11]`（9B），`values = Data[11:30]`（19B）。
+3. `TimeDecoder.Init(ts)`: 首字节 `0x1C` → 编码类型 1（PackedSimple）+ divisor 指数 12（log10(1e12)）；后 8B `0x000000003B9ACA00` = 1000000000。
+4. `FloatDecoder.SetBytes(values)`: 首字节 `0x10` → Gorilla；首 8B `0x4014000000000000` = 5.0；余下 10B 为 NaN 哨兵（2bit 标志 + 5bit leading=2 + 6bit sigbits=62 + 62bit delta = 75bit，补 5bit 0 对齐）。
+5. 校验: `1 + 1 + 9 + 19 = 30`，加 4B CRC 即 block 大小 34B。
+
+注意：`unpackBlock` 不校验 `type`；若把整个 `Data` 传给它，`0x00` 会被当成 uvarint 长度，
+得到 `tsLen=0`，随后 values 会错位。
 
 ## 4. Index — 索引区
 
@@ -302,7 +425,7 @@ unpackBlock(block[1:]):
 ### 4.2 IndexEntry — 28 字节
 
 ```go
-// tsdb/engine/tsm1/writer.go:179 — IndexEntry
+// tsdb/engine/tsm1/writer.go:180 — IndexEntry
 type IndexEntry struct {
     MinTime int64   // 8 字节: block 中最小时间戳
     MaxTime int64   // 8 字节: block 中最大时间戳
@@ -314,7 +437,7 @@ type IndexEntry struct {
 ### 4.3 IndexEntry 方法
 
 ```go
-// tsdb/engine/tsm1/writer.go:191 — UnmarshalBinary
+// tsdb/engine/tsm1/writer.go:192 — UnmarshalBinary
 func (e *IndexEntry) UnmarshalBinary(b []byte) error {
     if len(b) < indexEntrySize {
         return fmt.Errorf("unmarshalBinary: short buf: %v < %v", len(b), indexEntrySize)
@@ -326,7 +449,7 @@ func (e *IndexEntry) UnmarshalBinary(b []byte) error {
     return nil
 }
 
-// tsdb/engine/tsm1/writer.go:204 — AppendTo
+// tsdb/engine/tsm1/writer.go:205 — AppendTo
 func (e *IndexEntry) AppendTo(b []byte) []byte {
     if len(b) < indexEntrySize {
         if cap(b) < indexEntrySize {
@@ -342,12 +465,12 @@ func (e *IndexEntry) AppendTo(b []byte) []byte {
     return b
 }
 
-// tsdb/engine/tsm1/writer.go:223 — Contains
+// tsdb/engine/tsm1/writer.go:224 — Contains
 func (e *IndexEntry) Contains(t int64) bool {
     return e.MinTime <= t && e.MaxTime >= t
 }
 
-// tsdb/engine/tsm1/writer.go:228 — OverlapsTimeRange
+// tsdb/engine/tsm1/writer.go:229 — OverlapsTimeRange
 func (e *IndexEntry) OverlapsTimeRange(min, max int64) bool {
     return e.MinTime <= max && e.MaxTime >= min
 }
@@ -458,19 +581,26 @@ func (d *indirectIndex) UnmarshalBinary(b []byte) error {
     for i < iMax {
         offsets = append(offsets, i)  // 记录当前 key 的偏移
 
-        // 边界检查: keyLen(2B) 需要至少 2 字节
+        // 边界检查 1: keyLen(2B) 需要至少 2 字节 → i+2 >= iMax
         if i+2 >= iMax {
             return fmt.Errorf("indirectIndex: not enough data for key length value")
         }
 
-        // 跳过 key: keyLen(2B) + type(1B) + key(NB)
+        // 磁盘顺序是 keyLen(2B) + key(NB) + type(1B) + count(2B)
+        // i += 3 + keyLen 同时跳过 2B 长度、key 本体与 1B type；i 落在 count 上
         i += 3 + int32(binary.BigEndian.Uint16(b[i:i+2]))
 
-        // 读取 block 条目数量
-        count := int32(binary.BigEndian.Uint16(b[i : i+2]))
-        i += 2
+        // 边界检查 2: count(2B) → i+indexCountSize >= iMax
+        if i+indexCountSize >= iMax {
+            return fmt.Errorf("indirectIndex: not enough data for index entries count")
+        }
+        count := int32(binary.BigEndian.Uint16(b[i : i+indexCountSize]))
+        i += indexCountSize
 
-        // 记录最小时间戳 (第一个 block 的 MinTime)
+        // 边界检查 3: 第一个 IndexEntry 的 MinTime(8B) → i+8 >= iMax
+        if i+8 >= iMax {
+            return fmt.Errorf("indirectIndex: not enough data for min time")
+        }
         minT := int64(binary.BigEndian.Uint64(b[i : i+8]))
         if minT < minTime {
             minTime = minT
@@ -479,7 +609,7 @@ func (d *indirectIndex) UnmarshalBinary(b []byte) error {
         // 跳过中间的 block 条目
         i += (count - 1) * indexEntrySize  // indexEntrySize = 28
 
-        // 边界检查: MaxTime 需要 16 字节
+        // 边界检查 4: 最后一个 IndexEntry 的 MaxTime 需要 16 字节 → i+16 >= iMax
         if i+16 >= iMax {
             return fmt.Errorf("indirectIndex: not enough data for max time")
         }
@@ -558,18 +688,24 @@ func (d *indirectIndex) searchOffset(key []byte) int {
 
 ```mermaid
 flowchart TD
-    A["Seek('cpu,host=web#!~#value')"] --> B["binary search offsets 数组"]
-
-    B --> C{"offsets[mid] 对应的 key<br/>与目标 key 比较"}
-    C -->|"key < 目标"| D["lo = mid + 1"]
-    C -->|"key > 目标"| E["hi = mid - 1"]
-    C -->|"key == 目标"| F["返回 mid (key 索引)"]
-
-    D --> B
-    E --> B
-
-    F --> G["通过 key 索引读取 IndexEntry"]
+    A["SearchBytesFixed(offsets, 4, predicate)"] --> B["谓词: bytes.Compare(key(mid), target) >= 0"]
+    B --> C{"predicate ?"}
+    C -->|true| D["hi = mid"]
+    C -->|false| E["lo = mid + 4"]
+    D --> F{"lo < hi ?"}
+    E --> F
+    F -->|是| A
+    F -->|否| G["i = 第一个 >= target 的字节偏移<br/>i/4 = 候选 key 索引"]
+    G --> H{"i < len(offsets) ?"}
+    H -->|否| I["返回 len(offsets)/4"]
+    H -->|是| J["ReadEntries: readKey + bytes.Equal 二次确认"]
+    J -->|不匹配| K["返回 nil (key 不存在)"]
+    J -->|匹配| L["返回 IndexEntry[]"]
 ```
+
+这是**下界（lower bound）二分**：`SearchBytesFixed` 返回第一个满足谓词的字节偏移，
+不是“相等就提前返回”。目标 key 不存在时，`i` 是插入位置；`search()` 再通过
+`readKey` + `bytes.Equal` 二次确认，失败返回 `len(d.b)`。
 
 ### 6.4 Entry — 查找特定时间戳的 block
 
@@ -593,6 +729,37 @@ func (d *indirectIndex) Entry(key []byte, timestamp int64) *IndexEntry {
 **关键**: `Entry` 本身不直接调用 `d.search()`，也不存在 `idx < 0` 的判断。实际的
 `search()` 在未找到 key 时返回插入位置或 `len(d.b)`，`ReadEntries` 会再校验搜索结果
 中的 key 是否与目标 key 完全相等，不匹配就返回 `nil`。
+
+### 6.5 读路径：search → readEntriesAt → readEntries → readKey
+
+```mermaid
+flowchart TD
+    A["ReadEntries(key)"] --> B["search(key)"]
+    B --> C{"ContainsKey(key)?<br/>key < minKey || key > maxKey"}
+    C -->|否| D["返回 len(d.b)"]
+    C -->|是| E["SearchBytesFixed 下界二分"]
+    E --> F{"i < len(offsets) ?"}
+    F -->|否| D
+    F -->|是| G["readEntriesAt(ofs, entries)"]
+    G --> H["readKey: 2B keyLen + key(NB)"]
+    H --> I["readEntries: 1B type + 2B count + count×28B"]
+    I --> J["IndexEntry.UnmarshalBinary"]
+    J --> K{"bytes.Equal(key, foundKey) ?"}
+    K -->|否| L["返回 nil (搜索落在插入位置)"]
+    K -->|是| M["返回 []IndexEntry"]
+
+    I -.->|"数据不足"| N["readEntries 返回 error"]
+    N -.->|"readEntriesAt 直接 panic"| O["panic: error reading entries"]
+
+    style L fill:#fee2e2
+    style O fill:#fee2e2
+```
+
+失败出口:
+- `SearchBytesFixed` 返回 `len(d.b)`（key 不在 `[minKey,maxKey]` 范围）；
+- `readEntriesAt` 后 `bytes.Equal` 不匹配 → 返回 `nil`；
+- `readEntries` 数据不足返回 error，而 `readEntriesAt` 对这一错误**直接 `panic`**
+  （`reader.go:986-988`）——它把索引损坏视为不可恢复。
 
 ## 7. mmapAccessor — mmap 零拷贝访问
 
@@ -826,12 +993,103 @@ readBytes(entry, nil) 执行流程:
 而 `readBytes` 停在"返回 encodedBlock 切片"这一步，把解码决策交给调用方（例如 `FileStore.KeyCursor`
 希望在 cache 层再做一次 block cache 命中判断时使用）。
 
+### 7.5 mmap 回收与 Rename 协议
+
+**访问计数**（`reader.go:1486-1538`）:
+
+- `mmapAccessor.init` 结束时 `incAccess()` 并 `atomic.StoreUint64(&m.freeCount, 1)`，
+  即初始 `accessCount=1`、`freeCount=1`。
+- 每次 `readBytes` / `readBlock` 都会 `incAccess()`（原子 +1）。
+
+**Free 的延迟回收**（`reader.go:1546-1570`）:
+
+```go
+func (m *mmapAccessor) free() error {
+    accessCount := atomic.LoadUint64(&m.accessCount)
+    freeCount := atomic.LoadUint64(&m.freeCount)
+    if freeCount == 0 && accessCount == 0 { return nil }
+    if accessCount != freeCount {
+        // 期间又有人访问：只记录当前 accessCount，下次再试
+        atomic.StoreUint64(&m.freeCount, accessCount)
+        return nil
+    }
+    // 完全相等：清零并 madviseDontNeed
+    atomic.StoreUint64(&m.accessCount, 0)
+    atomic.StoreUint64(&m.freeCount, 0)
+    m.mu.RLock(); defer m.mu.RUnlock()
+    return madviseDontNeed(m.b)
+}
+```
+
+**Rename 不是“只改个名”**（`reader.go:1577-1611`）:
+
+```
+rename(path) = munmap → Close → os.Rename → os.Open → mmap
+```
+
+`mmapAccessor.rename(path)` 依次 `munmap(m.b)`、`m.f.Close()`、`file.RenameFile`、
+`os.Open(path)`、`m.f.Seek(0,0)`、`mmap`；成功后 `m.b` 指向新映射。
+
+**安全规则**:
+
+- `readBytes` 返回的是 mmap 子切片；解锁后仍指向旧映射。
+- 已持有的 block slice **不能跨 Rename 使用**，必须在 Rename 完成后重新 `readBytes`。
+- `Ref` 只保证文件不被删除，不保证旧映射有效。
+
+**生命周期图**:
+
+```mermaid
+sequenceDiagram
+    participant R as TSMReader
+    participant M as mmapAccessor
+    participant OS as OS/kernel
+
+    Note over M: init: accessCount=1, freeCount=1
+    R->>M: readBytes() / readBlock() ×N
+    M->>M: incAccess() → accessCount += N
+    R->>M: free()
+    alt accessCount != freeCount
+        M->>M: freeCount = accessCount（本次不 madvise）
+    else 相等
+        M->>M: accessCount=freeCount=0
+        M->>OS: madviseDontNeed(m.b)
+    end
+    R->>M: rename(path)
+    M->>M: incAccess()
+    M->>OS: munmap(m.b)
+    M->>OS: Close(fd) → RenameFile → Open(path)
+    M->>OS: mmap(newFd, size)
+```
+
+**数值案例**（t=0 打开，随后 3 次读、2 次 free、1 次 rename）:
+
+```
+t0  init():      accessCount=1, freeCount=1        // reader.go:1540-1541
+t1  readBytes:   accessCount=2
+t2  readBlock:   accessCount=3
+t3  readBytes:   accessCount=4
+t4  free():      accessCount(4) != freeCount(1)
+                 → freeCount=4, return nil         // 不释放任何页
+t5  free():      accessCount(4) == freeCount(4)
+                 → accessCount=freeCount=0
+                 → madviseDontNeed(m.b)            // 页可被内核回收
+t6  rename():    incAccess() → accessCount=1
+                 → munmap 旧映射 → Close → RenameFile → Open → mmap 新映射
+t7  free():      accessCount(1) != freeCount(0)
+                 → freeCount=1, return nil         // 新映射先保留
+```
+
+关键点:
+- `freeCount` 记录“上一次尝试释放时看到的访问计数”，它不是引用计数；文件生命周期由 `TSMReader.refs` 管。
+- rename 前的 `incAccess()` 让新旧映射的访问计数不会“恰好相等”，避免 rename 后立刻把新映射 madvise 掉。
+- `readBytes` 返回的 slice 指向旧映射；rename 完成后旧映射已 munmap，必须重新 `readBytes`。
+
 ## 8. TSMWriter — 写入流程
 
 ### 8.1 TSMWriter 接口
 
 ```go
-// tsdb/engine/tsm1/writer.go:121 — TSMWriter
+// tsdb/engine/tsm1/writer.go:122 — TSMWriter
 type TSMWriter interface {
     Write(key []byte, values Values) error
     WriteBlock(key []byte, minTime, maxTime int64, block []byte) error
@@ -937,7 +1195,7 @@ flowchart TD
 ### 8.3 directIndex.Add — 索引构建
 
 ```go
-// tsdb/engine/tsm1/writer.go:273 — directIndex.Add
+// tsdb/engine/tsm1/writer.go:274 — directIndex.Add
 func (d *directIndex) Add(key []byte, blockType byte, minTime, maxTime int64,
     offset int64, size uint32) {
 
@@ -1213,7 +1471,103 @@ func (r *BitReader) readBuf() {
 | Boolean 解码 | `BooleanDecoder` | 读取 1-bit 布尔值 |
 | Simple8b 解码 | `IntegerDecoder` | 读取 64-bit 打包字 |
 
+### 9.7 BitReader 位级视图与跨边界例子
+
+```mermaid
+flowchart LR
+    A["Reset(data)"] --> B["buf.v=0, buf.n=0"]
+    B --> C["readBuf()"]
+    C --> D{"byteN == 8 ?"}
+    D -->|是| E["一次装配 8B 到 buf.v<br/>buf.n=64"]
+    D -->|否| F["逐字节放到高位侧<br/>buf.n += 8"]
+    E --> G["ReadBits(n)"]
+    F --> G
+    G --> H{"buf.n == 0 ?"}
+    H -->|是| I["return io.EOF"]
+    H -->|否| J{"n <= buf.n ?"}
+    J -->|是, n==64| K["返回整个 buf.v<br/>清空后 readBuf"]
+    J -->|是, n<64| L["取高 n 位<br/>buf.v <<= n; buf.n -= n"]
+    J -->|否| M["拼接旧 buf + 新 readBuf<br/>按 n 右移对齐"]
+    L --> N{"buf.n == 0 ?"}
+    N -->|是| C
+    N -->|否| O["返回"]
+    K --> O
+    M --> N
+```
+
+`readBuf` 在 `Reset`（`buf.n=0`）以及每次缓冲区耗尽后调用；正常 `ReadBits` 只在
+`buf.n == 0` 时才补 8 字节，因此一次 `readBuf` 通常服务多次小位宽读取。
+
+**位级例子**（`buf.v` 从左到右为高位→低位）:
+
+```
+数据字节: 0b1010_1100 0b0011_0101 0b1111_0000 ...
+
+ReadBits(5):
+  buf.v = 1010 1100 0011 0101 1111 0000 ...
+  取高 5 位 → 10101 (0x15)
+  buf.v <<= 5, buf.n = 59
+
+ReadBits(7):
+  取高 7 位 → 100 0011 (0x43)
+  buf.v <<= 7, buf.n = 52
+
+跨 64 位边界 (buf.n = 52 时读 20 位):
+  慢路径: 先保留旧 buf.v 的 52 位，再 readBuf() 装入下 8 字节
+  v = old | (new >> 52)；只从新缓冲区扣除实际使用的 8 位
+  剩余 buf.n = 56
+```
+
 ## 10. Digest — 备份校验
+
+### 10.0 Digest 生成流程
+
+`DigestWithOptions`（`digest.go:25-117`）按以下顺序生成 digest：
+
+1. `NewDigestManifest(dir, files)`：记录目录与每个 TSM 的 filename/size。
+2. `NewDigestWriter(w)`：包一层 `snappy.NewBufferedWriter`。
+3. `WriteManifest`：`uint32(jsonLen)` + JSON。
+4. `newMergeKeyIterator(tsmFiles, nil)`：跨所有 TSM 文件按字典序遍历**唯一 key**。
+5. 对每个 key：`opts.MinKey/MaxKey` 过滤后，遍历每个 reader 的 `Entries(key)`；
+   对每个 entry：`ReadBytes` 取 CRC、`BlockCount` 取值数量；`opts.MinTime/MaxTime`
+   过滤掉 `entry.MaxTime < MinTime || entry.MinTime > MaxTime` 的 block。
+6. `DigestTimeSpan.Add(min, max, cnt, crc)` 只对 `(min,max,cnt,crc)` **完全相等**的区间去重，**不合并相邻或重叠区间**（`digest_writer.go:126-134`）。
+7. `sort.Sort(ts)` 后 `WriteTimeSpan(kstr, ts)`。
+
+```mermaid
+sequenceDiagram
+    participant D as DigestWithOptions
+    participant M as mergeKeyIterator
+    participant R as TSMReader
+    participant TS as DigestTimeSpan
+    participant W as DigestWriter
+
+    D->>D: NewDigestManifest + NewDigestWriter
+    D->>W: WriteManifest(manifest)
+    D->>M: newMergeKeyIterator(tsmFiles, nil)
+    loop 每个唯一 key
+        D->>D: opts.MinKey/MaxKey 过滤
+        loop 每个 reader
+            D->>R: Entries(key)
+            loop 每个 entry
+                D->>R: ReadBytes(entry) + BlockCount(b)
+                D->>D: opts.MinTime/MaxTime 过滤
+                D->>TS: ts.Add(min, max, cnt, crc)
+            end
+        end
+        D->>TS: sort.Sort(ts)
+        D->>W: WriteTimeSpan(kstr, ts)
+    end
+```
+
+**数值案例**: 两个 TSM 文件都含 key `cpu`：
+- file1 entries: [100-200] CRC=A、[300-400] CRC=B
+- file2 entries: [150-350] CRC=C
+
+`ts.Add` 依次追加 3 个 Range：150-350 与 100-200/300-400 虽然重叠，但
+`(min,max,cnt,crc)` 四元组都不同，**不会合并**；`sort.Sort` 按 Min 排序后写入 1 个
+TimeSpan，确定包含 3 段：100-200(CRC=A)、150-350(CRC=C)、300-400(CRC=B)。
+读取端 `ReadTimeSpan` 按 22B/Range 读回，用于备份恢复时比对 CRC 与数量。
 
 ### 10.1 Digest 文件格式
 
@@ -1249,7 +1603,7 @@ flowchart TD
 **二进制读写案例**:
 
 ```
-Manifest JSON = {"dir":"/shard","entries":[{"filename":"000001-01.tsm","size":4096}]}
+Manifest JSON = {"dir":"/shard","entries":[{"filename":"000000001-000000001.tsm","size":4096}]}
 写入:
   uint32 manifestLen = 69
   69 bytes manifest JSON
@@ -1636,15 +1990,15 @@ func DigestFresh(dir string, files []string, shardLastMod time.Time) (bool, stri
 
 ```mermaid
 sequenceDiagram
-    participant Caller as Engine/备份恢复
+    participant Caller as Engine或备份恢复
     participant DF as DigestFresh
     participant FS as 文件系统
     participant DR as DigestReader
 
     Caller->>DF: DigestFresh(dir, files, shardLastMod)
 
-    DF->>FS: Open(digest.tsd) + Stat()
-    alt 打开/stat 失败
+    DF->>FS: Open(digest.tsd) 加 Stat()
+    alt 打开或 stat 失败
         FS-->>DF: err
         DF-->>Caller: (false, "Can't open/stat digest file: ...")
         Note over DF: 早退 — 不读 manifest
@@ -1652,44 +2006,44 @@ sequenceDiagram
         FS-->>DF: digest.ModTime()
     end
 
-    DF->>DF: 第 2 段: shardLastMod.After(digest.ModTime())?
+    DF->>DF: 第 2 段 shardLastMod.After(digest.ModTime())?
     alt shard 更新
         DF-->>Caller: (false, "Shard modified: shard_time=.., digest_time=..")
         Note over DF: 早退 — 不读 manifest
     else shard 不更新
-        DF->>DR: NewDigestReader(f) + ReadManifest()
+        DF->>DR: NewDigestReader(f) 加 ReadManifest()
         DR-->>DF: mfest {Dir, Entries}
     end
 
-    DF->>DF: 第 3 段: mfest.Dir != dir ?
-    alt 目录不一致 (手动拷贝的 digest)
+    DF->>DF: 第 3 段 mfest.Dir != dir ?
+    alt 目录不一致 手动拷贝的 digest
         DF-->>Caller: (false, "Digest belongs to another shard...")
         Note over DF: 早退 — 不校验文件
     else 目录一致
-        DF->>DF: 第 4 段: len(files) != len(Entries)?
-    end
-    alt 数量不一致
-        DF-->>Caller: (false, "Number of tsm files differ: engine=N, manifest=M")
-        Note over DF: 早退 — 不逐文件 stat
-    else 数量一致
-        DF->>FS: sort(files); 对每个 tsmname: Stat()
-        loop 每个 TSM 文件
-            alt 文件名不匹配
-                DF-->>Caller: (false, "Names don't match: ...")
-            else 文件名匹配
-                FS-->>DF: tsm.Size(), tsm.ModTime()
-                alt size 变化
-                    DF-->>Caller: (false, "TSM file size changed: ...")
-                else size 一致
-                    alt tsm.ModTime > digest.ModTime
-                        DF-->>Caller: (false, "TSM file modified: ...")
+        DF->>DF: 第 4 段 len(files) != len(Entries) ?
+        alt 数量不一致
+            DF-->>Caller: (false, "Number of tsm files differ: engine=N, manifest=M")
+            Note over DF: 早退 — 不逐文件 stat
+        else 数量一致
+            DF->>FS: sort(files) 后逐个 tsmname 调 Stat()
+            loop 每个 TSM 文件
+                alt 文件名不匹配
+                    DF-->>Caller: (false, "Names don't match: ...")
+                else 文件名匹配
+                    FS-->>DF: tsm.Size() 与 tsm.ModTime()
+                    alt size 变化
+                        DF-->>Caller: (false, "TSM file size changed: ...")
+                    else size 一致
+                        alt tsm.ModTime > digest.ModTime
+                            DF-->>Caller: (false, "TSM file modified: ...")
+                        end
                     end
                 end
             end
         end
     end
 
-    DF-->>Caller: (true, "")  // 五段全过才算新鲜
+    DF-->>Caller: (true, "")
 ```
 
 **case 说明 (stale shard → mtime 不匹配 → 第 2 段早退)**:
@@ -1729,41 +2083,40 @@ DigestFresh 执行:
 
 > **场景**: 写入 3 个 key 的数据，然后读取其中一个
 
+> **数据来源**: 本节与 §11.3 的所有 offset/长度均由临时程序调用
+> `tsdb/engine/tsm1.NewTSMWriter` 真实写出后逐字节读取得到
+> （3 个 key 各 1 个 `FloatValue`，t1 = 1000000000 ns）。
+
 ```
-写入:
-  Write("cpu,host=db#!~#value", [t1:5, t2:15])
-  Write("cpu,host=web#!~#status", [t1:"ok", t2:"ok"])
-  Write("cpu,host=web#!~#value", [t1:10, t2:20, t3:30])
+写入（3 个 key、各 1 个 FloatValue / 1 个 IndexEntry，共 224B）:
+  Write("cpu",  [t1:5])
+  Write("disk", [t1:10])
+  Write("mem",  [t1:7])
 
-文件结构:
-  Header: [0x16D116D1, 0x01] (5B)
+文件结构（offset 均为绝对文件偏移）:
+  Header                 @0..4      5B   0x16D116D1 + Version 1
+  Block0 (cpu)           @5..38     34B  CRC32(4B) + Data(30B)
+  Block1 (disk)          @39..72    34B  CRC32(4B) + Data(30B)
+  Block2 (mem)           @73..106   34B  CRC32(4B) + Data(30B)
+  Index                  @107..215  109B
+    "cpu"  (3B):  2+3+1+2+28 = 36B @107  (rel 0)
+    "disk" (4B):  2+4+1+2+28 = 37B @143  (rel 36)
+    "mem"  (3B):  2+3+1+2+28 = 36B @180  (rel 73)
+    offsets[] = [0, 36, 73]               // 相对 Index 起点
+  Footer                 @216..223  8B   uint64 BE = 107
 
-  Block 0: CRC32(4B) + encode([t1:5, t2:15]) (NB)
-  Block 1: CRC32(4B) + encode([t1:"ok", t2:"ok"]) (NB)
-  Block 2: CRC32(4B) + encode([t1:10, t2:20, t3:30]) (NB)
-
-  Index:
-    Key "cpu,host=db#!~#value": type=Float, count=1
-      → IndexEntry: MinTime=t1, MaxTime=t2, Offset=5, Size=N0
-    Key "cpu,host=web#!~#status": type=String, count=1
-      → IndexEntry: MinTime=t1, MaxTime=t2, Offset=5+N0, Size=N1
-    Key "cpu,host=web#!~#value": type=Float, count=1
-      → IndexEntry: MinTime=t1, MaxTime=t3, Offset=5+N0+N1, Size=N2
-
-  Footer: indexStartOffset (8B)
+  读取 "disk", timestamp=t1:
+  1. mmap 整个文件（224B）
+  2. 读取 Footer → indexStart = 107
+  3. UnmarshalBinary(b[107:216]) → indirectIndex（offsets 0/36/73）
+  4. Seek("disk") → key 索引 = 1
+  5. Entry("disk", t1) → IndexEntry{MinTime=t1, MaxTime=t1, Offset=39, Size=34}
+  6. readBytes(entry) → crc + encodedBlock（已跳过 4B CRC，30B）
+  7. DecodeBlock(encodedBlock) → [t1:10]
 
   约束:
-    directIndex.Add 要求 Write() 调用已经按 key 字典序排列
+    directIndex.Add 要求 Write() 调用已经按 key 字典序排列（cpu < disk < mem）
     乱序写入会 panic，而不是在 WriteIndex 阶段自动排序
-
-  读取 "cpu,host=web#!~#value", timestamp=t2:
-  1. mmap 整个文件
-  2. 读取 Footer → indexStart
-  3. UnmarshalBinary(b[indexStart:]) → 间接索引
-  4. Seek("cpu,host=web#!~#value") → key 索引 = 2
-  5. Entry("cpu,host=web#!~#value", t2) → IndexEntry{MinTime=t1, MaxTime=t3, Offset=5+N0+N1, Size=N2}
-  6. readBytes(entry) → crc + encodedBlock (已跳过 4B checksum)
-  7. DecodeBlock(encodedBlock) → [t1:10, t2:20, t3:30]
 ```
 
 ### 11.2 mmap 按需加载案例
@@ -1787,6 +2140,57 @@ t=3ms    返回解码后的值
 
 最终: 物理内存只用了 4KB (不是 1GB!)
 ```
+
+### 11.3 带真实偏移的字节走查
+
+以上面由 `NewTSMWriter` 真实生成的 224B 文件为例，把每个字段落到具体 offset：
+
+| 区段 | 起始 offset | 长度 | 内容 / 校验 |
+|---|---|---|---|
+| Header | 0 | 5 | `0x16D116D1`（4B BE）+ `0x01`（1B） |
+| Block0 | 5 | 34 | `CRC32[5:9]=0xA8DF7628` + Data[9:39]（cpu） |
+| Block1 | 39 | 34 | `CRC32[39:43]=0x5742D428` + Data[43:73]（disk） |
+| Block2 | 73 | 34 | `CRC32[73:77]=0x82653928` + Data[77:107]（mem） |
+| Index | 107 | 109 | 3 个 key 记录 |
+| └ "cpu" | 107 | 36 | `keyLen=3` + `cpu` + `type=0` + `count=1` + Entry(28B) |
+| └ "disk" | 143 | 37 | `keyLen=4` + `disk` + `type=0` + `count=1` + Entry(28B) |
+| └ "mem" | 180 | 36 | `keyLen=3` + `mem` + `type=0` + `count=1` + Entry(28B) |
+| Footer | 216 | 8 | `uint64 BE = 107` |
+
+三个 block 的 Data 结构相同（以 cpu 为例）:
+
+```
+Data[9:39] (30B) = type(1B) + uvarint(tsLen=9) + ts(9B) + values(19B)
+  00                    BlockFloat64
+  09                    tsLen = 9（uvarint 单字节）
+  ts[9B]  1C 00 00 00 00 3B 9A CA 00
+          0x1C = packedSimple<<4 | log10(divisor=1e12)=12
+          后 8B = 首个（也是唯一一个）时间戳 1000000000 的 BE 编码
+  vb[19B] 10 40 14 00 00 00 00 00 00 C5 F7 FD 80 00 00 00 00 00 20
+          0x10            Gorilla 压缩头
+          40 14 ... 00    首值 5.0（0x4014000000000000，BE）
+          余 10B          NaN 哨兵：2bit 标志 + 5bit leading(2)
+                          + 6bit sigbits(62) + 62bit delta = 75bit，
+                          再补 5bit 0 对齐到 80bit
+```
+
+校验公式:
+
+```
+footerStart    = fileSize - 8                       = 224 - 8 = 216
+indexStart     = uint64(Footer)                     = 107
+Index 长度     = Σ(2 + len(key) + 1 + 2 + count*28)
+               = 36 + 37 + 36 = 109
+Block 大小     = 4 (CRC) + 1 (type) + 1 (uvarint tsLen) + 9 (ts) + 19 (values)
+               = 34
+文件长度       = 5 + 34*3 + 109 + 8 = 5 + 102 + 109 + 8 = 224
+Block 的 Offset 是绝对文件偏移（write() 里 t.index.Add(..., t.n, n)，writer.go:619-637；
+WriteBlock 路径见 writer.go:686）
+readBytes 返回的 encodedBlock 已跳过 4B CRC（长度 = Size - 4 = 30）
+```
+
+> 注意：Footer 的 8 字节是 **Index 起始绝对偏移**（107），不是 `fileSize - 8`；
+> `fileSize - 8` 是 Footer 自身的起点（216）。读取时先定位 Footer 再取其中的 107。
 
 ## 12. 架构设计意图
 

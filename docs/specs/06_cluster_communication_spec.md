@@ -36,9 +36,10 @@ sequenceDiagram
     Meta-->>PW: RetentionPolicyInfo{Duration, ShardGroupDuration}
 
     PW->>PW: 5 MapShards(points)
-    PW->>PW: 使用 RetentionPolicyInfo.ShardGroups 构建 sgList
-    PW->>PW: sgList.Covers / ShardGroupAt 本地路由
-    PW->>Meta: CreateShardGroup(db, rp, timestamp) [按需创建]
+    PW->>PW: sgList 初始为空（不预填 RP 的 ShardGroups）
+    PW->>PW: 第一遍: sgList.Covers / 按需 CreateShardGroup
+    PW->>Meta: CreateShardGroup(db, rp, timestamp) [每个新时间窗一次 meta RPC]
+    PW->>PW: 第二遍: sgList.ShardGroupAt 本地路由
     PW->>PW: sg.ShardFor(point) -> Hash 路由
     Note over PW: mapping: shardID -> []points
 
@@ -58,7 +59,7 @@ sequenceDiagram
         TSDB->>TSDB: 8 guard.Wait() [如有匹配的 pending delete]
         TSDB->>Shard: 9 sh.WritePoints(points, tracker)
         Shard->>Shard: 10 validateSeriesAndFields()
-        Shard->>Shard: 11 createFieldsAndMeasurements()
+        Shard->>Shard: 11 saveFieldsAndMeasurements()
         Shard->>Engine: 12 engine.WritePoints(points, tracker)
         Engine->>Engine: Cache.WriteMulti + WAL.WriteMulti (模块 1)
         TSDB->>Epoch: 13 epoch.EndWrite(gen)
@@ -158,6 +159,7 @@ func (h *Handler) serveWrite(database, retentionPolicy, precision string, w http
 - `serveWriteV2` 先把 `bucket` 映射为 v1 的 `database/retentionPolicy`，并把 `precision=ns/us` 转为 `n/u`
 - `ParsePointsWithPrecision` 支持 `n`(纳秒), `u`(微秒), `ms`(毫秒), `s`(秒), `m`(分), `h`(时)
 - 请求体不是 `ioutil.ReadAll`: 源码使用 `truncateReader`、可选 gzip 解压、`bytes.Buffer.ReadFrom` 和 Content-Length 预分配
+- **注意 gzip 分支绕过 `MaxBodySize`**: `body = truncateReader(...)` 先执行，但 `Content-Encoding: gzip` 时 `body` 被替换为 `gzip.NewReader(r.Body)`，`truncateReader` 被丢弃；剩余的体积上限只有 `Content-Length` 预检（`services/httpd/handler.go:1702-1724`），分块传输（无 `Content-Length`）可绕过该预检
 - `WriteTracing` 开启时会记录原始 write body，便于调试但也可能暴露写入数据
 - 部分写入成功（`PartialWriteError`）返回 400，但已写入的点仍被持久化
 - 完全失败返回 400 或 500
@@ -165,7 +167,7 @@ func (h *Handler) serveWrite(database, retentionPolicy, precision string, w http
 #### 步骤 2: PointsWriter 结构体
 
 ```go
-// coordinator/points_writer.go:45 — PointsWriter
+// coordinator/points_writer.go:44 — PointsWriter
 type PointsWriter struct {
     mu           sync.RWMutex       // 保护 closing
     closing      chan struct{}       // 关闭信号
@@ -188,6 +190,9 @@ type PointsWriter struct {
     Subscriber interface {
         Send(*WritePointsRequest)
     }
+
+    subPoints chan<- *WritePointsRequest    // 订阅异步写通道（可为 nil）
+
     stats     *WriteStatistics             // 原子统计计数器
 }
 ```
@@ -195,7 +200,7 @@ type PointsWriter struct {
 **WriteStatistics 结构**:
 
 ```go
-// coordinator/points_writer.go:157 — WriteStatistics
+// coordinator/points_writer.go:267 — WriteStatistics
 type WriteStatistics struct {
     WriteReq           int64  // 写入请求总数
     PointWriteReq      int64  // 写入点总数
@@ -231,7 +236,7 @@ func (w *PointsWriter) WritePointsPrivileged(writeCtx tsdb.WriteContext, databas
     // ... 继续执行写入逻辑
 }
 
-// coordinator/points_writer.go:334 — WritePointsInto
+// coordinator/points_writer.go:454 — WritePointsInto
 func (w *PointsWriter) WritePointsInto(p *IntoWriteRequest) error {
     writeCtx := tsdb.WriteContext{UserId: tsdb.SelectIntoUser}
     return w.WritePointsPrivileged(writeCtx, p.Database, p.RetentionPolicy, models.ConsistencyLevelOne, p.Points)
@@ -258,7 +263,7 @@ if retentionPolicy == "" {
 #### 步骤 5: MapShards — Shard 路由核心
 
 ```go
-// coordinator/points_writer.go:191 — MapShards
+// coordinator/points_writer.go:299 — MapShards
 func (w *PointsWriter) MapShards(wp *WritePointsRequest) (*ShardMapping, error) {
     // 1. 获取 RetentionPolicy
     rp, err := w.MetaClient.RetentionPolicy(wp.Database, wp.RetentionPolicy)
@@ -314,15 +319,17 @@ func (w *PointsWriter) MapShards(wp *WritePointsRequest) (*ShardMapping, error) 
 
 **写入窗口与 sgList 查找细节**:
 
-- `NewWriteWindow(rp)` 使用 `rp.PastWriteLimit` 和 `rp.FutureWriteLimit` 生成允许写入的时间边界。
-- 第一遍遍历时，过期点、已被现有 shard group 覆盖的点、超出写入窗口的点都不会触发 `CreateShardGroup`。
+- `NewWriteWindow(rp)` 使用 `rp.PastWriteLimit` 和 `rp.FutureWriteLimit` 生成允许写入的时间边界；两者的零值 `0` 表示**关闭**该方向检查（`coordinator/points_writer.go:226-233` 只在 `>0` 时启用），因此默认 RP 不做写窗口限制。
+- 相关常量: `DefaultMaxBodySize = 25e6`（`services/httpd/config.go:27`）、`DefaultWriteTimeout = 10 * time.Second`（`coordinator/config.go:15`）。
+- 第一遍遍历时，过期点、已被**本批已创建的** shard group 覆盖的点、超出写入窗口的点都不会触发 `CreateShardGroup`（`sgList` 初始为空，`list.Add(*sg)` 用 meta 返回的组填充）。
+- 每批 N 个新时间窗 ⇒ 至少 N 次 `CreateShardGroup` meta 调用；命中已有组时走 `Client.CreateShardGroup` 的读锁快速路径（`services/meta/client.go:693-721`）。
 - 第二遍构建 `ShardMapping` 时，过期点按 `RetentionPolicyBound` 计入 dropped，超出窗口的点按 `WriteWindowLowerBound` / `WriteWindowUpperBound` 计入 dropped。
 - `ShardGroupAt` 先按 `EndTime` 二分查找；如果遇到重叠 shard group 导致二分结果不包含目标时间，会在 `earliest/latest` 范围内回退到线性扫描，避免误丢本应接受的点。
 
 **sgList 结构与二分查找**:
 
 ```go
-// coordinator/points_writer.go:245 — sgList
+// coordinator/points_writer.go:364 — sgList
 type sgList struct {
     items     meta.ShardGroupInfos  // 按 EndTime 排序
     needsSort bool                  // 延迟排序标志
@@ -330,7 +337,7 @@ type sgList struct {
     latest    time.Time             // 最晚 EndTime
 }
 
-// coordinator/points_writer.go:274 — ShardGroupAt
+// coordinator/points_writer.go:393 — ShardGroupAt
 func (l sgList) ShardGroupAt(t time.Time) *meta.ShardGroupInfo {
     if l.items.Len() == 0 {
         return nil
@@ -389,51 +396,31 @@ flowchart TD
     G -->|"遍历完都没找到"| I["return nil (异常)"]
 ```
 
-> **具体案例**: t 落在两个重叠 ShardGroup 的窗口内
+> **具体案例**: 截断组、重叠组与线性回退
 >
-> 假设有两个 ShardGroup (通常由 `TruncatedAt` 截断 + 后续重建产生重叠):
+> 排序键是**有效结束时间**：截断组取 `TruncatedAt`，否则取 `EndTime`（`services/meta/data.go:1423-1439`）；
+> 而 `sgList.ShardGroupAt` 的二分键是原始 `EndTime`（`coordinator/points_writer.go:403`）。
+> 两者在存在截断组时不再单调，于是需要线性回退。
 >
-> ```
-> SG_A: StartTime=00:00, EndTime=01:00, TruncatedAt=00:30  (实际 EndTime 仍按 01:00 排序)
-> SG_B: StartTime=00:20, EndTime=02:00
-> ```
->
-> `ShardGroupInfos.Less` 在 `EndTime` 相同时按 `StartTime` 升序，但这里 EndTime 不同，
-> 排序结果 (按 EndTime 升序): `[SG_A(01:00), SG_B(02:00)]`。
-> `earliest = 00:00`, `latest = 02:00`。
->
-> 查询 `t = 00:25`:
-> 1. `sort.Search` 找"第一个 EndTime > 00:25" → `idx = 0` (SG_A, EndTime=01:00 > 00:25)。
-> 2. `t.Before(l.items[0].StartTime)` → `00:25.Before(00:00)` = false。
-> 3. 二分命中，返回 `&SG_A`。**正确** (00:25 在 SG_A 的 [00:00, 01:00) 内)。
->
-> 查询 `t = 00:35` (在 SG_A 截断后、SG_B 起始后的重叠区):
-> 1. `sort.Search` 找"第一个 EndTime > 00:35" → `idx = 0` (SG_A, EndTime=01:00 > 00:35)。
-> 2. `t.Before(l.items[0].StartTime)` → `00:35.Before(00:00)` = false。
-> 3. 二分命中，返回 `&SG_A`。**但 SG_A 已被 TruncatedAt=00:30 截断**，
->    `ShardGroupByTimestamp` 会因 `!sgi.Truncated() || timestamp.Before(sgi.TruncatedAt)`
->    返回 nil (data.go:1157 的 `ShardGroupByTimestamp` 逻辑)。
->
-> 真正触发**线性回退**的场景是 EndTime 相同、StartTime 不同导致二分 idx 指向
-> "StartTime > t" 的那个组:
+> **(1) 截断后的真实创建路径**（`CreateShardGroup` 收缩循环，`data.go:403-430`）:
 >
 > ```
-> SG_C: StartTime=00:30, EndTime=01:00   (EndTime 相同)
-> SG_D: StartTime=00:00, EndTime=01:00   (StartTime 更早)
-> 排序 (EndTime 相同按 StartTime 升序): [SG_D(00:00), SG_C(00:30)]
+> SG_A: StartTime=00:00, EndTime=01:00, TruncatedAt=00:30
+> 写 timestamp=00:40 → 收缩循环把新组起点抬到 TruncatedAt:
+> SG_B: StartTime=00:30, EndTime=01:00
+> 写 timestamp=00:20（<= TruncatedAt）→ ShardGroupByTimestamp 命中 SG_A，幂等返回，不建新组
 > ```
 >
-> 查询 `t = 00:15`:
-> 1. `sort.Search` 找"第一个 EndTime > 00:15" → `idx = 0` (两个 EndTime 都是 01:00 > 00:15，
->    `sort.Search` 返回第一个满足条件的，即 idx=0 = SG_D)。
-> 2. `t.Before(l.items[0].StartTime)` → `00:15.Before(00:00)` = false → 二分命中 SG_D。
->    **正确** (00:15 ∈ SG_D 的 [00:00, 01:00))。
+> 所以正常写入路径**不可能**产生 `SG_B: StartTime=00:20` 这种组——收缩循环会先抬高起点。
 >
-> 查询 `t = 00:45` (两个组都包含):
-> 1. `sort.Search` → idx=0 = SG_D。`00:45.Before(00:00)` = false → 返回 SG_D。
->    **正确** (重叠区任选一个都算命中)。
+> **(2) 写路径如何路由 `t=00:35`**: `sort.Search` 找第一个 `EndTime > 00:35` → SG_A；
+> `Contains(00:35)` 用原始 `[00:00, 01:00)` → 命中 SG_A。**写路径只看原始 `StartTime/EndTime`，
+> 不看 `TruncatedAt`**，因此该点会正常写入 SG_A，而不是"返回 nil / 被丢弃"。
+> `TruncatedAt` 只影响 meta 侧 `ShardGroupByTimestamp` 的查找（`data.go:1263-1271`）。
+> 正常 HTTP 写入路径上，过期组会先在 `MapShards` 被 `now - rp.Duration` 过滤掉
+> （`coordinator/points_writer.go:309-320`），所以可达性主要取决于保留期而不是截断标记。
 >
-> 触发线性回退的构造: EndTime 不同但二分 idx 指向 StartTime > t 的组:
+> **(3) 真正触发线性回退的构造**（EndTime 不同，但二分 idx 指向 `StartTime > t` 的组）:
 >
 > ```
 > SG_E: StartTime=00:50, EndTime=01:00   (EndTime 早, StartTime 晚)
@@ -446,19 +433,19 @@ flowchart TD
 > 1. `sort.Search` 找"第一个 EndTime > 00:30" → `idx = 0` (SG_E, EndTime=01:00 > 00:30)。
 > 2. `t.Before(l.items[0].StartTime)` → `00:30.Before(00:50)` = **true**。
 > 3. 二分路径判定"未命中"，进入回退分支。
-> 4. `t.Before(earliest)` → `00:30.Before(00:00)` = false; `t.After(latest)` = false → 不返回 nil。
-> 5. 线性 `for idx=0`: `SG_E.Contains(00:30)` → `00:30 >= 00:50` = false，不 break。
-> 6. `idx=1`: `SG_F.Contains(00:30)` → `00:30 >= 00:00 && 00:30 < 02:00` = true → break。
-> 7. 返回 `&SG_F`。**正确** (00:30 ∈ SG_F)。
+> 4. `t.Before(earliest)` = false; `t.After(latest)` = false → 不返回 nil。
+> 5. 线性 `for idx=0`: `SG_E.Contains(00:30)` → false，不 break。
+> 6. `idx=1`: `SG_F.Contains(00:30)` → true → break。
+> 7. 返回 `&SG_F`。**正确**。
 >
 > 如果没有线性回退，步骤 3 之后直接返回 nil，`MapShards` 会把 `t=00:30` 的点标记为
-> dropped (points_writer.go:298-301)，造成**数据丢失**。这正是源码注释强调的
+> dropped（`points_writer.go:298-301`），造成**数据丢失**。这正是源码注释强调的
 > "non-silently drop writes we should have accepted" 风险。
 
 **ShardGroupInfos 排序规则** (services/meta/data.go:1304):
 
 ```go
-// services/meta/data.go:1304 — ShardGroupInfos 排序
+// services/meta/data.go:1414 — ShardGroupInfos 排序
 type ShardGroupInfos []ShardGroupInfo
 
 func (a ShardGroupInfos) Less(i, j int) bool {
@@ -483,7 +470,7 @@ func (a ShardGroupInfos) Less(i, j int) bool {
 **ShardFor 路由**:
 
 ```go
-// services/meta/data.go:1370 — ShardGroupInfo.ShardFor
+// services/meta/data.go:1480 — ShardGroupInfo.ShardFor
 func (sgi *ShardGroupInfo) ShardFor(p hashIDer) ShardInfo {
     if len(sgi.Shards) == 1 {
         return sgi.Shards[0]  // 单 shard: 直接返回 (OSS 默认)
@@ -496,7 +483,7 @@ func (sgi *ShardGroupInfo) ShardFor(p hashIDer) ShardInfo {
 **ShardGroupInfo 完整结构**:
 
 ```go
-// services/meta/data.go:1293 — ShardGroupInfo
+// services/meta/data.go:1403 — ShardGroupInfo
 type ShardGroupInfo struct {
     ID          uint64        // 全局唯一 ID (data.MaxShardGroupID++)
     StartTime   time.Time     // 窗口起始 (包含)
@@ -529,13 +516,13 @@ func (sgi *ShardGroupInfo) Truncated() bool {
 **ShardInfo 和 ShardOwner**:
 
 ```go
-// services/meta/data.go:1426 — ShardInfo
+// services/meta/data.go:1536 — ShardInfo
 type ShardInfo struct {
     ID     uint64        // 全局唯一 Shard ID
     Owners []ShardOwner  // 拥有此 Shard 的节点列表
 }
 
-// services/meta/data.go:1532 — ShardOwner
+// services/meta/data.go:1642 — ShardOwner
 type ShardOwner struct {
     NodeID uint64  // 节点 ID
 }
@@ -764,7 +751,7 @@ func (e *epochDeleteState) done() {
     e.cond.L.Unlock()
 }
 
-// tsdb/epoch_tracker.go:101 — epochWaiter
+// tsdb/epoch_tracker.go:102 — epochWaiter
 type epochWaiter struct {
     gen     uint64
     guard   *guard
@@ -863,8 +850,8 @@ sequenceDiagram
 
     Note over Writer: 写入完成
     Writer->>Epoch: EndWrite(gen) -> writes--
-    Epoch->>Epoch: state.pending--, if 0 -> close(ready)
-    Epoch->>Delete: Wait() 返回 (ready 被关闭)
+    Epoch->>Epoch: state.pending--, if 0 -> cond.Broadcast()
+    Epoch->>Delete: Wait() 返回 (cond 被唤醒)
     Delete->>Delete: 继续执行 delete
 ```
 
@@ -1065,83 +1052,104 @@ func (e PartialWriteError) Error() string {
 #### 步骤 12b: Engine.WritePoints — Point 到 Value 的转换
 
 ```go
-// tsdb/engine/tsm1/engine.go:1346 — WritePoints
+// tsdb/engine/tsm1/engine.go:1346-1460 — WritePoints
 func (e *Engine) WritePoints(points []models.Point, tracker tsdb.StatsTracker) error {
     values := make(map[string][]Value, len(points))
+    var (
+        keyBuf    []byte
+        baseLen   int
+        seriesErr error
+        npoints   int64
+        nvalues   int64
+    )
 
     for _, p := range points {
-        // 1. 构建 key: point.Key() + keyFieldSeparator + fieldKey
-        keyBuf := append(p.Key(), keyFieldSeparator...)
-
-        // 2. 遍历 fields
+        keyBuf = append(keyBuf[:0], p.Key()...)      // 复用缓冲，避免每点分配
+        keyBuf = append(keyBuf, keyFieldSeparator...)
+        baseLen = len(keyBuf)
         iter := p.FieldIterator()
-        for iter.Next() {
-            fieldKey := iter.FieldKey()
-            fullKey := append(keyBuf, fieldKey...)
+        t := p.Time().UnixNano()
+        npoints++
+        var nValuesForPoint int64
 
-            // 3. 类型冲突快速检查 (seriesTypeMap 是 *radix.Tree)
-            //    存储的是 int 值 (int(iter.Type()) / int(typ))
-            if v, ok := e.seriesTypeMap.Get(fullKey); ok {
-                if v != int(iter.Type()) {
+        for iter.Next() {
+            keyBuf = append(keyBuf[:baseLen], iter.FieldKey()...)
+
+            if e.seriesTypeMap != nil {
+                // 快路径: 已存在则比较类型
+                if v, ok := e.seriesTypeMap.Get(keyBuf); !ok {
+                    if typ, err := e.Type(keyBuf); err != nil {
+                        // 磁盘类型未知，尝试插入
+                    } else if typ != iter.Type() {
+                        seriesErr = tsdb.ErrFieldTypeConflict
+                        e.seriesTypeMap.Insert(keyBuf, int(typ))
+                        continue
+                    }
+                    vv, ok := e.seriesTypeMap.Insert(keyBuf, int(iter.Type()))
+                    if !ok || vv != int(iter.Type()) {
+                        seriesErr = tsdb.ErrFieldTypeConflict
+                        continue
+                    }
+                } else if v != int(iter.Type()) {
                     seriesErr = tsdb.ErrFieldTypeConflict
-                    continue  // 跳过此 field
-                }
-            } else {
-                // 不存在时尝试 Insert；Insert 返回 (旧值, ok)
-                // ok==false 表示插入成功；否则比较旧值
-                vv, ok := e.seriesTypeMap.Insert(fullKey, int(iter.Type()))
-                if !ok || vv != int(iter.Type()) {
-                    seriesErr = tsdb.ErrFieldTypeConflict
-                    continue  // 跳过此 field
+                    continue
                 }
             }
 
-            // 4. 转换为 TSM Value (按 iter.Type() 分发)
+            var v Value
             switch iter.Type() {
             case models.Float:
-                fv, _ := iter.FloatValue()
-                values[string(fullKey)] = append(values[string(fullKey)],
-                    NewFloatValue(p.UnixNano(), fv))
+                fv, err := iter.FloatValue()
+                if err != nil { return err }
+                v = NewFloatValue(t, fv)
             case models.Integer:
-                iv, _ := iter.IntegerValue()
-                values[string(fullKey)] = append(values[string(fullKey)],
-                    NewIntegerValue(p.UnixNano(), iv))
+                iv, err := iter.IntegerValue()
+                if err != nil { return err }
+                v = NewIntegerValue(t, iv)
             case models.Unsigned:
-                uv, _ := iter.UnsignedValue()
-                values[string(fullKey)] = append(values[string(fullKey)],
-                    NewUnsignedValue(p.UnixNano(), uv))
+                uv, err := iter.UnsignedValue()
+                if err != nil { return err }
+                v = NewUnsignedValue(t, uv)
             case models.String:
-                sv, _ := iter.StringValue()
-                values[string(fullKey)] = append(values[string(fullKey)],
-                    NewStringValue(p.UnixNano(), sv))
+                v = NewStringValue(t, iter.StringValue())
             case models.Boolean:
-                bv, _ := iter.BooleanValue()
-                values[string(fullKey)] = append(values[string(fullKey)],
-                    NewBooleanValue(p.UnixNano(), bv))
+                bv, err := iter.BooleanValue()
+                if err != nil { return err }
+                v = NewBooleanValue(t, bv)
+            default:
+                return fmt.Errorf("unknown field type for %s: %s", string(iter.FieldKey()), p.String())
             }
+            nValuesForPoint++
+            values[string(keyBuf)] = append(values[string(keyBuf)], v)
         }
+        nvalues += nValuesForPoint
     }
 
-    // 5. 写入 Cache
-    e.Cache.WriteMulti(values)
+    e.mu.RLock()                 // 读锁覆盖 Cache/WAL 写入
+    defer e.mu.RUnlock()
 
-    // 6. 写入 WAL (e.WALEnabled 是 Engine 上的 bool 字段, engine.go:203)
+    if err := e.Cache.WriteMulti(values); err != nil {
+        return err               // Cache 错误必须返回
+    }
     if e.WALEnabled {
-        if err := e.WAL.WriteMulti(values); err != nil {
+        if _, err := e.WAL.WriteMulti(values); err != nil {
             return err
         }
     }
-
+    if tracker.AddedPoints != nil {
+        tracker.AddedPoints(npoints, nvalues)
+    }
     return seriesErr
 }
 ```
 
-> **源码校准**: `e.seriesTypeMap` 是 `*radix.Tree` (engine.go:225)，不是 `sync.Map`。
-> 类型检查通过 `e.seriesTypeMap.Get(key)` / `e.seriesTypeMap.Insert(key, int)` 完成，
-> 存储值为 `int` (`int(iter.Type())` 或 `int(typ)`)；冲突判断是 `v != int(iter.Type())`。
-> 当 `Get` 未命中时，源码还会先调用 `e.Type(keyBuf)` 复核磁盘上的类型 (engine.go:1372-1380)，
-> 两者都通过后才 `Insert`。`tsdb.ErrFieldTypeConflict` 被赋给 `seriesErr` 并 `continue`
-> 跳过该 field，但不会中断整批写入——这部分行为与旧描述一致。
+**与旧描述的关键差异**:
+
+1. **`keyBuf` 复用**: 循环外声明，每点 `keyBuf[:0]` 重置、每 field `keyBuf[:baseLen]` 截断；旧伪代码的 `append(p.Key(), ...)` 每点都会分配。
+2. **读锁**: `e.mu.RLock()` 覆盖 `Cache.WriteMulti` 与 `WAL.WriteMulti`，不是无锁写。
+3. **错误分支**: 5 种类型的 `FieldValue()` 错误都直接 `return err`；`default` 分支返回 `unknown field type ...`；`Cache.WriteMulti` 的错误也必须返回。
+4. **`seriesTypeMap`**: 是 `*radix.Tree`（`engine.go:225`），不是 `sync.Map`；未命中时先 `e.Type(keyBuf)` 复核磁盘类型，冲突时把磁盘类型写回 map 再 `continue`（跳过单个 field）。
+5. **Cache 先于 WAL 的失败语义**: WAL 失败时值已经在内存 Cache 中，**没有回滚**。读路径 `Cache.Values` 会去重且同一时间戳以 cache 为准（`cache.go:554-606`、`encoding.gen.go:61-90`、`array_cursor.gen.go:88-95`），因此**不会读到重复点**；代价是**持久性**——未进 WAL 的值要等 cache snapshot → TSM 才落盘，这之前进程崩溃会丢。
 
 #### 步骤 13: Epoch EndWrite
 
@@ -1196,7 +1204,7 @@ func (s *subscriptionRouter) Send(request *coordinator.WritePointsRequest) {
 **BalanceMode 定义**:
 
 ```go
-// services/subscriber/service.go:392 — BalanceMode
+// services/subscriber/service.go:512 — BalanceMode
 type BalanceMode int
 
 const (
@@ -1381,26 +1389,76 @@ sequenceDiagram
 #### 步骤 15: 结果收集与超时
 
 ```go
-// coordinator/points_writer.go:437 — 结果收集
-var timer *time.Timer
-timer = time.NewTimer(w.WriteTimeout)  // 默认 10s
-defer timer.Stop()
+// coordinator/points_writer.go:474-539 — WritePointsPrivileged（fan-out 与结果收集，节选）
+// 省略前置：shardMappings, err := w.MapShards(...)，其错误处理见步骤 14
+ch := make(chan error, len(shardMappings.Points))   // 缓冲 = shard 数，goroutine 不会泄漏
+for shardID, points := range shardMappings.Points {
+    go func(writeCtx tsdb.WriteContext, shard *meta.ShardInfo, database, retentionPolicy string, points []models.Point) {
+        err := w.writeToShard(writeCtx, shard, database, retentionPolicy, points)
+        if err == tsdb.ErrShardDeletion {
+            err = tsdb.PartialWriteError{
+                Reason:          fmt.Sprintf("shard %d is pending deletion", shard.ID),
+                Dropped:         len(points),
+                Database:        database,
+                RetentionPolicy: retentionPolicy,
+            }
+        }
+        ch <- err
+    }(writeCtx, shardMappings.Shards[shardID], database, retentionPolicy, points)
+}
 
-for i := 0; i < len(shardMappings.Points); i++ {
+timeout := time.NewTimer(w.WriteTimeout)
+defer timeout.Stop()
+
+// Subscriber.Send 在启动全部 goroutine 之后、等待结果之前
+pts := &WritePointsRequest{Database: database, RetentionPolicy: retentionPolicy, Points: points}
+w.Subscriber.Send(pts)
+atomic.AddInt64(&w.stats.SubWriteOK, 1)
+
+// 保留期/写窗口丢弃: 即使每个 shard 都成功，也整体返回 PartialWriteError
+if err == nil && shardMappings.Dropped() > 0 {
+    err = tsdb.PartialWriteError{
+        Reason:          shardMappings.SummariseDropped(),
+        Dropped:         shardMappings.Dropped(),
+        Database:        database,
+        RetentionPolicy: retentionPolicy,
+    }
+}
+
+for range shardMappings.Points {
     select {
-    case <-timer.C:
-        // 超时
-        return ErrTimeout
     case <-w.closing:
-        // 正在关闭
         return ErrWriteFailed
+    case <-timeout.C:
+        atomic.AddInt64(&w.stats.WriteTimeout, 1)
+        return ErrTimeout
     case err := <-ch:
         if err != nil {
-            return err  // 第一个错误立即返回
+            return err            // 第一个错误立即返回
         }
     }
 }
+return err
 ```
+
+**错误 → HTTP 状态码**（`services/httpd/handler.go:1773-1805`）:
+
+| 错误来源 | 错误类型 | HTTP | 客户端可见信息 | 已写入? |
+|---|---|---|---|---|
+| 解析失败且 0 点 | parseError | 400 | 原始错误 | 否 |
+| 解析部分失败 | parseError + points | 400 | 成功点已写 | 部分 |
+| 保留期外/写窗口外 | `ShardMapping.Dropped()` → PartialWriteError | 400 | `partial write: dropped N points outside retention policy of duration <dur> - oldest ..., newest ... dropped=N` | 其它点写 |
+| field 类型冲突 | `tsdb.PartialWriteError` | 400 | `... already exists as type ...` | 整点丢 |
+| shard 正在删除 | `ErrShardDeletion` → PartialWriteError | 400 | `shard N is pending deletion` | 否（该 shard） |
+| 认证/授权 | `influxdb.IsAuthorizationError` | 403 | not authorized | 否 |
+| 其它底层错误 | error | 500 | 原始错误 | 未知 |
+| 全部成功 | nil | 204 | — | 是 |
+
+**三个案例**:
+
+1. **2 个 shard，一成功一正在删除**: 删除中的 shard 返回 `ErrShardDeletion`，被转换成 `PartialWriteError{Dropped=len(points)}`；select 收到非 nil 立即返回 → 400，另一个 shard 的写入已经发生。
+2. **所有点早于 `now-rp.Duration`**: `MapShards` 把全部点放进 `Dropped`，`shardMappings.Points` 为空，因此**不会启动任何 goroutine**；函数在等待结果前就把 `err` 设为 `PartialWriteError`，`for range` 循环体不执行，直接 `return err` → 400。
+3. **一个 shard 磁盘错误**: 该 goroutine 返回底层 error → select 立即返回 500；其它 goroutine 继续跑完并把结果写入**带缓冲**的 `ch`，不会阻塞泄漏，但结果被丢弃。
 
 `WritePointsPrivileged` 遇到第一个 shard 错误会立即返回给调用方，但它不会取消已经启动的其他 shard goroutine；这些 goroutine 仍会继续执行到底层 `WriteToShard` 返回。
 
@@ -1447,44 +1505,46 @@ sequenceDiagram
 #### writeToShard — Write-Through 重试
 
 ```go
-// coordinator/points_writer.go:544 — writeToShard
+// coordinator/points_writer.go:542-569 — writeToShard
 func (w *PointsWriter) writeToShard(writeCtx tsdb.WriteContext, shard *meta.ShardInfo,
     database, retentionPolicy string, points []models.Point) error {
+    atomic.AddInt64(&w.stats.PointWriteReqLocal, int64(len(points)))
 
-    // 首次写入
-    err := w.TSDBStore.WriteToShard(writeCtx, shard.ID, points)
-
-    // ErrShardNotFound: 创建 Shard 后重试一次
-    if err == tsdb.ErrShardNotFound {
-        err = w.TSDBStore.CreateShard(database, retentionPolicy, shard.ID, true)
-        if err != nil {
-            w.Logger.Error("Failed to create shard",
-                zap.Uint64("shard", shard.ID), zap.Error(err))
+    // 只有 ErrShardNotFound 可以在这里处理
+    if err := w.TSDBStore.WriteToShard(writeCtx, shard.ID, points); err == tsdb.ErrShardNotFound {
+        if err = w.TSDBStore.CreateShard(database, retentionPolicy, shard.ID, true); err != nil {
+            w.Logger.Warn("Write failed creating shard", zap.Uint64("shard", shard.ID), zap.Error(err))
             atomic.AddInt64(&w.stats.WriteErr, 1)
             return err
         }
-        // 重试一次
-        err = w.TSDBStore.WriteToShard(writeCtx, shard.ID, points)
-    }
-
-    if err != nil {
-        w.Logger.Error("Write failed",
-            zap.Uint64("shard", shard.ID), zap.Error(err))
+        // 创建后重试一次
+        if err := w.TSDBStore.WriteToShard(writeCtx, shard.ID, points); err != nil {
+            w.Logger.Info("Write failed", zap.Uint64("shard", shard.ID), zap.Error(err))
+            atomic.AddInt64(&w.stats.WriteErr, 1)
+            return err
+        }
+    } else if err != nil {
         atomic.AddInt64(&w.stats.WriteErr, 1)
         return err
     }
-
     atomic.AddInt64(&w.stats.WriteOK, 1)
     return nil
 }
 ```
+
+**关键细节**:
+
+1. 只有 `tsdb.ErrShardNotFound` 会触发一次 `CreateShard` + 重试；`ErrShardDeletion` 不在这里处理，而是由调用方 `WritePointsPrivileged` 的 goroutine 转换成 `PartialWriteError`（`coordinator/points_writer.go:496-503`）。
+2. 日志级别不同：创建失败是 `Warn("Write failed creating shard")`，重试写失败是 `Info("Write failed")`，非 `ErrShardNotFound` 的底层错误**不在这里打日志**。
+3. 每次进入都递增 `PointWriteReqLocal`（本地写入点数）；成功只递增 `WriteOK`，失败递增 `WriteErr`。
+4. `CreateShard` 是幂等的；若 shard 已在 `pendingShardDeletes` 中，返回 `ErrShardDeletion`，该错误会原样上抛并被调用方转换。
 
 ## 2. ShardGroup Duration 自适应
 
 ### 2.1 shardGroupDuration 函数
 
 ```go
-// services/meta/data.go:1266 — shardGroupDuration
+// services/meta/data.go:1376 — shardGroupDuration
 func shardGroupDuration(d time.Duration) time.Duration {
     if d >= 180*24*time.Hour || d == 0 { // 6 个月或 0
         return 7 * 24 * time.Hour
@@ -1502,10 +1562,10 @@ func shardGroupDuration(d time.Duration) time.Duration {
 | < 2 天 | 1 小时 | 短期数据，细粒度过期管理 |
 | 无限 (0) | 7 天 | 默认策略 |
 
-**normalisedShardDuration** (services/meta/data.go:1275):
+**normalisedShardDuration** (services/meta/data.go:1386):
 
 ```go
-// services/meta/data.go:1275 — normalisedShardDuration
+// services/meta/data.go:1386 — normalisedShardDuration
 func normalisedShardDuration(sgd, d time.Duration) time.Duration {
     // sgd=0: 未指定, 使用 shardGroupDuration 默认值
     if sgd == 0 {
@@ -1522,9 +1582,8 @@ func normalisedShardDuration(sgd, d time.Duration) time.Duration {
 ### 2.2 ShardGroup 自动创建
 
 ```go
-// services/meta/data.go:358 — CreateShardGroup
+// services/meta/data.go:382 — CreateShardGroup
 func (data *Data) CreateShardGroup(database, policy string, timestamp time.Time) error {
-    // 1. 查找 RP
     rpi, err := data.RetentionPolicy(database, policy)
     if err != nil {
         return err
@@ -1532,38 +1591,54 @@ func (data *Data) CreateShardGroup(database, policy string, timestamp time.Time)
         return influxdb.ErrRetentionPolicyNotFound(policy)
     }
 
-    // 2. 检查是否已存在覆盖此时间的 ShardGroup (幂等)
+    // 幂等：已存在覆盖该时间戳且未被删除/截断的组
     if rpi.ShardGroupByTimestamp(timestamp) != nil {
-        return nil  // 已存在
+        return nil
     }
 
-    // 3. 计算 ShardGroup 边界 (直接使用 rpi.ShardGroupDuration)
+    startTime := timestamp.Truncate(rpi.ShardGroupDuration).UTC()
+    endTime := startTime.Add(rpi.ShardGroupDuration).UTC()
+    if endTime.After(time.Unix(0, models.MaxNanoTime)) {
+        // Shard group range is [start, end) so add one to the max time.
+        endTime = time.Unix(0, models.MaxNanoTime+1)
+    }
+
+    // 收缩新区间，保证不与已有组重叠（data.go:403-430）
+    for i := range rpi.ShardGroups {
+        if rpi.ShardGroups[i].Deleted() {
+            continue
+        }
+        startI := rpi.ShardGroups[i].StartTime
+        endI := rpi.ShardGroups[i].EndTime
+        if rpi.ShardGroups[i].Truncated() {
+            endI = rpi.ShardGroups[i].TruncatedAt
+        }
+        if !timestamp.Before(endI) && endI.After(startTime) {
+            startTime = endI
+        }
+        if startI.After(timestamp) && startI.Before(endTime) {
+            endTime = startI
+        }
+    }
+
     data.MaxShardGroupID++
-    sgi := ShardGroupInfo{}
-    sgi.ID = data.MaxShardGroupID
-    sgi.StartTime = timestamp.Truncate(rpi.ShardGroupDuration).UTC()
-    sgi.EndTime = sgi.StartTime.Add(rpi.ShardGroupDuration).UTC()
-
-    // 4. 创建 Shard (OSS: 每个 ShardGroup 只有 1 个 Shard)
+    sgi := ShardGroupInfo{ID: data.MaxShardGroupID, StartTime: startTime, EndTime: endTime}
     data.MaxShardID++
-    sgi.Shards = []ShardInfo{
-        {ID: data.MaxShardID},
-    }
-
-    // 5. 添加到 RP (排序后插入)
+    sgi.Shards = []ShardInfo{{ID: data.MaxShardID}}
     rpi.ShardGroups = append(rpi.ShardGroups, sgi)
     sort.Sort(ShardGroupInfos(rpi.ShardGroups))
-
     return nil
 }
 ```
 
+**注意**: `MaxNanoTime` 钳制发生在收缩循环**之前**；收缩循环会把新组起点抬到已有组的有效结束时间（截断组取 `TruncatedAt`），因此新组不会与旧组重叠。`CreateShardGroup` 每次固定只建 1 个 Shard（`data.MaxShardID++`），这是 OSS 的退化形态。
+
 **关键发现**: OSS 版本每个 ShardGroup 只创建 **1 个 Shard**。`ShardFor()` 的 hash 路由是 Enterprise 版本的遗留代码。
 
-**ShardGroupByTimestamp** (services/meta/data.go:1157):
+**ShardGroupByTimestamp** (services/meta/data.go:1263):
 
 ```go
-// services/meta/data.go:1157 — ShardGroupByTimestamp
+// services/meta/data.go:1263 — ShardGroupByTimestamp
 func (rpi *RetentionPolicyInfo) ShardGroupByTimestamp(timestamp time.Time) *ShardGroupInfo {
     for i := range rpi.ShardGroups {
         sgi := &rpi.ShardGroups[i]
@@ -1579,14 +1654,43 @@ func (rpi *RetentionPolicyInfo) ShardGroupByTimestamp(timestamp time.Time) *Shar
 ### 2.3 ShardGroup 预创建
 
 ```go
-// services/meta/client.go — PrecreateShardGroups
+// services/meta/client.go:766-816 — PrecreateShardGroups
 func (c *Client) PrecreateShardGroups(from, to time.Time) error {
-    // 预创建未来 2 个 ShardGroup 周期的 ShardGroup
-    // 避免写入时的实时创建延迟
+    c.mu.Lock()
+    defer c.mu.Unlock()
+    data := c.cacheData.Clone()
+    changed := false
+
+    for _, di := range data.Databases {
+        for _, rp := range di.RetentionPolicies {
+            if len(rp.ShardGroups) == 0 {
+                continue                                   // 从未写入过数据
+            }
+            g := rp.ShardGroups[len(rp.ShardGroups)-1]     // 只看最后一个组
+            if !g.Deleted() && g.EndTime.Before(to) && g.EndTime.After(from) {
+                nextTime := g.EndTime.Add(1 * time.Nanosecond)
+                if sg, _ := data.ShardGroupByTimestamp(di.Name, rp.Name, nextTime); sg != nil {
+                    continue                               // 已存在，幂等跳过
+                }
+                if _, err := createShardGroup(data, di.Name, rp.Name, nextTime); err != nil {
+                    continue                           // 失败只记 Info 日志
+                }
+                changed = true
+            }
+        }
+    }
+    if changed {
+        return c.commit(data)
+    }
+    return nil
 }
 ```
 
-**为什么预创建？** 写入路径中 `CreateShardGroup` 是同步调用。如果需要创建新的 ShardGroup，会增加写入延迟。预创建可以消除这种延迟。
+**关键点**:
+
+- 每个 RP 每次调用**最多创建 1 个组**，且只覆盖 `(now, now+advancePeriod]` 内的下一组。
+- 条件 `g.EndTime.After(from)` 要求最后一组的结束时间仍在未来；停机后该条件恒为 false，**预创建不会追赶**缺失的组，只能等写入路径 `MapShards → CreateShardGroup` 按需建组。
+- 预创建的意义是减少写入路径上的建组延迟；失败只记 `Info` 日志，不重试。
 
 ### 2.4 ShardGroup 生命周期
 
@@ -1610,34 +1714,37 @@ sequenceDiagram
     Write->>Write: sgList.ShardGroupAt(t) 本地路由
     Meta-->>Write: 返回匹配的 ShardGroup
     Write->>TSDB: WriteToShard(writeCtx, shardID, points)
-    Note over TSDB: 数据写入 Cache + WAL → TSM 文件
+    Note over TSDB: 数据写入 Cache 与 WAL → TSM 文件
 
-    Note over Write: 阶段 3: 过期标记
-    Note over Meta: ShardGroup.EndTime 到达
-    Meta->>Data: ShardGroup 仍在查询范围内<br>但不再接受新写入
+    Note over Write: 阶段 3: 截断（Enterprise/运维路径，OSS 不可达）
+    Note over Meta: TruncateShardGroups 设置 TruncatedAt
+    Note over Meta: OSS 无生产调用方，且写路径 ShardGroupAt 只用 Contains<br/>（原始 StartTime/EndTime），不感知 TruncatedAt
+    Note over Meta: 所以“EndTime 到达后不再接受新写入”在 OSS 不成立
 
-    Note over Retention: 阶段 4: 软删除
-    Retention->>Meta: DeleteShardGroup(db, rp, sgID)
-    Meta->>Data: sgi.DeletedAt = time.Now()
-    Data->>Disk: snapshot() → 写入 meta.db
-    Note over Data: 查询时过滤: !sgi.Deleted()
+    Note over Retention: 阶段 4: 收集过期组
+    Note over Meta: ExpiredShardGroups 找出 EndTime + RP.Duration < now 的组
 
-    Note over Retention: 阶段 5: 物理清理
-    Retention->>Meta: PruneShardGroups()
-    Meta->>Data: 移除已过期的软删除 ShardGroup
-    Retention->>TSDB: DeleteShard(shardID)
-    TSDB->>TSDB: 关闭 Shard → 删除目录
+    Note over Retention: 阶段 5: 物理清理（顺序与 services/retention/service.go 一致）
+    Retention->>Meta: DeleteShardGroup（软删，置 DeletedAt）
+    Retention->>TSDB: SetShardNewReadersBlocked(id, true)
+    Retention->>TSDB: ShardInUse(id)
+    Retention->>TSDB: DeleteShard(id) — 先摘 s.shards，再删文件
+    Retention->>Meta: DropShardMetaRef(id, owners) — OSS: DropShard 移除 ShardInfo
+    Note over Meta: 组内最后一个 ShardInfo 被移除时，副作用置 DeletedAt
+    Retention->>Meta: PruneShardGroups() — 条件: DeletedAt 超过 14 天 且 len(Shards)==0
     Note over TSDB: 磁盘空间释放
 ```
 
-**ShardGroup 时间边界计算** (`data.go:358`):
+**注意**: `DeletedAt` 只影响查询过滤（`services/meta/data.go:340-352`）；没有 `DeletedAt` 的空组不会被修剪。`TruncateShardGroups` 在 OSS 只有接口声明与测试/mock 调用方（`coordinator/meta_client.go:30`），写路径 `ShardGroupAt` 用 `Contains` 看原始 `StartTime/EndTime`。
+
+**ShardGroup 时间边界计算** (`data.go:382`):
 
 ```go
 startTime := timestamp.Truncate(rpi.ShardGroupDuration).UTC()
 endTime := startTime.Add(rpi.ShardGroupDuration).UTC()
 ```
 
-**ShardGroupDuration 自适应** (`data.go:1266`):
+**ShardGroupDuration 自适应** (`data.go:1376`):
 
 | RP Duration | ShardGroup Duration | 设计意图 |
 |-------------|---------------------|----------|
@@ -1651,33 +1758,32 @@ endTime := startTime.Add(rpi.ShardGroupDuration).UTC()
 >
 > ```
 > 输入: [
->   cpu,host=web value=3.14 1000,      // value 是 Float
->   cpu,host=web value=42 1001,        // value 是 Float (OK)
->   cpu,host=web status="running" 1002 // status 是 String (新 field)
+>   cpu,host=web value=3.14 1000,      // value Float
+>   cpu,host=web value=42 1001,        // value Float
+>   cpu,host=web status="running" 1002 // status String（新 field）
 > ]
 >
-> 步骤 1: validateSeriesAndFields
->   - value=3.14: Float, 已存在类型 Float → 匹配 ✓
->   - value=42: Float, 已存在类型 Float → 匹配 ✓
->   - status="running": 不存在 → 新建 String field ✓
+> 步骤 1: validateSeriesAndFields → ValidateAndCreateFields
+>   - 点 1/2: value 已存在类型 Integer → ErrFieldTypeConflict → Dropped=1
+>   - 点 3: status 不存在 → 创建 String field，Dropped=0
 >
-> 步骤 2: 假设 value 字段之前被写为 Integer
->   - value=3.14: Float, 已存在类型 Integer → 冲突!
->   - 产生 PartialWriteError: "field type conflict: input field 'value'
->     on measurement 'cpu' is type float, already exists as type integer"
+> 步骤 2: Dropped>0 的点不进入 points[j]（shard.go:719-726）
+>   - 点 1、点 2 整点丢弃（Dropped=2）
+>   - 点 3 继续交给 engine.WritePoints
 >
-> 步骤 3: 传播路径
->   Shard.validateSeriesAndFields() → 返回 PartialWriteError
->   Shard.WritePoints() → 返回但继续写入有效点 (status)
+> 步骤 3: 已识别的新 field（status）仍会被 saveFieldsAndMeasurements 落盘
+>   （调用点 shard.go:585 无条件执行）→ SHOW FIELD KEYS 会出现 status
+>
+> 步骤 4: 传播路径
+>   Shard.validateSeriesAndFields() → PartialWriteError{Dropped:2}
+>   Shard.WritePoints() → 继续写点 3，返回 writeError
 >   Store.WriteToShard() → 透传
 >   PointsWriter.writeToShard() → 透传
->   HTTP Handler.serveWrite() → 检查错误类型
+>   HTTP Handler.serveWrite() → 400，PointsWrittenDropped += 2
 >
-> 步骤 4: HTTP 响应
->   if partial, ok := err.(tsdb.PartialWriteError); ok {
->       // 部分成功: 返回 400 Bad Request
->       // 已写入的点被持久化, 被丢弃的点信息在错误消息中
->   }
+> 步骤 5: HTTP 响应
+>   partial write: ... dropped=2 → 400 Bad Request
+>   点 1、2 未写入；点 3 已写入，status 字段已创建
 > ```
 
 ## 3. Shard 层详细实现
@@ -1685,7 +1791,7 @@ endTime := startTime.Add(rpi.ShardGroupDuration).UTC()
 ### 3.1 Shard 结构体
 
 ```go
-// tsdb/shard.go:129 — Shard
+// tsdb/shard.go:146 — Shard
 type Shard struct {
     mu      sync.RWMutex
     id      uint64
@@ -1700,6 +1806,8 @@ type Shard struct {
     enabled bool
     stats       *ShardStatistics
     defaultTags models.StatisticTags
+    baseLogger  *zap.Logger
+    logger      *zap.Logger
     EnableOnOpen bool
     CompactionDisabled bool
 }
@@ -1708,60 +1816,55 @@ type Shard struct {
 ### 3.2 Store.CreateShard — Shard 创建
 
 ```go
-// tsdb/store.go:601 — CreateShard
+// tsdb/store.go:892-927 — Store.CreateShard
 func (s *Store) CreateShard(database, retentionPolicy string, shardID uint64, enabled bool) error {
-    // 1. 检查是否已存在
-    if _, ok := s.shards[shardID]; ok {
-        return nil  // 幂等: shardID 已存在即返回, 不检查 db/rp
+    s.mu.Lock()
+    defer s.mu.Unlock()
+
+    select {
+    case <-s.closing:
+        return ErrStoreClosed
+    default:
     }
 
-    // 2. 检查是否正在删除
+    // 已存在 → 幂等返回
+    if _, ok := s.shards[shardID]; ok {
+        return nil
+    }
+    // 正在删除 → 必须先等删除完成
     if _, ok := s.pendingShardDeletes[shardID]; ok {
         return ErrShardDeletion
     }
 
-    // 3. 创建目录结构
+    // 创建 db/rp 目录与 WAL 目录
     if err := os.MkdirAll(filepath.Join(s.path, database, retentionPolicy), 0700); err != nil {
         return err
     }
-
-    // 4. WAL 目录 (使用 WALDir 不是 WALPath)
     walPath := filepath.Join(s.EngineOptions.Config.WALDir, database, retentionPolicy, fmt.Sprintf("%d", shardID))
     if err := os.MkdirAll(walPath, 0700); err != nil {
         return err
     }
 
-    // 5. 获取或创建 SeriesFile
-    sfile, err := s.seriesFile(database)
-
-    // 6. 获取或创建 Index
-    idx, err := s.createIndex(database, sfile)
-
-    // 7. 创建 Shard 对象 (5 个参数, index 通过 opt.InmemIndex 传入)
-    opt := s.EngineOptions
-    opt.InmemIndex = idx
-    sh := NewShard(shardID, path, walPath, sfile, opt)
-    sh.EnableOnOpen = enabled
-
-    // 8. 打开 Shard
-    if err := sh.Open(); err != nil {
-        return err
-    }
-
-    // 9. 注册
-    s.shards[shardID] = sh
-    s.epochs[shardID] = newEpochTracker()
-
-    return nil
+    loader := s.newShardLoader(shardID, database, retentionPolicy, enabled)
+    res := loader.Load()
+    s.registerShard(res)          // 总会调用；失败时只登记 badShards
+    s.warnMixedIndexTypes(database)
+    return res.err
 }
 ```
+
+**三条关键路径**:
+
+1. `shardLoader.Load()`（`tsdb/store.go:390-419`）才做 `NewShard` + `shard.Open()`；`newShardLoader`（`:444-488`）负责 `openSeriesFile` / `createIndexIfNotExists`（真实函数名，不是 `s.createIndex`）并注入 `InmemIndex`。
+2. `registerShard`（`:632-651`）在 `res.err == nil` 时才写 `s.shards[id]`、`s.epochs[id] = newEpochTracker()`、`s.databases[...]`；`res.err != nil` 时只 `s.badShards.setShardOpenError(...)` 后立即 return，**不会进入 `s.shards`**。函数本身总会被调用（失败也要登记 `badShards`）。
+3. `badShards` 命中时除非 `force` 否则不再尝试打开（`:462`）；`ClearBadShardList` 可清空（`:788`）。
 
 ## 4. Consistency Level — 一致性级别
 
 ### 4.1 定义
 
 ```go
-// models/consistency.go:14 — ConsistencyLevel
+// models/consistency.go:12 — ConsistencyLevel
 type ConsistencyLevel int
 
 const (
@@ -1808,7 +1911,7 @@ func ParseConsistencyLevel(level string) (ConsistencyLevel, error) {
 
 ```mermaid
 flowchart LR
-    subgraph "Hash 路由 (当前设计)"
+    subgraph "Hash 路由 (Enterprise 设计；OSS 单 shard 时退化)"
         A1["Point 1: hash=503"] --> S1["Shard 3"]
         A2["Point 2: hash=217"] --> S2["Shard 1"]
         A3["Point 3: hash=891"] --> S3["Shard 1"]
@@ -1842,8 +1945,8 @@ RetentionPolicy (保留策略: 7d, 30d, ...)
 
 - **时间局部性**: 同一时间窗口的数据在同一个 ShardGroup 中
 - **生命周期管理**: ShardGroup 过期后整体删除（标记 DeletedAt），无需逐 shard 清理
-- **查询优化**: 时间范围查询只需扫描覆盖的 ShardGroup，使用二分查找 O(log N)
-- **并发写入**: 不同 series 可以并行写入不同 shard
+- **查询优化**: 写路径用二分查找 O(log G)；查询路径通过 `ShardGroupsByTimeRange` 线性扫描 O(G) 且只扫元数据（见 §5.6）
+- **并发写入**: OSS 每个 ShardGroup 只有 1 个 shard（`services/meta/data.go:443-447`），写入并发来自多个 ShardGroup、多个批次，而不是同一 ShardGroup 内的 hash 分片；多 shard 的 hash 路由是 Enterprise 形态
 
 ### 5.3 为什么用 Write-Through 创建 Shard
 
@@ -1885,7 +1988,8 @@ func (c *chanWriter) Write(wr WriteRequest) {
 
 - **写入优先**: Subscriber 是辅助功能，具体 destination 的队列不能阻塞主写入路径
 - **背压显式化**: subscriber 的 `writeFailures` 统计暴露队列满或超出内存限制
-- **at-most-once**: 保证主写入路径的延迟不受 subscriber 影响
+- **入队非阻塞**: `select default` 只保证"入队"不阻塞主写入路径；`Send` 本身仍是同步调用，开销包括全批 `ValidPointStrings` 校验、line protocol 序列化（`services/subscriber/service.go:42-66`）以及每次 `Send` 一次 `router.mu.RLock`（`:608-611`，覆盖整张 destination 表）
+- **at-most-once**: 队列满/超限时只递增 `writeFailures`，不重试，因此是尽力而为
 
 ### 5.5 为什么用 Epoch Tracker 而非简单的锁
 
@@ -1911,12 +2015,54 @@ flowchart TD
 - **非重叠写入不受影响**: 不同 measurement 的写入可以并发进行
 - **无死锁风险**: Epoch 单调递增，不存在循环等待
 
+### 5.6 查询侧路由：LocalShardMapper
+
+写路径与读路径用的是两套完全不同的路由。`SELECT` 由 `coordinator.LocalShardMapper` 按**查询时间范围**裁剪 shard group（时序图如下）；`SHOW TAG KEYS` / `SHOW TAG VALUES` 不经过 `LocalShardMapper`，而是在 `StatementExecutor` 内直接调用同一个 `MetaClient.ShardGroupsByTimeRange` 再扁平化 shard ID（`coordinator/statement_executor.go:1041`、`:1149`），过滤语义相同：
+
+```mermaid
+sequenceDiagram
+    participant Exec as QueryExecutor
+    participant Mapper as LocalShardMapper
+    participant Meta as MetaClient
+    participant Data as Data
+    participant TSDB as TSDBStore
+
+    Exec->>Mapper: MapShards(sources, TimeRange)
+    Mapper->>Mapper: tmin/tmax = TimeRange
+    loop 每个 Source（Measurement）
+        Mapper->>Meta: ShardGroupsByTimeRange(db, rp, tmin, tmax)
+        Meta->>Data: RetentionPolicy + 线性遍历 ShardGroups
+        Data-->>Meta: groups（过滤 Deleted / !Overlaps）
+        Meta-->>Mapper: []ShardGroupInfo
+        Mapper->>Mapper: 扁平化 groups[*].Shards[*].ID
+        Mapper->>TSDB: ShardGroup(shardIDs)
+        TSDB-->>Mapper: tsdb.ShardGroup
+        Mapper->>Mapper: ShardMap[Source] = ShardGroup
+    end
+    Note over Mapper: *influxql.SubQuery 递归处理其 Sources
+```
+
+**读写路由对照**:
+
+| 维度 | 写路径 `PointsWriter.MapShards` | 读路径 `LocalShardMapper.mapShards` |
+|---|---|---|
+| 入口 | `PointsWriter.MapShards` | `LocalShardMapper.MapShards`（`coordinator/shard_mapper.go:33-45`） |
+| 选组依据 | 点时间戳 → `sgList.ShardGroupAt`（二分 + 重叠线性回退） | 查询时间范围 → `ShardGroupsByTimeRange`（线性 `Overlaps`） |
+| 复杂度 | O(log G + R) | O(G) |
+| 过滤条件 | 保留期 + 写窗口 + `Contains` | 仅 `Deleted()` + `Overlaps` |
+| 是否看 `TruncatedAt` | 否 | 否 |
+| 产出 | `ShardMapping{Points,Shards}` | `LocalShardMapping.ShardMap` |
+
+**数值案例**: 某 RP 有 SG1=[10:00,11:00)、SG2=[11:00,12:00)、SG3=[12:00,13:00)（各 1h、首尾相接），SG2 已软删、SG3 已截断。查询 `[10:10, 12:20)`：`ShardGroupsByTimeRange` 过滤掉 SG2（`Deleted()`）与范围外的组，返回 SG1/SG3 两个组；扁平化得到 2 个 shard ID；SG3 虽然已截断，**仍会被扫描**——读路径不看 `TruncatedAt`。
+
+**调用点**: `coordinator/shard_mapper.go:33-90`；`StatementExecutor.ShardMapper` 在 `coordinator/statement_executor.go:430`（`query.Prepare`）与 `:647`（`query.Select`）被使用，实例由 `cmd/influxd/run/server.go:233` 注入。过滤逻辑在 `services/meta/client.go:615-634` 与 `services/meta/data.go:1447-1459`。
+
 ## 6. 架构收益
 
 | 维度 | 收益 |
 |------|------|
-| **写入吞吐** | goroutine per shard 并发写入 + Hash 路由均匀分布 |
-| **查询性能** | ShardGroup 时间分区 + 二分查找 O(log N) |
+| **写入吞吐** | goroutine per shard 并发写入；OSS 单 shard 时并发来自多个 ShardGroup/批次 |
+| **查询性能** | ShardGroup 时间分区；写路径二分 O(log G)，查询路径线性扫元数据 O(G)（见 §5.6） |
 | **存储管理** | ShardGroup 整体过期删除，生命周期管理简单 |
 | **可靠性** | Epoch Tracker 防止写入/删除竞态 |
 | **可扩展性** | 接口化设计 (MetaClient, TSDBStore)，支持测试和替换 |
@@ -1953,22 +2099,31 @@ OSS 版本没有 Hinted Handoff 实现：
 
 ### 7.3 写入超时的粗粒度控制
 
+`WritePointsPrivileged` 为整批写入启动 N 个 shard goroutine，然后用**一个** `time.Timer`（`WriteTimeout`，默认 10s，`coordinator/config.go:15`）等待 N 个结果：
+
 ```go
-// 所有 shard 共享同一个 WriteTimeout (10s)
-timer := time.NewTimer(w.WriteTimeout)
-for i := 0; i < len(shardMapping.Points); i++ {
+// coordinator/points_writer.go:474-539（节选）
+ch := make(chan error, len(shardMappings.Points))   // 缓冲 = shard 数
+timeout := time.NewTimer(w.WriteTimeout)
+defer timeout.Stop()
+for range shardMappings.Points {
     select {
-    case <-timer.C:
+    case <-w.closing:
+        return ErrWriteFailed
+    case <-timeout.C:
         return ErrTimeout
     case err := <-ch:
-        ...
+        if err != nil {
+            return err
+        }
     }
 }
 ```
 
-- 所有 shard 写入共享同一个 10s 超时
-- 无法为单个 shard 设置不同的超时
-- 慢 shard 会拖累整个写入操作
+- 所有 shard 共享同一个 10s 超时，无法为单个慢 shard 设置不同上限。
+- 任何一个 shard 错误会立即返回，但**不会取消**其它已启动的 goroutine；`ch` 的缓冲等于 shard 数，其它 goroutine 仍能写入结果并退出，不会泄漏。
+- 超时只约束"等待结果"的时间，不约束已经在执行的 `WriteToShard`；超时返回后已写入的数据不会回滚。
+- 超时递增 `WriteTimeout` 统计。
 
 ### 7.4 Subscriber 非阻塞发送的数据丢失
 
@@ -2002,19 +2157,39 @@ func (u *UDP) WritePointsContext(_ context.Context, request WriteRequest) (desti
 
 ### 7.6 ShardGroup 创建的竞态
 
+真实代码是"两遍扫描"，不是"检查-创建-重查"：
+
 ```go
-// MapShards 中的检查-创建模式
-sg := sgList.ShardGroupAt(p.Time())
-if sg == nil {
-    w.MetaClient.CreateShardGroup(database, retentionPolicy, p.Time())
-    sg = sgList.ShardGroupAt(p.Time())
+// 第一遍: 按需创建并把返回值加入 sgList（coordinator/points_writer.go:300-334）
+for _, p := range wp.Points {
+    if p.Time().Before(min) || list.Covers(p.Time()) || !withinWindow {
+        continue
+    }
+    sg, err := w.MetaClient.CreateShardGroup(wp.Database, wp.RetentionPolicy, p.Time())
+    if err != nil {
+        return nil, err
+    }
+    if sg == nil {
+        return nil, errors.New("nil shard group")
+    }
+    list.Add(*sg)
+}
+
+// 第二遍: 在本地 sgList 上二分路由
+for _, p := range wp.Points {
+    sg := list.ShardGroupAt(p.Time())
+    if sg == nil {
+        mapping.AddDropped(p, min, RetentionPolicyBound)
+        continue
+    }
+    // ... ShardFor / MapPoint
 }
 ```
 
-- 多个并发写入可能同时发现 ShardGroup 不存在
-- `CreateShardGroup` 内部有锁保护，但可能导致短暂阻塞
-- 创建后需要重新查询 sgList，增加延迟
-- **缓解**: MetaClient 预创建未来 ShardGroup
+- 竞态保护在 `Client.CreateShardGroup` 内部：`RLock` 快速路径 → 释放 → `Lock` → **double-check** `ShardGroupByTimestamp`（`services/meta/client.go:693-721`），不是"重新查询 sgList"。
+- 并发写入可能同时调用 `CreateShardGroup`，但只有一个真正创建；另一个在写锁内二次检查时拿到已存在的组。
+- `sgList` 初始为空，只用 meta 的返回值填充，**不会**从 `RetentionPolicyInfo.ShardGroups` 预填。
+- **缓解**: Precreator 定时预创建；但它不会追赶停机期间缺失的组（见 §2.3）。
 
 ### 7.7 MapShards 每次分配新 map
 
@@ -2059,6 +2234,7 @@ func (c *Client) ShardOwner(shardID uint64) (database, policy string, sgi *Shard
 - O(D x R x G x S) 复杂度
 - 数据库/RP/ShardGroup 数量多时查询变慢
 - **优化建议**: 维护 shardID -> (db, rp, sg) 的反向索引
+- **注意**: `Client.ShardOwner`（`services/meta/client.go:819`）在 OSS 全树**没有生产调用方**（只有 mock），且返回的 `&g` 是 `range` 迭代变量的地址——是组信息的**副本**，不是 `cacheData` 中的原对象；修改它不会影响元数据
 
 ### 7.9 全局 WriteTimeout 与 Context 超时冲突
 
@@ -2087,85 +2263,138 @@ timer := time.NewTimer(w.WriteTimeout)
 ### 8.1 结构体
 
 ```go
-// tsdb/shard.go:1685 — MeasurementFieldSet
+// tsdb/shard.go:1657-1663
 type MeasurementFieldSet struct {
-    mu              sync.RWMutex
-    fields          map[string]*MeasurementFields  // measurement → fields
-    path            string                          // 磁盘路径
-    memoryVersion   uint64                          // 内存版本号
-    writtenVersion  uint64                          // 已写入磁盘的版本号
+    mu        sync.RWMutex
+    fields    map[string]*MeasurementFields
+    path      string
+    changeMgr *measurementFieldSetChangeMgr   // 异步 change-log 队列
 }
 ```
 
 ### 8.2 MeasurementFields
 
 ```go
-// tsdb/shard.go:1557 — MeasurementFields
+// tsdb/shard.go:1557-1559
 type MeasurementFields struct {
-    mu     sync.Mutex
-    fields atomic.Value // map[string]*Field
+    fields gensyncmap.Map[string, *Field]     // 泛型并发 map，不是 atomic.Value
 }
 ```
 
 ### 8.3 Field
 
 ```go
-// tsdb/shard.go:1937 — Field
+// tsdb/shard.go:2272-2275
 type Field struct {
-    ID   uint8             `json:"id,omitempty"`
-    Name string            `json:"name,omitempty"`
-    Type influxql.DataType `json:"type,omitempty"`  // Float, Integer, Unsigned, String, Boolean
+    Name string
+    Type influxql.DataType
 }
 ```
 
-### 8.4 createFieldsAndMeasurements — 创建新 Field
+**并发模型**:
+
+- `MeasurementFieldSet.mu`（`sync.RWMutex`）保护 `fields` map、`path` 与 `changeMgr`；`CreateFieldsIfNotExists` / `MeasurementFields` 分别走写锁与读锁。
+- `MeasurementFields.fields` 是 `gensyncmap.Map[string, *Field]`（泛型并发 map），自身并发安全；读多写少，`FieldKeys`/`ForEachField` 只做 `Range`。
+- `changeMgr` 持 `writeRequests` channel（容量 `MaxCombinedWrites=100`）与后台 `SaveWriter` goroutine（`SetMeasurementFieldSetWriter` `:1814-1825` 启动，`SaveWriter` `:1844-1858`）。`RequestSave` 对调用方**同步**（阻塞等回执），对磁盘**批量异步**：多个并发 `Save` 的变更会被合并成一次 `appendToChangesFile`。
+
+### 8.4 saveFieldsAndMeasurements — 创建新 Field
 
 ```go
-// tsdb/shard.go:744 — createFieldsAndMeasurements
-func (s *Shard) createFieldsAndMeasurements(fieldsToCreate []*FieldCreate) error {
-    if len(fieldsToCreate) == 0 {
-        return nil
+// tsdb/shard.go:765 — saveFieldsAndMeasurements
+// 调用点: tsdb/shard.go:585（无论本批是否丢点都会调用）
+func (s *Shard) saveFieldsAndMeasurements(fieldsToSave []*FieldCreate) (int, error) {
+    if len(fieldsToSave) == 0 {
+        return 0, nil
     }
-
     engine, err := s.engineNoLock()
     if err != nil {
-        return err
+        return 0, err
     }
-
-    // 1. 遍历需要创建的 fields
-    for _, f := range fieldsToCreate {
-        // 2. 获取 measurement 的 field 集合
-        mf := engine.MeasurementFields(f.Measurement)
-
-        // 3. 创建 field (如果不存在)
-        if err := mf.CreateFieldIfNotExists([]byte(f.Field.Name), f.Field.Type); err != nil {
-            return err
-        }
-
-        // 4. 更新索引中的 field 名称
+    numCreated := 0
+    changes := make([]*FieldChange, 0, len(fieldsToSave))
+    for _, f := range fieldsToSave {
+        numCreated++
         s.index.SetFieldName(f.Measurement, f.Field.Name)
+        changes = append(changes, &FieldChange{
+            FieldCreate: *f,
+            ChangeType:  AddMeasurementField,
+        })
     }
-
-    // 5. 持久化到磁盘
-    return engine.MeasurementFieldSet().Save()
+    return numCreated, engine.MeasurementFieldSet().Save(changes)
 }
 ```
+
+**注意易错点**:
+
+1. 函数名是 `saveFieldsAndMeasurements`，返回 `(int, error)`；旧文档里的 `create…FieldsAndMeasurements` 名称并不存在。`CreateFieldIfNotExists(name string, typ influxql.DataType)` 由上一阶段的 `ValidateAndCreateFields`（`tsdb/field_validator.go:63`）调用，不在本函数内。
+2. `Save(changes FieldChanges) error`（`tsdb/shard.go:1834-1836`）→ `changeMgr.RequestSave`（`:1838-1844`，阻塞等回执）→ 后台 `SaveWriter`（`:1844-1858`）→ `appendToChangesFile`（`:1915-2001`，`O_CREATE|O_APPEND|O_SYNC`，排空并合并队列中已排队的请求）。返回时变更已进 `fields.idxl`；`fields.idx` 仍是旧文件。
+3. 全量落盘 `WriteToFile`（`tsdb/shard.go:1855-1911`，tmp + `O_SYNC` + rename + `SyncDir`）只在 `Close`/`ApplyChanges`（`:2243-2268`）/引擎打开时发生（`tsdb/engine/tsm1/engine.go:780-783,934`）。
 
 ### 8.5 Field 类型冲突检测
 
 ```mermaid
 flowchart TD
-    A["写入: cpu value=3.14"] --> B["检查 field 类型"]
-    B --> C{"field 'value' 存在?"}
-    C -->|"否"| D["创建 Float field"]
-    C -->|"是"| E{"类型匹配?"}
-    E -->|"是"| F["继续写入"]
-    E -->|"否"| G["ErrFieldTypeConflict"]
-    G --> H["此 field 被跳过"]
-    H --> I["其他 field 继续写入"]
+    A["Shard.WritePoints(points)"] --> B["validateSeriesAndFields"]
+    B --> C{"field 名为 time?"}
+    C -->|"是"| D["Dropped=0，剥字段，点继续"]
+    C -->|"否"| E{"字符串长度 > 1 MiB?"}
+    E -->|"是"| F["Dropped=1，整点丢弃"]
+    E -->|"否"| G{"类型冲突?"}
+    G -->|"是"| F
+    G -->|"否"| H["创建/复用 field，点继续"]
+    F --> I["已识别的新 field 仍写入 fields.idxl"]
+    D --> J["engine.WritePoints 只写保留的点"]
+    H --> J
 ```
 
-**关键行为**: Field 类型冲突不会阻止整个 Point 的写入，只跳过冲突的 field。其他 field 正常写入。
+| 条件 | Dropped | 点是否继续写入 | 证据 |
+|------|---------|----------------|------|
+| field 名为 `time` | 0 | 是（剥掉该字段） | `tsdb/field_validator.go:44-54` |
+| 字符串值 > 1 MiB（`MaxFieldValueLength=1048576`） | 1 | 否，整点丢弃 | `tsdb/field_validator.go:12,27-39` |
+| 类型冲突 `ErrFieldTypeConflict` | 1 | 否，整点丢弃 | `tsdb/field_validator.go:65-73`；`tsdb/shard.go:719-726` |
+| 其它建 field 错误 | 1 | 否 | `tsdb/field_validator.go:74-79` |
+| `dataType == influxql.Unknown` | — | 该 field 被静默跳过（不校验、不创建） | `tsdb/field_validator.go:56-58` |
+
+**关键行为**: Field 类型冲突**不是**"只跳过冲突的 field"。`ValidateAndCreateFields` 返回 `PartialWriteError{Dropped: 1}`，`validateSeriesAndFields` 在 `Dropped > 0` 时直接 `continue`，该点不进入 `points[j]`，因此**整个 Point 被丢弃**（`tsdb/shard.go:719-726`）。只有 field 名为 `time` 时 `Dropped=0`，剥掉该字段后点继续。
+
+> engine 层的 `seriesTypeMap` 冲突只跳过单个 field（`tsdb/engine/tsm1/engine.go:1372-1391`），但正常写入路径已在 shard 层拦下。被丢弃点上已识别的新 field 仍会创建并写入 `fields.idxl`，因此 `SHOW FIELD KEYS` 可能看到"从未成功写入过数据"的字段。
+
+### 8.6 Field 元数据的"写—压缩—恢复"三泳道
+
+```mermaid
+flowchart TD
+    subgraph W["写请求线程"]
+        W1["validateSeriesAndFields"] --> W2["saveFieldsAndMeasurements"]
+        W2 --> W3["MeasurementFieldSet.Save(changes)"]
+        W3 --> W4["changeMgr.RequestSave<br/>阻塞等回执"]
+    end
+    subgraph S["SaveWriter goroutine"]
+        S1["writeRequests 队列（容量 100）"] --> S2["排空队列并合并<br/>（单次最多 1+100 条）"]
+        S2 --> S3["Truncate(上次已知长度)"]
+        S3 --> S4["marshalFieldChanges"]
+        S4 --> S5["fd.Write + O_SYNC → fields.idxl"]
+        S5 --> S6["回执 error 给所有等待方"]
+    end
+    subgraph L["启动 / Close / ApplyChanges"]
+        L1["load fields.idx"] --> L2["ApplyChanges 重放 fields.idxl"]
+        L2 --> L3["WriteToFile: tmp → rename → SyncDir"]
+        L3 --> L4["remove fields.idxl"]
+    end
+    W4 -.->|"变更入队"| S1
+    S6 -.->|"内存已生效"| W4
+    S5 -.->|"进程重启后重放"| L2
+```
+
+**崩溃点案例**（`fields.idxl` 追加写，`fields.idx` 全量写）:
+
+- `Save` 返回后立刻 `kill -9`：变更已在 `fields.idxl`（`O_SYNC`），重启 `load` + `ApplyChanges` 重放后 `SHOW FIELD KEYS` 可见。
+- `Save` 返回前 kill：内存已创建 field，日志可能只写了半条；重启时 `Truncate(changeFileSize)` 丢弃半条，字段不可见。
+- 压缩到一半掉电：`fields.idx` 仍是旧文件（POSIX 下同目录 `rename(2)` 原子；Windows 的 `file.RenameFile` 先删目标再 rename，见 07 号文档 §7.2，存在 `fields.idx` 缺失的窗口）+ `fields.idxl` 未删除 → 下次启动重放幂等（Windows 上 `fields.idx` 缺失会从空索引开始，靠 `fields.idxl` 全量重建）。
+
+**关键常量**: `FieldsChangeFile = "fields.idxl"`（`tsdb/shard.go:51`）、`MaxCombinedWrites = 100`（`:1667`，作为 `writeRequests` channel 容量传给 `SetMeasurementFieldSetWriter`，`:1675`、`:1818`；`appendToChangesFile` 会排空队列，单次最多合并 1+100 条请求）、change-log 打开标志 `O_CREATE|O_APPEND|O_SYNC|O_WRONLY`（`:1935`）。`SkipFieldSizeValidation` 只关闭"字符串 > 1 MiB"检查，不影响类型冲突判定。
+
+**对比**: `fields.idx` 的 rename 之后显式调用 `file.SyncDir`（`tsdb/shard.go:2020-2032`），而 meta snapshot 的 rename 没有（见 07 号文档 §9.2、S-07-07）。
+
 
 ## 9. CreateSeriesListIfNotExists — 完整调用链
 
@@ -2198,70 +2427,126 @@ flowchart TD
 // tsdb/series_file.go:32 — SeriesFilePartitionN
 const SeriesFilePartitionN = 8
 
-// tsdb/series_file.go:178 — CreateSeriesListIfNotExists
-func (f *SeriesFile) CreateSeriesListIfNotExists(names [][]byte, tagsSlice []models.Tags) ([]uint64, error) {
-    // 1. 构建 key
-    keys := make([][]byte, len(names))
-    for i := range names {
-        keys[i] = models.MakeKey(names[i], tagsSlice[i])
-    }
+// tsdb/series_file.go:182-199 — CreateSeriesListIfNotExists
+func (f *SeriesFile) CreateSeriesListIfNotExists(names [][]byte, tagsSlice []models.Tags, tracker StatsTracker) ([]uint64, error) {
+    keys := GenerateSeriesKeys(names, tagsSlice)          // 不是 models.MakeKey
+    keyPartitionIDs := f.SeriesKeysPartitionIDs(keys)     // xxhash % 8
+    ids := make([]uint64, len(keys))
 
-    // 2. 按分区分组
-    for i, key := range keys {
-        partitionID := int(xxhash.Sum64(key) % SeriesFilePartitionN)
-        // ...
+    var g errgroup.Group                                 // 每个分区一个 goroutine
+    for i := range f.partitions {
+        p := f.partitions[i]
+        g.Go(func() error {
+            return p.CreateSeriesListIfNotExists(keys, keyPartitionIDs, ids, tracker)
+        })
     }
-
-    // 3. 每个分区独立处理
-    for _, p := range f.partitions {
-        p.CreateSeriesListIfNotExists(keys, keyPartitionIDs, ids)
+    if err := g.Wait(); err != nil {
+        return nil, err
     }
-
     return ids, nil
 }
+
+// tsdb/series_file.go:325 — SeriesKeysPartitionIDs
+func (f *SeriesFile) SeriesKeysPartitionIDs(keys [][]byte) []int {
+    partitionIDs := make([]int, len(keys))
+    for i := range keys {
+        partitionIDs[i] = int(xxhash.Sum64(keys[i]) % SeriesFilePartitionN)
+    }
+    return partitionIDs
+}
 ```
+
+**要点**:
+
+- 8 个分区**并行**处理，每个 goroutine 只写 `ids` 中属于自己的下标，互不重叠。
+- `tracker StatsTracker` 一路传进分区，用于 `AddedMeasurementSeries` / `AddedSeries` 统计。
+- 真实函数名是 `GenerateSeriesKeys`；`SeriesKeysPartitionIDs` 用 `xxhash.Sum64(key) % 8`。
 
 ### 9.3 SeriesPartition — SSEG + RHH
 
-```go
-// tsdb/series_partition.go:199 — CreateSeriesListIfNotExists
-func (p *SeriesPartition) CreateSeriesListIfNotExists(keys [][]byte, keyPartitionIDs []int, ids []uint64) error {
-    p.mu.Lock()
-    defer p.mu.Unlock()
+`SeriesPartition.CreateSeriesListIfNotExists` 是**两阶段锁**：先读锁查已有 ID，只有发现新 key 才升级为写锁并重查，避免所有写入都抢写锁（`tsdb/series_partition.go:200-320`）。
 
-    for i, key := range keys {
+```go
+func (p *SeriesPartition) CreateSeriesListIfNotExists(keys [][]byte, keyPartitionIDs []int, ids []uint64, tracker StatsTracker) error {
+    // 阶段 1: 读锁查已有 series
+    var writeRequired bool
+    p.mu.RLock()
+    if p.closed {
+        p.mu.RUnlock()
+        return ErrSeriesPartitionClosed
+    }
+    for i := range keys {
         if keyPartitionIDs[i] != p.id {
             continue
         }
-
-        // 1. 在索引中查找
-        id := p.index.FindIDBySeriesKey(key)
-        if id != 0 {
+        if id := p.index.FindIDBySeriesKey(p.segments, keys[i]); id == 0 {
+            writeRequired = true
+            continue
+        } else {
             ids[i] = id
+        }
+    }
+    p.mu.RUnlock()
+    if !writeRequired {
+        return nil
+    }
+
+    // 阶段 2: 写锁重查 + 插入
+    p.mu.Lock()
+    defer p.mu.Unlock()
+    if p.closed {
+        return ErrSeriesPartitionClosed
+    }
+
+    newIDs := make(map[string]uint64, len(ids))   // 批内去重
+    var newKeyRanges []keyRange
+    for i := range keys {
+        if keyPartitionIDs[i] != p.id || ids[i] != 0 {
             continue
         }
-
-        // 2. 分配新 ID
-        id = p.seq
-        p.seq++
-
-        // 3. 写入 SSEG segment
-        offset, err := p.log.AppendSeries(id, key)
-
-        // 4. 更新内存索引 (RHH)
-        p.index.InsertSeries(id, offset, key)
-
+        key := keys[i]
+        if ids[i] = newIDs[string(key)]; ids[i] != 0 {
+            continue                               // 同一批里的重复 key
+        }
+        if ids[i] = p.index.FindIDBySeriesKey(p.segments, key); ids[i] != 0 {
+            continue                               // 读锁释放后被别的 goroutine 插入
+        }
+        id, offset, err := p.insert(key)
+        if err != nil {
+            return err
+        }
         ids[i] = id
+        newIDs[string(key)] = id
+        newKeyRanges = append(newKeyRanges, keyRange{id, offset})
     }
+
+    // 阶段 3: flush 后把新 key 插入内存索引 (RHH)
+    if segment := p.activeSegment(); segment != nil {
+        if err := segment.Flush(); err != nil {
+            return err
+        }
+    }
+    for _, kr := range newKeyRanges {
+        p.index.Insert(p.seriesKeyByOffset(kr.offset), kr.id, kr.offset)
+    }
+    return nil
+}
+
+// tsdb/series_partition.go:464-472 — insert
+func (p *SeriesPartition) insert(key []byte) (id uint64, offset int64, err error) {
+    id = p.seq
+    offset, err = p.writeLogEntry(AppendSeriesEntry(nil, SeriesEntryInsertFlag, id, key))
+    if err != nil {
+        return 0, 0, err
+    }
+    p.seq += SeriesFilePartitionN       // 不是自增 1
+    return id, offset, nil
 }
 ```
 
-**Series ID 分配规则**: 分区 0 获得 1, 9, 17, ...; 分区 1 获得 2, 10, 18, ...
+**Series ID 分配规则**: `p.seq` 初值为 `p.id + 1`（`tsdb/series_partition.go:62`），每次插入 `+= SeriesFilePartitionN`（8）。所以分区 0 获得 1, 9, 17, ...；分区 1 获得 2, 10, 18, ...。ID 的 `id % 8` 恒等于分区号，`SeriesIDPartition(id)` 可 O(1) 定位分区。
 
-```go
-// tsdb/series_partition.go:62 — seq 初始化
-p.seq = uint64(p.id + 1)  // 分区 0 → seq=1, 分区 1 → seq=2, ...
-```
+**为什么两阶段锁**: 绝大多数写入的 series 已存在，读锁路径可以并发；只有真正需要创建新 series 时才升级写锁，并在写锁内**重查**，避免读锁释放窗口内的重复插入。`newIDs` 额外处理同一批次内重复 key。
 
 ### 9.4 SSEG Entry 格式
 

@@ -18,7 +18,7 @@
 
 ## 1. 关键发现
 
-**此代码库是 InfluxDB OSS 单节点版本，没有 Raft 实现。** Meta Store 使用简单的**文件持久化 + 内存缓存**模型。Protobuf 中定义的 30 种 Command Type 是 Enterprise 共享代码的遗留，在 OSS 中不用于日志复制。
+**此代码库是 InfluxDB OSS 单节点版本，没有 Raft 实现。** Meta Store 使用简单的**文件持久化 + 内存缓存**模型。Protobuf 中定义的 29 个 Command Type（值 1-19、21-30，20 未分配）是 Enterprise 共享代码的遗留，在 OSS 中不用于日志复制。
 
 | 维度 | Enterprise 版本 | 此 OSS 版本 |
 |------|----------------|-------------|
@@ -41,7 +41,7 @@
 type Data struct {
     Term      uint64         // Raft Term (OSS 中始终为 0，遗留字段)
     Index     uint64         // 单调递增版本号 (每次 commit +1)
-    ClusterID uint64         // 集群 ID (OSS 中首次 Open 时随机生成)
+    ClusterID uint64         // 集群 ID（NewClient 时用 math/rand 生成；首次落盘前重启会换 ID）
 
     Databases []DatabaseInfo // 所有数据库元数据
     Users     []UserInfo     // 所有用户元数据
@@ -61,7 +61,7 @@ type Data struct {
 ### 2.2 Client — 元数据子系统
 
 ```go
-// services/meta/client.go:49 — Client
+// services/meta/client.go:48 — Client
 type Client struct {
     logger *zap.Logger
 
@@ -94,9 +94,11 @@ Data (meta.db)
 │   ├── DefaultRetentionPolicy: string
 │   ├── RetentionPolicies []RetentionPolicyInfo
 │   │   ├── Name: string
-│   │   ├── ReplicaN: int32 (OSS 固定 1)
+│   │   ├── ReplicaN: int (OSS 固定 1)
 │   │   ├── Duration: time.Duration
 │   │   ├── ShardGroupDuration: time.Duration
+│   │   ├── FutureWriteLimit: time.Duration (0=关闭)
+│   │   ├── PastWriteLimit: time.Duration (0=关闭)
 │   │   ├── ShardGroups []ShardGroupInfo
 │   │   │   ├── ID: uint64
 │   │   │   ├── StartTime: time.Time
@@ -165,7 +167,7 @@ sequenceDiagram
 #### 步骤 1-7: CreateDatabase — 完整的 Clone-Modify-Commit 示例
 
 ```go
-// services/meta/client.go:171 — CreateDatabase
+// services/meta/client.go:170 — CreateDatabase
 func (c *Client) CreateDatabase(name string) (*DatabaseInfo, error) {
     // 步骤 1: 获取写锁
     c.mu.Lock()
@@ -219,7 +221,7 @@ func (c *Client) CreateDatabase(name string) (*DatabaseInfo, error) {
 > 3. 在副本上创建数据库:
 >    - 新 Data: {Databases: [db1, db2, mydb], Users: [admin]}
 >
-> 4. 自动创建默认 RP (autogen, 保留 7 天):
+> 4. 自动创建默认 RP (autogen: Duration=0 永久保留，ShardGroupDuration=7 天):
 >    - 新 Data: {Databases: [db1, db2, {Name: mydb, RPs: [autogen]}], Users: [admin]}
 >
 > 5. 提交:
@@ -240,7 +242,7 @@ func (c *Client) CreateDatabase(name string) (*DatabaseInfo, error) {
 |------|------|------|--------|
 | `CreateDatabase` | 171 | 添加 DatabaseInfo | 已存在返回已有 DatabaseInfo |
 | `DropDatabase` | 270 | 移除 DB + 清理用户权限 | 不存在返回 nil (无 error) |
-| `CreateRetentionPolicy` | 288 | 添加 RP 到 DB | 已存在返回 nil |
+| `CreateRetentionPolicy` | 288 | 添加 RP 到 DB | 同名且 `ReplicaN/Duration/ShardGroupDuration` 全等 → nil；否则 `ErrRetentionPolicyExists`；`makeDefault=true` 且当前默认 RP 不是它 → `ErrRetentionPolicyConflict` |
 | `DropRetentionPolicy` | 324 | 移除 RP | 不存在返回 nil (无 error) |
 | `UpdateRetentionPolicy` | 342 | 更新 RP 字段 | 使用指针的零值判断 |
 | `CreateShardGroup` | 708 | 创建 ShardGroup + Shard | 已存在返回 nil |
@@ -400,7 +402,7 @@ flowchart TD
 #### 步骤 2-3: 快速路径 — 读锁检查
 
 ```go
-// services/meta/client.go:145 — Database (读操作示例)
+// services/meta/client.go:144 — Database (读操作示例)
 func (c *Client) Database(name string) *DatabaseInfo {
     c.mu.RLock()
     defer c.mu.RUnlock()
@@ -433,7 +435,7 @@ func (c *Client) RetentionPolicy(database, policy string) (*RetentionPolicyInfo,
 #### 步骤 4: 锁升级 — RUnlock → Lock (Double-Checked Locking)
 
 ```go
-// services/meta/client.go:708 — CreateShardGroup 的双重检查模式
+// services/meta/client.go:693 — CreateShardGroup 的双重检查模式
 func (c *Client) CreateShardGroup(database, policy string, timestamp time.Time) (*ShardGroupInfo, error) {
     // 快速路径: 读锁检查
     c.mu.RLock()
@@ -530,7 +532,7 @@ sequenceDiagram
 #### 步骤 5: 深拷贝 — Clone
 
 ```go
-// services/meta/data.go:683 — Data.Clone (导出, 指针接收者)
+// services/meta/data.go:759 — Data.Clone (导出, 指针接收者)
 func (data *Data) Clone() *Data {
     other := *data  // 浅拷贝 struct
 
@@ -543,7 +545,7 @@ func (data *Data) Clone() *Data {
     return &other
 }
 
-// services/meta/data.go:965 — DatabaseInfo.clone (非导出, 值接收者)
+// services/meta/data.go:1041 — DatabaseInfo.clone (非导出, 值接收者)
 func (di DatabaseInfo) clone() DatabaseInfo {
     other := di
 
@@ -566,7 +568,7 @@ func (di DatabaseInfo) clone() DatabaseInfo {
     return other
 }
 
-// services/meta/data.go:1237 — RetentionPolicyInfo.clone (非导出, 值接收者)
+// services/meta/data.go:1347 — RetentionPolicyInfo.clone (非导出, 值接收者)
 func (rpi RetentionPolicyInfo) clone() RetentionPolicyInfo {
     other := rpi  // 值拷贝 (含 Subscriptions 浅拷贝)
 
@@ -615,29 +617,48 @@ func (data *Data) CreateDatabase(name string) error {
     return nil
 }
 
-// services/meta/data.go:358 — Data.CreateShardGroup
+// services/meta/data.go:382-449 — Data.CreateShardGroup（逐行版本见 §13.3）
 func (data *Data) CreateShardGroup(database, policy string, timestamp time.Time) error {
     // 1. 查找 RP
     rpi, err := data.RetentionPolicy(database, policy)
     if err != nil {
         return err
+    } else if rpi == nil {
+        return influxdb.ErrRetentionPolicyNotFound(policy)
     }
 
-    // 2. 幂等检查
+    // 2. 幂等检查: 已存在覆盖该时间戳且未被删除/截断的组
     if rpi.ShardGroupByTimestamp(timestamp) != nil {
         return nil
     }
 
-    // 3. 计算时间边界
+    // 3. 计算时间边界 + MaxNanoTime 钳制
     duration := rpi.ShardGroupDuration
     startTime := timestamp.Truncate(duration).UTC()
     endTime := startTime.Add(duration).UTC()
     if endTime.After(time.Unix(0, models.MaxNanoTime)) {
-        // Shard group range is [start, end) so add one to the max time.
-        endTime = time.Unix(0, models.MaxNanoTime+1)  // 注意: +1 且无 .UTC()
+        endTime = time.Unix(0, models.MaxNanoTime+1)
     }
 
-    // 4. 分配 ID
+    // 4. 收缩新区间，保证不与已有组重叠（截断组以 TruncatedAt 为有效结束时间）
+    for i := range rpi.ShardGroups {
+        if rpi.ShardGroups[i].Deleted() {
+            continue
+        }
+        startI := rpi.ShardGroups[i].StartTime
+        endI := rpi.ShardGroups[i].EndTime
+        if rpi.ShardGroups[i].Truncated() {
+            endI = rpi.ShardGroups[i].TruncatedAt
+        }
+        if !timestamp.Before(endI) && endI.After(startTime) {
+            startTime = endI
+        }
+        if startI.After(timestamp) && startI.Before(endTime) {
+            endTime = startI
+        }
+    }
+
+    // 5. 分配 ID
     data.MaxShardGroupID++
     sgi := ShardGroupInfo{
         ID:        data.MaxShardGroupID,
@@ -645,16 +666,13 @@ func (data *Data) CreateShardGroup(database, policy string, timestamp time.Time)
         EndTime:   endTime,
     }
 
-    // 5. 创建 Shard (OSS: 每个 ShardGroup 只有 1 个)
+    // 6. 创建 Shard (OSS: 每个 ShardGroup 只有 1 个)
     data.MaxShardID++
-    sgi.Shards = []ShardInfo{
-        {ID: data.MaxShardID},
-    }
+    sgi.Shards = []ShardInfo{{ID: data.MaxShardID}}
 
-    // 6. 添加到 RP 并排序
+    // 7. 添加到 RP 并排序
     rpi.ShardGroups = append(rpi.ShardGroups, sgi)
     sort.Sort(ShardGroupInfos(rpi.ShardGroups))
-
     return nil
 }
 ```
@@ -702,7 +720,7 @@ func (c *Client) CreateUser(name, password string, admin bool) (User, error) {
 #### 步骤 7-11: Commit 协议
 
 ```go
-// services/meta/client.go:964 — commit
+// services/meta/client.go:948 — commit
 func (c *Client) commit(data *Data) error {
     // 步骤 8: 递增版本号
     data.Index++
@@ -743,10 +761,34 @@ flowchart TD
     J --> K["c.changed = make(chan struct{})"]
 ```
 
+#### 步骤 7-11.x commit 失败矩阵与锁跨度
+
+`commit()` 的顺序是 `Index++ → snapshot(tmp→fsync→rename) → cacheData=data → close(changed) → changed=make(...)`，全程持 `c.mu` 写锁。
+
+| 崩溃点 | meta.db | meta.dbtmp | 重启后 |
+|---|---|---|---|
+| 写 tmp 前 | 旧版本 | 旧残留 | 旧版本 |
+| 写 tmp 后、fsync 前 | 旧版本 | 可能半写 | 旧版本（tmp 被下次截断） |
+| fsync 后、rename 前 | 旧版本 | 完整新版本 | 旧版本（tmp 不参与 Load） |
+| rename 后 | 新版本 | 无/旧句柄 | 新版本 |
+
+> **平台限定**：表中“fsync 后、rename 前”一行按 POSIX 语义（同目录 `rename(2)` 原子）成立。
+> Windows 的 `file.RenameFile` 先 `os.Remove(meta.db)` 再 `os.Rename`（`pkg/file/file_windows.go:10-17`，见 §7.2），
+> 该窗口内进程崩溃后 `meta.db` 已不存在，重启 `Load` 走 `os.IsNotExist` 分支返回 nil（`client.go:1015-1024`），
+> 结果是**空 Data + `Index=1`**（`NewClient` 的初始值），等价于元数据丢失。
+
+**锁跨度**: `c.mu.Lock()` 覆盖 `MarshalBinary + os.Create + Write + fsync + rename`，期间所有 `RLock`（包括 `PointsWriter.MapShards` 的 `RetentionPolicy` 查询）都会阻塞。元数据越大，写锁持有越久。
+
+**失败案例**: 当前 `Index=42`，磁盘满导致 `snapshot` 失败 → `commit` 返回 error，`cacheData` 仍是旧对象（Index=42），磁盘仍是旧版本，`changed` 不广播。清理磁盘后同一操作重试：重新 `Clone` 旧对象 → `Index++` 变 43 → 成功。**Index 不会跳号**，因为失败副本被整体丢弃。
+
+**损坏恢复**: `meta.db` 被截断或字节损坏 → `Load` 的 `proto.Unmarshal` 返回 error → `Client.Open` 返回 error → 节点启动失败。代码没有自动回退/重建逻辑，运维需要停机并从备份还原 `meta.db`。
+
+**残留 tmp**: `snapshot` 用 `os.Create(tmpFile)`（`O_TRUNC`）重建临时文件，不会误读上次残留；但 rename 后没有 `SyncDir`（见 §9.2 与 S-07-07），掉电后目录项可能未持久化。
+
 #### 步骤 9: 快照持久化 — tmp + fsync + Rename
 
 ```go
-// services/meta/client.go:997 — snapshot
+// services/meta/client.go:981 — snapshot
 func snapshot(path string, data *Data) error {
     filename := filepath.Join(path, metaFile)  // "meta.db"
     tmpFile := filename + "tmp"                 // "meta.dbtmp"
@@ -862,7 +904,7 @@ flowchart TD
 #### 步骤 11: 变更通知 — Channel Broadcast
 
 ```go
-// services/meta/client.go:954 — WaitForDataChanged
+// services/meta/client.go:940 — WaitForDataChanged
 func (c *Client) WaitForDataChanged() chan struct{} {
     c.mu.RLock()
     defer c.mu.RUnlock()
@@ -912,7 +954,7 @@ sequenceDiagram
 #### 步骤 13-14: 恢复机制
 
 ```go
-// services/meta/client.go:88 — Open
+// services/meta/client.go:87 — Open
 func (c *Client) Open() error {
     c.mu.Lock()
     defer c.mu.Unlock()
@@ -932,7 +974,7 @@ func (c *Client) Open() error {
     return nil
 }
 
-// services/meta/client.go:1031 — Load
+// services/meta/client.go:1015 — Load
 func (c *Client) Load() error {
     file := filepath.Join(c.path, metaFile)  // "meta.db"
     f, err := os.Open(file)
@@ -964,14 +1006,14 @@ func (c *Client) Load() error {
 ### 4.1 认证缓存 — salted SHA-256
 
 ```go
-// services/meta/client.go:65 — authUser
+// services/meta/client.go:64 — authUser
 type authUser struct {
-    bhash string   // 原始 bcrypt hash (用于匹配)
+    bhash string   // 原始 bcrypt hash：仅写入、当前无读取；实际匹配只用 salt+hash
     salt  []byte   // 随机 salt
     hash  []byte   // SHA-256(salt + password) 缓存值
 }
 
-// services/meta/client.go:550 — Authenticate
+// services/meta/client.go:548 — Authenticate
 func (c *Client) Authenticate(username, password string) (User, error) {
     // 第一次 RLock: 查找用户
     c.mu.RLock()
@@ -1011,7 +1053,7 @@ func (c *Client) Authenticate(username, password string) (User, error) {
 }
 ```
 
-**为什么用 salted SHA-256 缓存？** bcrypt 比较需要 ~100ms（故意慢以防止暴力破解）。缓存 salted hash 可以将后续认证降低到 ~1μs，性能提升 100,000 倍。
+**为什么用 salted SHA-256 缓存？** bcrypt 比较需要 ~100ms（故意慢以防止暴力破解）。缓存 salted hash 可以将后续认证降低到 ~1μs。**注意**: `~100ms`/`~1μs`/`100,000 倍` 是经验值，非源码常量，实际取决于 CPU 与 bcrypt cost。
 
 **认证缓存流程 Mermaid 图**:
 
@@ -1085,6 +1127,8 @@ func (c *Client) DropUser(name string) error {
 ```
 
 **潜在问题**: `DropUser` 未显式清除 `authCache`，但不会导致安全问题——因为 `Authenticate` 先检查 `cacheData.user(username)`，用户已被删除所以直接返回 `ErrUserNotFound`，不会走到 authCache 检查。不过，authCache 中的残留条目会占用内存直到服务重启。
+
+> 图中 `~1μs` / `~100ms` 为经验值，非源码常量。
 
 ### 4.2 WriteAuthorizer
 
@@ -1191,18 +1235,18 @@ func (a *QueryAuthorizer) AuthorizeQuery(u User, q *influxql.Query, database str
 ### 5.1 Lease 结构
 
 ```go
-// services/meta/data.go:1679 — Lease
+// services/meta/data.go:1799 — Lease
 type Lease struct {
     Name       string    `json:"name"`
     Expiration time.Time `json:"expiration"`
     Owner      uint64    `json:"owner"`
 }
 
-// services/meta/data.go:1686 — Leases
+// services/meta/data.go:1806 — Leases
 type Leases struct {
     mu sync.Mutex
     m  map[string]*Lease
-    d  time.Duration  // 默认 60s
+    d  time.Duration  // 由 NewLeases(d) 注入；60s 是 DefaultLeaseDuration
 }
 ```
 
@@ -1219,7 +1263,7 @@ func (c *Client) AcquireLease(name string) (*Lease, error) {
     return &l, nil  // 单节点始终成功
 }
 
-// services/meta/data.go:1704 — Enterprise 模式
+// services/meta/data.go:1824 — Enterprise 模式
 func (leases *Leases) Acquire(name string, nodeID uint64) (*Lease, error) {
     leases.mu.Lock()
     defer leases.mu.Unlock()
@@ -1244,16 +1288,19 @@ func (leases *Leases) Acquire(name string, nodeID uint64) (*Lease, error) {
 }
 ```
 
+> **注意**: `Leases`/`NewLeases`（`services/meta/data.go:1806-1824`）在 OSS **没有生产调用方**，是未使用的 Enterprise 共享代码。OSS 只调用 `Client.AcquireLease`，它恒成功、不提供互斥（见 §5.3）。
+
 ### 5.3 Lease 使用场景
 
 | Lease Name | 使用者 | 用途 |
 |------------|--------|------|
-| `"continuous_querier"` | CQ Service | 确保只有一个节点执行 CQ |
-| `"retention"` | Retention Service | 确保只有一个节点执行过期删除 |
+| `"continuous_querier"` | CQ Service | 名义上的 leader 闸门；OSS 恒成功、无互斥 |
 
 **单节点 vs Enterprise**:
-- 单节点: `AcquireLease` 始终成功（当前进程即唯一 owner）
-- Enterprise: 只有 Raft Leader 能获取 Lease（非 Leader 返回 error）
+- 单节点（OSS）: `Client.AcquireLease`（`services/meta/client.go:127-133`）无条件返回 `&Lease{...}, nil`，既不检查也不写入共享状态，**不提供任何互斥**；`Leases`/`NewLeases`（`services/meta/data.go:1806-1824`）是 Enterprise 共享代码，在 OSS 无生产调用方。
+- Enterprise: 只有 Raft Leader 能获取 Lease（非 Leader 返回 error）。
+
+Retention/Precreator 不使用 Lease（见 12 号文档 §1.1/§1.2）；`services/retention/` 全目录无 lease 符号，其 `MetaClient` 接口也不含 `AcquireLease`。OSS 中 `AcquireLease` 的唯一生产调用方是 CQ Service（`services/continuous_querier/service.go:230,239`）。
 
 ## 6. Protobuf Schema (Enterprise 遗留)
 
@@ -1376,11 +1423,11 @@ sequenceDiagram
     Restore->>Data: ImportData(backup md, ...)
     Backup-->>Data: 合并 DB/RP/Shard 元数据
     Restore->>Client: SetData(&mergedData)
-    Client->>Client: mu.Lock(); defer mu.Unlock()
+    Client->>Client: mu.Lock() → defer mu.Unlock()
     Client->>Data: Clone()
     Data-->>Client: d
     Client->>Disk: commit(d) / snapshot
-    Client->>Client: cacheData=d; close(changed)
+    Client->>Client: cacheData=d → close(changed)
     Client-->>Restore: error / nil
 ```
 
@@ -1393,13 +1440,23 @@ sequenceDiagram
 ### 7.1 Unix 实现
 
 ```go
-// pkg/file/file_unix.go:33
+// pkg/file/file_unix.go:39-57
+func RenameFileWithReplacement(oldpath, newpath string) error {
+    if err := os.Rename(oldpath, newpath); !errors.Is(err, syscall.EXDEV) {
+        // note: also includes err == nil
+        return err
+    }
+    // 跨文件系统: 退化为拷贝 + 删除
+    return MoveFileWithReplacement(oldpath, newpath)
+}
+
+// pkg/file/file_unix.go:54-56
 func RenameFile(oldpath, newpath string) error {
-    return os.Rename(oldpath, newpath)  // 原子操作 (POSIX)
+    return RenameFileWithReplacement(oldpath, newpath)
 }
 ```
 
-POSIX `rename(2)` 是原子的：要么新文件可见，要么旧文件可见，不会出现中间状态。
+同目录内 POSIX `rename(2)` 是原子的：要么新文件可见，要么旧文件可见，不会出现中间状态。**跨文件系统**（`EXDEV`）时退化为 `MoveFileWithReplacement` 的拷贝路径，此时不再是原子 rename；meta snapshot 的 `meta.dbtmp` 与 `meta.db` 同目录，通常不受影响。
 
 ### 7.2 Windows 实现
 
@@ -1487,7 +1544,7 @@ sequenceDiagram
     TSDB->>Disk: 遍历匹配的 Shard
     loop 每个 Shard 的每个 TSM 文件
         TSDB->>Disk: 读取 TSM file
-        TSDB->>TCP: ⑧ 写入: shardID + fileID + data
+        TSDB->>TCP: ⑧ tar 流写入（snapshot 目录 + Since 过滤）
     end
 
     TCP-->>Client: 备份文件 (meta.db + TSM files)
@@ -1503,59 +1560,74 @@ sequenceDiagram
     Note over Meta: ImportData 返回 IDMap + newDBs
     SnapSvc->>Meta: ⑫ ossClient.SetData(&data) — Clone + commit
     SnapSvc->>TSDB: ⑬ createNewDBShards — 为新 DB 创建 Shard
+    SnapSvc->>TCP: ⑭ respondIDMap(IDMap) — [MagicHeader, npairs, (old,new)*]
 
-    Client->>TCP: ⑭ 发送 Shard 数据
-    loop 每个 Shard 的每个 TSM 文件
-        TCP->>TSDB: 写入 TSM file 到对应 Shard 目录
-    end
+    Note over Client: 客户端按 IDMap 把旧 shard ID 映射到新 ID
+    Client->>TCP: ⑮ 对每个旧 shard 发 RequestShardUpdate (sid + tar)
+    TCP->>TSDB: updateShardsLive — SetShardEnabled(false) → RestoreShard → defer 启用
 
-    TSDB->>TSDB: ⑮ 重新打开受影响的 Shard
+    TSDB->>TSDB: ⑯ 重新打开受影响的 Shard
     Note over TSDB: Shard.Open() → 加载新 TSM 文件<br>重建内存索引
 ```
 
 ### 8.3 备份协议
 
 ```go
-// services/snapshotter/service.go — handleConn
+// services/snapshotter/service.go:124-162 — handleConn
 func (s *Service) handleConn(conn net.Conn) error {
-    // 1. 读取第一个字节 — RequestType 枚举
     var typ [1]byte
     if _, err := io.ReadFull(conn, typ[:]); err != nil {
         return err
     }
 
-    // 2. 特殊处理: ShardUpdate 直接走快速路径
+    // 快路径: 已存在的 shard 走 live update，不解析 Request
     if RequestType(typ[0]) == RequestShardUpdate {
         return s.updateShardsLive(conn)
     }
 
-    // 3. 使用 json.NewDecoder 读取 Request (非 binary.Read)
     r, bytes, err := s.readRequest(conn)
     if err != nil {
         return fmt.Errorf("read request: %s", err)
     }
 
-    // 4. 根据 RequestType 分发
     switch RequestType(typ[0]) {
-    case RequestMetastoreBackup:
-        return s.writeMetaStore(conn)
     case RequestShardBackup:
         return s.TSDBStore.BackupShard(r.ShardID, r.Since, conn)
+    case RequestShardExport:
+        return s.TSDBStore.ExportShard(r.ShardID, r.ExportStart, r.ExportEnd, conn)
+    case RequestMetastoreBackup:
+        return s.writeMetaStore(conn)
+    case RequestDatabaseInfo:
+        return s.writeDatabaseInfo(conn, r.BackupDatabase)
+    case RequestRetentionPolicyInfo:
+        return s.writeRetentionPolicyInfo(conn, r.BackupDatabase, r.BackupRetentionPolicy)
     case RequestMetaStoreUpdate:
-        return s.updateMetaStore(conn, bytes, ...)
-    // ...
+        return s.updateMetaStore(conn, bytes, r.BackupDatabase, r.RestoreDatabase,
+            r.BackupRetentionPolicy, r.RestoreRetentionPolicy)
+    default:
+        return fmt.Errorf("request type unknown: %v", r.Type)
     }
-}
-
-func (s *Service) readRequest(r io.Reader) (*Request, []byte, error) {
-    var req Request
-    d := json.NewDecoder(r)  // 使用 JSON 而非 binary.Read
-    if err := d.Decode(&req); err != nil {
-        return nil, nil, err
-    }
-    // ... 读取 payload
 }
 ```
+
+**RequestType 分发**（`services/snapshotter/service.go:443-471`）:
+
+| 值 | RequestType | 服务端函数 | 响应 |
+|---|---|---|---|
+| 0 | RequestShardBackup | `TSDBStore.BackupShard` | tar 流 |
+| 1 | RequestMetastoreBackup | `writeMetaStore` | magic + meta + node |
+| 2 | RequestSeriesFileBackup | **无 case** | `request type unknown` |
+| 3 | RequestDatabaseInfo | `writeDatabaseInfo` | JSON |
+| 4 | RequestRetentionPolicyInfo | `writeRetentionPolicyInfo` | JSON |
+| 5 | RequestShardExport | `TSDBStore.ExportShard` | tar 流 |
+| 6 | RequestMetaStoreUpdate | `updateMetaStore` | IDMap |
+| 7 | RequestShardUpdate | `updateShardsLive`（快路径） | 无（读 tar 并 `RestoreShard`） |
+
+**数值案例**:
+
+- 备份端 shard `{1, 2}`，恢复端 `MaxShardID=100` → `ImportData` 重新编号为 101/102 → IDMap `{1:101, 2:102}`。
+- 恢复库已存在 → `importOneDB` 返回 `database already exists` → `updateMetaStore` 在错误分支调用 `respondIDMap({})`（npairs=0）→ 客户端 `client.go:55-90` 报 `DB metadata not changed. database may already exist`，不再上传 shard。
+- 三个显式错误分支（反序列化失败、非 OSS、`ImportData` 失败）都会先 `respondIDMap(空)`，客户端据此报 `DB metadata not changed`；但 `SetData` / `createNewDBShards` 失败是直接 `return err`（`service.go:209-217`），**不发送任何响应**。
 
 ### 8.4 writeMetaStore — 备份元数据
 
@@ -1623,8 +1695,44 @@ func (s *Service) updateMetaStore(conn net.Conn, bits []byte, ...) error {
 
 **恢复关键路径**:
 - 元数据恢复不是直接用备份覆盖当前 `cacheData`；`updateMetaStore` 先 `ossClient.Data()` 取得当前 Data，再通过 `ImportData` 合并备份元数据，最后 `SetData(&data)` 提交合并后的快照并由 `snapshot()` 持久化到 `meta.db`
+- 成功时 `updateMetaStore` 在 `SetData` + `createNewDBShards` 之后调用 `respondIDMap(IDMap)`（`services/snapshotter/service.go:219`）；反序列化失败（`:184-189`）、非 OSS（`:191-197`）、`ImportData` 失败（`:201-207`）这三个显式错误分支会先发空 map（npairs=0）。**注意**：`SetData` 失败（`:209-212`）与 `createNewDBShards` 失败（`:214-217`）直接 return，不发送 IDMap，客户端收到的是空响应，报 `updating metadata on influxd service failed`（`services/snapshotter/client.go:53-56`），而不是 `DB metadata not changed`
+- 已存在的 shard 走 `RequestShardUpdate → updateShardsLive`：`SetShardEnabled(false)` → `RestoreShard` → `defer SetShardEnabled(true)`（`service.go:166-179`），不需要新建 shard
 - Shard 数据恢复是文件级别的复制，将 TSM 文件写入对应的 Shard 目录
 - 恢复后需要重新打开 Shard 以加载新的 TSM 文件并重建内存索引
+
+### 8.6 ImportData 的选择规则与 ID 重编号
+
+恢复时 shard ID 会变化，原因是 `Data.ImportData` 把备份中的 DB/RP/ShardGroup/Shard 复制进当前 `Data` 时重新分配 ID（`services/meta/data.go:876-902` 的 `ImportData` 与 `:904-969` 的 `importOneDB`）。
+
+**三步**:
+
+1. `ImportData(other, backupDBName, restoreDBName, backupRPName, restoreRPName)`：决定导入哪些库/RP。
+2. `importOneDB`：创建目标库、克隆 RP、重编号 shard group/shard。
+3. 返回 `shardIDMap` 与 `newDBs`；`updateMetaStore` 通过 `respondIDMap` 把它发给客户端。
+
+**选择规则**:
+
+- 指定 `backupDBName` → 只导入单库，返回 `[]string{dbName}`；否则遍历 `other.Databases`，**跳过 `_internal`**（`data.go:890-892`）。
+- 目标库已存在 → 直接 `errors.New("database already exists")`（不是合并，`data.go:915-917`）。
+- 指定 `backupRPName` → 只导入该 RP 并改名；否则整库 RP 逐个 `clone()` 后原样导入（`data.go:926-950`）。
+- 重新编号：每个 ShardGroup `data.MaxShardGroupID++`；每个 Shard `data.MaxShardID++`，并填 `shardIDMap[oldID] = newID`（`data.go:952-966`）。
+
+**数值案例**:
+
+```
+备份端: shard 1, 2（属于 SG 10）
+恢复端当前: MaxShardGroupID=50, MaxShardID=100
+导入后: SG 51, shard 101, 102
+IDMap = {1: 101, 2: 102}
+```
+
+该 map 正是 `respondIDMap` 的内容；客户端据此把备份 tar 中的旧 shard 数据通过 `UploadShard(oldID, newID, ...)` 上传（`services/snapshotter/client.go:103-125`、`cmd/influxd/restore/restore.go:424,472`）。
+
+**运维含义**:
+
+- `_internal` 不会被恢复。
+- 同名库恢复会失败，需要先改名（`restoreDBName`）或删库。
+- shard ID 变化不影响查询，但依赖 shard ID 的外部工具需要按 IDMap 更新。
 
 ## 9. 架构设计意图
 
@@ -1663,7 +1771,7 @@ snapshot(path, data)   // 1. 先写磁盘
 c.cacheData = data     // 2. 再更新内存
 ```
 
-- **崩溃安全**: 如果在 `snapshot` 之后、`cacheData = data` 之前崩溃，重启后从磁盘加载的是最新数据
+- **进程崩溃安全**: 如果在 `snapshot` 之后、`cacheData = data` 之前进程崩溃，重启后从磁盘加载的是最新数据；但这不覆盖掉电——`snapshot()` 只 `f.Sync()` + rename，**没有调用 `SyncDir`**（`services/meta/client.go:981-1013`），rename 的目录项可能未持久化。Windows 上 `SyncDir` 是 no-op（`pkg/file/file_windows.go:5-7`）。
 - **WAL 语义**: 磁盘是 source of truth，内存是 cache
 - **读一致性**: 读操作在 `snapshot` 完成前看到旧数据，在完成后看到新数据
 
@@ -1697,7 +1805,7 @@ func (data *Data) MarshalBinary() ([]byte, error) {
 | JSON | 大 | 慢 | 无类型 |
 | gob | 中 | 中 | Go 专用 |
 
-protobuf 的二进制格式比 JSON 小 3-5 倍，序列化/反序列化快 10 倍。对于频繁的全量快照，这个差异很重要。
+protobuf 的二进制格式通常比 JSON 更小、序列化更快。**注意**: "小 3-5 倍 / 快 10 倍"是经验值，非源码常量。对于频繁的全量快照，这个差异很重要。
 
 ## 10. 架构收益
 
@@ -1820,13 +1928,13 @@ c.changed = make(chan struct{})  // 无缓冲
 type Leases struct {
     mu sync.Mutex
     m  map[string]*Lease  // 内存中
-    d  time.Duration
+    d  time.Duration      // 由 NewLeases(d) 注入；60s 是 DefaultLeaseDuration
 }
 ```
 
 - 服务重启后所有 Lease 清空
-- CQ 和 retention 服务会立即重新获取 Lease
-- 可能导致重启后的执行风暴（类似 Module 5 中的 lastRuns 问题）
+- CQ 每次执行前重新 `AcquireLease`；因为 OSS 恒成功，重启不会产生"租约相关"的执行风暴
+- Retention/Precreator 不使用 Lease，重启后按各自 ticker 继续
 
 ### 11.8 元数据规模限制
 
@@ -1867,17 +1975,16 @@ var ErrStoreClosed = errors.New("raft store already closed")
 ### 12.1 Subscriber Service — 变更监听
 
 ```go
-// services/subscriber/service.go:162 — waitForMetaUpdates
+// services/subscriber/service.go:255-267 — waitForMetaUpdates
 func (s *Service) waitForMetaUpdates() {
+    ch := s.MetaClient.WaitForDataChanged()   // 循环外取一次
     for {
-        ch := s.MetaClient.WaitForDataChanged()
         select {
         case <-ch:
-            // 元数据变更: 更新 subscription 列表
-            err := s.Update()
-            if err != nil {
-                s.Logger.Info("Error updating subscriptions", zap.Error(err))
-            }
+            // ch 在 meta commit 时被 close；先取新 channel，
+            // 保证 updateSubs 期间发生的下一次 commit 不会丢失通知
+            ch = s.MetaClient.WaitForDataChanged()   // 先重取
+            s.updateSubs()                           // 再更新
         case <-s.closing:
             return
         }
@@ -1885,7 +1992,7 @@ func (s *Service) waitForMetaUpdates() {
 }
 ```
 
-**关键模式**: 每次循环重新获取 `changed` channel。这是因为 `commit()` 中 `close(changed)` 后立即创建新 channel，旧 channel 不会再有新信号。
+**关键模式**: channel 在循环**外**取一次，被唤醒后**先重取新 channel、再执行 `updateSubs()`**。`commit()` 先 `close(c.changed)`，紧接着 `c.changed = make(chan struct{})`（`services/meta/client.go:948-963`），旧 channel 不会再有信号。若像旧伪代码那样"先更新、下一轮再取 channel"，在 `updateSubs()` 执行期间发生的 commit 会被永久错过。方法名是 `updateSubs`（`services/subscriber/service.go:313`），不存在 `Update` 方法。
 
 ```mermaid
 sequenceDiagram
@@ -1899,12 +2006,14 @@ sequenceDiagram
 
     Client->>Client: commit(data)
     Client->>Client: close(ch_old) → 广播!
-    W1-->>W1: 唤醒, 调用 Update()
-    W2-->>W2: 唤醒, 调用 Update()
     Client->>Client: ch_new = make(chan struct{})
-
-    Note over W1: 下次循环获取 ch_new
+    W1-->>W1: 唤醒 → WaitForDataChanged() 取到 ch_new
+    W2-->>W2: 唤醒 → WaitForDataChanged() 取到 ch_new
+    W1->>W1: 再执行 updateSubs()
+    W2->>W2: 再执行 updateSubs()
 ```
+
+> 实现顺序说明: `close(ch_old)`（`:960`）与 `ch_new = make(...)`（`:961`）都在 `commit()` 内，watcher 被唤醒后调用 `WaitForDataChanged()` 一定拿到新 channel；图中把 `make` 画在两次“取 ch_new”之前，表示 watcher 实际观察到的顺序。
 
 ### 12.2 其他消费者
 
@@ -1912,10 +2021,10 @@ sequenceDiagram
 
 | 组件 | 文件 | 通知机制 | 响应动作 |
 |------|------|---------|---------|
-| Subscriber Service | `services/subscriber/service.go:162` | **WaitForDataChanged (channel)** | 更新 subscription 列表 |
+| Subscriber Service | `services/subscriber/service.go:255` | **WaitForDataChanged (channel)** | 更新 subscription 列表 |
 | Retention Service | `services/retention/service.go` | **Ticker 轮询** (`time.NewTicker`) | 定期检查并删除过期 ShardGroup |
 | Precreator Service | `services/precreator/service.go` | **Ticker 轮询** (`time.After`) | 定期预创建 ShardGroup |
-| CQ Service | `services/continuous_querier/service.go` | Lease 驱动 | 按 Lease 周期执行 CQ |
+| CQ Service | `services/continuous_querier/service.go` | **`time.Timer`（`RunInterval`，默认 1s）驱动 + 每次执行前 `AcquireLease` 闸门** | 按 `RunInterval` 执行 CQ |
 
 **为什么 Retention/Precreator 不用 WaitForDataChanged？**
 这些服务按固定间隔运行（如每 30 分钟检查一次），不需要实时响应元数据变更。Ticker 轮询更简单，避免在高写入场景下频繁触发。
@@ -1957,7 +2066,7 @@ sequenceDiagram
 ### 13.2 ShardGroupDuration 自动计算
 
 ```go
-// services/meta/data.go:1266 — shardGroupDuration
+// services/meta/data.go:1376 — shardGroupDuration
 func shardGroupDuration(d time.Duration) time.Duration {
     if d >= 180*24*time.Hour || d == 0 {  // 180 天 (约 6 个月) 或 0 (永久)
         return 7 * 24 * time.Hour
@@ -1971,21 +2080,45 @@ func shardGroupDuration(d time.Duration) time.Duration {
 ### 13.3 CreateShardGroup — 幂等性
 
 ```go
-// services/meta/data.go:358 — CreateShardGroup
+// services/meta/data.go:382-449 — CreateShardGroup
 func (data *Data) CreateShardGroup(database, policy string, timestamp time.Time) error {
     rpi, err := data.RetentionPolicy(database, policy)
+    if err != nil {
+        return err
+    } else if rpi == nil {
+        return influxdb.ErrRetentionPolicyNotFound(policy)
+    }
 
-    // 幂等检查: 已存在则直接返回
+    // 幂等检查: 已存在覆盖该时间戳且未被删除/截断的组
     if rpi.ShardGroupByTimestamp(timestamp) != nil {
         return nil
     }
 
-    // 计算时间边界
-    duration := rpi.ShardGroupDuration
-    startTime := timestamp.Truncate(duration).UTC()
-    endTime := startTime.Add(duration).UTC()
+    startTime := timestamp.Truncate(rpi.ShardGroupDuration).UTC()
+    endTime := startTime.Add(rpi.ShardGroupDuration).UTC()
+    if endTime.After(time.Unix(0, models.MaxNanoTime)) {
+        // Shard group range is [start, end) so add one to the max time.
+        endTime = time.Unix(0, models.MaxNanoTime+1)
+    }
 
-    // 创建 ShardGroup
+    // 收缩新区间，保证不与已有组重叠
+    for i := range rpi.ShardGroups {
+        if rpi.ShardGroups[i].Deleted() {
+            continue
+        }
+        startI := rpi.ShardGroups[i].StartTime
+        endI := rpi.ShardGroups[i].EndTime
+        if rpi.ShardGroups[i].Truncated() {
+            endI = rpi.ShardGroups[i].TruncatedAt
+        }
+        if !timestamp.Before(endI) && endI.After(startTime) {
+            startTime = endI
+        }
+        if startI.After(timestamp) && startI.Before(endTime) {
+            endTime = startI
+        }
+    }
+
     data.MaxShardGroupID++
     sgi := ShardGroupInfo{
         ID:        data.MaxShardGroupID,
@@ -1993,17 +2126,16 @@ func (data *Data) CreateShardGroup(database, policy string, timestamp time.Time)
         EndTime:   endTime,
     }
 
-    // 创建 Shard (OSS: 每个 ShardGroup 只有 1 个)
     data.MaxShardID++
     sgi.Shards = []ShardInfo{{ID: data.MaxShardID}}
 
-    // 添加到 RP 并排序
     rpi.ShardGroups = append(rpi.ShardGroups, sgi)
     sort.Sort(ShardGroupInfos(rpi.ShardGroups))
-
     return nil
 }
 ```
+
+**注意**: 收缩循环（`:403-430`）与 `MaxNanoTime` 钳制（`:398-401`）缺一不可；前者防止新组与已有组重叠（截断组以 `TruncatedAt` 为有效结束时间），后者防止 `EndTime` 溢出到 `time.Time` 的表示上限。
 
 **关键发现**: OSS 版本每个 ShardGroup 只创建 **1 个 Shard**。`ShardFor()` 的 hash 路由是 Enterprise 版本的遗留代码。
 
@@ -2012,7 +2144,7 @@ func (data *Data) CreateShardGroup(database, policy string, timestamp time.Time)
 ### 14.1 启动时恢复
 
 ```go
-// services/meta/client.go:88 — Open
+// services/meta/client.go:87 — Open
 func (c *Client) Open() error {
     c.mu.Lock()
     defer c.mu.Unlock()
@@ -2036,7 +2168,7 @@ func (c *Client) Open() error {
 ### 14.2 Load — 读取 meta.db
 
 ```go
-// services/meta/client.go:1031 — Load
+// services/meta/client.go:1015 — Load
 func (c *Client) Load() error {
     file := filepath.Join(c.path, metaFile)  // "meta.db"
     f, err := os.Open(file)
@@ -2112,3 +2244,14 @@ func (data *Data) unmarshal(pb *internal.Data) {
     data.adminUserExists = data.hasAdminUser()
 }
 ```
+
+### 14.5 meta.db 损坏与恢复边界
+
+| 场景 | 代码行为 | 运维动作 |
+|------|---------|---------|
+| `meta.db` 不存在 | `Load` 返回 nil，使用默认空 `Data`（Index=1），`Open` 立即 snapshot | 无（全新实例） |
+| `meta.db` 被截断/字节损坏 | `proto.Unmarshal` 返回 error → `Open` 返回 error，进程启动失败 | 停机，从备份还原；必要时用 `influxd restore` 恢复元数据 |
+| 只有 `meta.dbtmp` 完整 | `Load` 只读 `meta.db`，tmp 被忽略；`os.Create` 下次会截断它 | 若 `meta.db` 丢失且 tmp 完整，可人工把 tmp 改名为 `meta.db` 后启动（无代码支持，需谨慎） |
+| rename 后掉电 | `meta.db` 已是新版本，但目录项未 `SyncDir`（`services/meta/client.go:981-1013`；Windows 上 `SyncDir` 为 no-op，`pkg/file/file_windows.go:5-7`） | 文件系统可能回退到旧目录项；这是"进程崩溃安全"而非"掉电安全" |
+
+**结论**: Clone-Modify-Commit 保证的是"进程崩溃后不会读到半写状态"，不保证掉电后一定保留最后一次 commit；也没有自动修复损坏 `meta.db` 的机制。

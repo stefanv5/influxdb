@@ -12,9 +12,11 @@
 > 为什么要一层层整理？因为一次性整理所有包裹太慢了，会堵住仓库入口（阻塞写入）。
 > 分层整理可以在不阻塞写入的情况下，逐步达到最优状态。
 >
-> **两种合并模式**:
-> - **Full (Level 1-2, 4)**: 使用 `tsmBatchKeyIterator` 按 key 收集 block，再由生成的 `merge*/combine*` 逻辑尽量复用不重叠 block，仅对需要合并的部分解码
-> - **Fast / Batch (Level 3)**: 使用同一批量 key 迭代器路径，倾向于解码并重新编码以完成快速合并
+> **两种合并模式**（由 `tsmBatchKeyIterator.fast` 控制，`compact.go:1434-1442`）:
+> - **fast = false（Level 1/2/4、Level 5 optimize）**: 解码、去重、归并重叠 block，
+>   再按 `pointsPerBlock`（默认 1000；optimize 可为 10000）重新分块编码。压缩率优先。
+> - **fast = true（Level 3）**: 对已满或未重叠的剩余 block 直接复用原编码字节并追加，
+>   跳过解码/重编码；只有必须消除同 key 重叠时才走慢路径。速度优先，块更碎、压缩率更低。
 
 ## 1. Compaction 全链路总览
 
@@ -50,22 +52,24 @@ sequenceDiagram
         TSMComp->>Planner: 7 PlanLevel(1), PlanLevel(2), PlanLevel(3)
         TSMComp->>Planner: 8 Plan(lastWrite) — Full / Level 4 计划
         TSMComp->>Planner: 9 PlanOptimize(lastWrite) — Optimize / Level 5 计划
-        TSMComp->>Scheduler: 10 setDepth(level, count)
+        TSMComp->>Scheduler: 10 SetDepth(level, count)（L5 holdoff 期间传 0）
         TSMComp->>Scheduler: 11 next() → 加权优先级选择 level
-        alt case 1: compactHiPriorityLevel(grp[0], 1, fast=false, wg)
+        TSMComp->>TSMComp: 12 按 level 分发并切队列（grp[0].Group）
+        alt case 1: compactHiPriorityLevel(grp[0].Group, 1, fast=false, wg)
             TSMComp->>Compactor: 13a CompactFull(group) — 完整合并路径
-        else case 2: compactHiPriorityLevel(grp[0], 2, fast=false, wg)
+        else case 2: compactHiPriorityLevel(grp[0].Group, 2, fast=false, wg)
             TSMComp->>Compactor: 13b CompactFull(group) — 完整合并路径
-        else case 3: compactLoPriorityLevel(grp[0], 3, fast=true, wg)
+        else case 3: compactLoPriorityLevel(grp[0].Group, 3, fast=true, wg)
             TSMComp->>Compactor: 13c CompactFast(group) — 批量路径
-        else case 4: compactFull(grp[0], wg)
+        else case 4: compactFull(grp[0].Group, wg)
             TSMComp->>Compactor: 13d CompactFull(group)
-        else case 5: compactOptimize(grp[0], pointsPerBlock, wg)
+        else case 5: compactOptimize(grp[0].Group, grp[0].PointsPerBlock, wg)
             TSMComp->>Compactor: 13e CompactFull(group) — 优化块大小
         end
-        Compactor->>Disk: 14 写入新 TSM 文件
-        TSMComp->>FileStore: 15 Replace(oldFiles, newFiles)
-        TSMComp->>Planner: 16 Release(usedGroups)
+        Compactor->>Disk: 14 goroutine 内写入新 TSM 文件
+        Compactor->>FileStore: 15 goroutine 内 Apply → Replace(oldFiles, newFiles)
+        Compactor->>Planner: 16 goroutine 内 Release(s.group)
+        TSMComp->>Planner: 17 tick 末尾 ReleaseCompactionPlans(未启动的组)
     end
 ```
 
@@ -137,6 +141,11 @@ func (e *Engine) writeSnapshotAndCommit(log *zap.Logger, closedFiles []string, s
         return err
     }
 
+    // 源码在 Compactor.WriteSnapshot 之后取读锁，保护后面的
+    // Replace / ClearSnapshot / WAL.Remove（engine.go:2060-2061）
+    e.mu.RLock()
+    defer e.mu.RUnlock()
+
     if err := e.FileStore.Replace(nil, newFiles); err != nil {
         for _, file := range newFiles {
             _ = os.Remove(file)
@@ -202,74 +211,192 @@ func (c *Compactor) WriteSnapshot(cache *Cache, logger *zap.Logger) ([]string, e
 
 职责边界要拆清楚：`Engine.WriteSnapshot` 在持有 engine 写锁时关闭当前 WAL segment、收集 closed segments，并执行 `Cache.Snapshot()`；锁外对 snapshot 去重；`Compactor.WriteSnapshot` 只把传入的 snapshot cache 切分并写成新的 `.tsm.tmp` 文件；`Engine.writeSnapshotAndCommit` 再把新文件 `FileStore.Replace(nil, newFiles)` 进 store，成功后 `e.Cache.ClearSnapshot(true)`，最后删除已关闭 WAL segment。失败时 `writeSnapshotAndCommit` 通过 defer `ClearSnapshot(false)` 恢复 snapshot 状态，不能把 `e.Cache.ClearSnapshot` 写进 Compactor。
 
+**提交段锁时序**（engine.go:1973-2014、2046-2086）:
+1. `e.mu.Lock()`：`WAL.CloseSegment()` + `WAL.ClosedSegments()` + `Cache.Snapshot()`；
+2. 解锁：`snapshot.Deduplicate()`；
+3. 无锁：`Compactor.WriteSnapshot(snapshot)`；
+4. `e.mu.RLock()`：`FileStore.Replace(nil, newFiles)` + `Cache.ClearSnapshot(true)` + `WAL.Remove(closedFiles)`；
+5. 解锁。任一步失败时 defer `ClearSnapshot(false)`，并删除全部 `newFiles`。
+
 #### 步骤 6-15: TSM Compaction 主循环
 
 ```go
-// tsdb/engine/tsm1/engine.go:2082 — compact
-func (e *Engine) compact(wg *sync.WaitGroup) {
-    t := time.NewTicker(time.Second)
-    defer t.Stop()
+// tsdb/engine/tsm1/engine.go:2180 — compact
+const initialOptimizationHoldoff = time.Hour       // engine.go:2171
+const optimizationHoldoff = 5 * time.Minute        // engine.go:2174
+const tickPeriod = time.Second                     // engine.go:2178
 
-    var nextDisabledMsg time.Time
+optHoldoffStart, optHoldoffDuration := time.Time{}, time.Duration(0)
+startOptHoldoff := func(d time.Duration) {         // engine.go:2186-2191
+    optHoldoffStart, optHoldoffDuration = time.Now(), d
+}
+startOptHoldoff(initialOptimizationHoldoff)
 
-    for {
-        e.mu.RLock()
-        quit := e.done  // 注意: compactCache 使用 e.snapDone
-        e.mu.RUnlock()
+for {
+    select {
+    case <-quit:
+        return
+    case <-t.C:
+        if _, err := os.Stat(filepath.Join(e.Path(), DoNotCompactFile)); err == nil {
+            continue
+        }
 
-        select {
-        case <-quit:
-            return
-        case <-t.C:
-            // 步骤 6: 检查是否禁用 compaction
-            doNotCompactFile := filepath.Join(e.Path(), DoNotCompactFile)
-            if _, err := os.Stat(doNotCompactFile); err == nil {
-                continue  // 存在 DoNotCompactFile，跳过
-            }
+        l1, l2, l3, l4, l5 := e.PlanCompactions()
 
-            // 步骤 7-9: 获取各级 compaction 计划
-            level1Groups, level2Groups, level3Groups, level4Groups, level5Groups := e.PlanCompactions()
+        // holdoff 期间把 L5 深度置 0，让 Scheduler.next() 不选 L5；
+        // 但 l5 组仍保留，供 tick 末尾 Release 释放文件占用。
+        l5Count := 0
+        if time.Since(optHoldoffStart) >= optHoldoffDuration {
+            l5Count = len(l5)
+        }
+        e.Scheduler.SetDepth(1, len(l1))
+        e.Scheduler.SetDepth(2, len(l2))
+        e.Scheduler.SetDepth(3, len(l3))
+        e.Scheduler.SetDepth(4, len(l4))
+        e.Scheduler.SetDepth(5, l5Count)
 
-            // 步骤 10: 更新队列深度
-            e.scheduler.setDepth(1, len(level1Groups))
-            e.scheduler.setDepth(2, len(level2Groups))
-            e.scheduler.setDepth(3, len(level3Groups))
-            e.scheduler.setDepth(4, len(level4Groups))
-            e.scheduler.setDepth(5, len(level5Groups)) // holdoff 期间传 0
-
-            // 步骤 11: 调度器选择执行哪个 level
-            level, runnable := e.scheduler.next()
-            if !runnable {
-                continue
-            }
-
-            // 步骤 12: 根据 level 分发，处理 [0] (第一个 group)
+        if level, runnable := e.Scheduler.next(); runnable {
             switch level {
             case 1:
-                if e.compactHiPriorityLevel(level1Groups[0], 1, false, wg) {
-                    level1Groups = level1Groups[1:]
-                }
+                if e.compactHiPriorityLevel(l1[0].Group, 1, false, wg) { l1 = l1[1:] }
             case 2:
-                if e.compactHiPriorityLevel(level2Groups[0], 2, false, wg) {
-                    level2Groups = level2Groups[1:]
-                }
+                if e.compactHiPriorityLevel(l2[0].Group, 2, false, wg) { l2 = l2[1:] }
             case 3:
-                if e.compactLoPriorityLevel(level3Groups[0], 3, true, wg) {
-                    level3Groups = level3Groups[1:]
-                }
+                if e.compactLoPriorityLevel(l3[0].Group, 3, true, wg) { l3 = l3[1:] }
             case 4:
-                if e.compactFull(level4Groups[0], wg) {
-                    level4Groups = level4Groups[1:]
-                }
+                if e.compactFull(l4[0].Group, wg) { l4 = l4[1:] }
             case 5:
-                g := level5Groups[0]
-                if err := e.compactOptimize(g.Group, g.PointsPerBlock, wg); err == nil {
-                    level5Groups = level5Groups[1:]
+                g := l5[0]
+                err := e.compactOptimize(g.Group, g.PointsPerBlock, wg)
+                switch {
+                case err == nil:
+                    l5 = l5[1:]
+                case errors.Is(err, ErrOptimizeCompactionLimited),
+                     errors.Is(err, ErrCompactionLimited):
+                    // 本 tick 不再调度 optimize，避免饿死 level compaction
+                default:
+                    log.Error("Error during compactOptimize", zap.Error(err))
                 }
+                // 成功或失败都重启 5 分钟 holdoff
+                startOptHoldoff(optimizationHoldoff)
             }
         }
+
+        // 无论 next() 是否 runnable，都必须释放本 tick 未启动的计划。
+        e.ReleaseCompactionPlans(l1, l2, l3, l4, l5)
     }
 }
+```
+
+**三个容易漏掉的状态机要点**:
+
+1. `PlannedCompactionGroup = {Group CompactionGroup, PointsPerBlock int}`；只有 case 5
+   显式使用非默认 `PointsPerBlock`，其余四路传 `.Group`，`pointsPerBlock` 由策略构造器兜底。
+2. 已启动的组由 goroutine 在 `s.Apply()` 之后释放：
+   `e.CompactionPlan.Release([]CompactionGroup{s.group})`（`engine.go:2464-2468`、
+   `2520-2523`、`2550-2554`）；`ReleaseCompactionPlans` 只释放“本 tick 规划了但没启动”的组
+   （`engine.go:2287-2335`）。
+3. 若省略 `SetDepth(5, 0)`，holdoff 形同虚设；若省略 tick 末尾 Release，
+   `acquire()` 的 `filesInUse` 会永久占住文件，后续 tick 永远 plan 不到。
+
+```mermaid
+sequenceDiagram
+    participant Engine as Engine
+    participant Planner as CompactionPlanner
+    participant Scheduler as Scheduler
+    participant Compactor as Compactor
+    participant Goroutine as compaction goroutine
+    participant FileStore as FileStore
+
+    Note over Engine: tick1: Planner 返回 L4 组
+    Engine->>Planner: PlanCompactions()
+    Planner-->>Engine: l4=[G4]
+    Engine->>Scheduler: SetDepth(4, 1)
+    Scheduler-->>Engine: next() = 4
+    Engine->>Compactor: compactFull(G4)
+    Compactor-->>Engine: false (limiter 已满, 未启动)
+    Engine->>Planner: ReleaseCompactionPlans(l1,l2,l3,l4=[G4],l5)
+
+    Note over Engine: tick2: optimize holdoff 未到期
+    Engine->>Scheduler: SetDepth(5, 0)
+
+    Note over Engine: tick3: holdoff 到期
+    Engine->>Scheduler: SetDepth(5, n)
+    Scheduler-->>Engine: next() = 5
+    Engine->>Compactor: compactOptimize(...)
+    Compactor-->>Engine: ErrOptimizeCompactionLimited
+    Engine->>Engine: startOptHoldoff(5m)
+    Engine->>Planner: ReleaseCompactionPlans(剩余 l5)
+
+    Note over Engine: tick4: L1 启动成功
+    Engine->>Goroutine: go s.Apply()
+    Goroutine->>Compactor: CompactFull / CompactFast
+    Goroutine->>FileStore: Replace(old, new)
+    Goroutine->>Planner: Release(s.group)
+```
+
+**调度数值案例**（`maxConcurrency=8`）:
+
+```
+loLimit  = 8/5 + 1 = 2
+queues   = [5, 0, 0, 0, 3]
+weights  = [0.4, 0.3, 0.2, 0.1, 0.01]
+
+加权分数:
+  L1: 5 * 0.40 = 2.00   ← 最大
+  L5: 3 * 0.01 = 0.03
+→ next() 选择 L1。
+
+注意：源码里还有一个 `end=2` 的分支（`scheduler.go:54-59`：当 `L3+L4+L5 >= loLimit`
+且 `maxConcurrency - (L1+L2 running) == 0` 时只扫描 L1/L2），但它在当前实现下**不可达**：
+`8 - (L1+L2) == 0` 意味着 L1+L2 已占满 `maxConcurrency`，而入口的
+`总数 >= maxConcurrency → return 0, false`（`scheduler.go:43-45`）会先返回。
+因此实际参与选择的始终是 5 个 level，这段是防御性代码。
+```
+
+### 1.3 Snapshot 输出文件编号
+
+1. `Cache.Split` 走 `ring.split(n)`：按 `i%n` 把 16 个 partition 分给 n 个 split
+   (`ring.go:196-207`)。同一 series 只属于一个 partition，因此同一 split 内 key 不重叠，
+   各 split 写出的文件互不重叠。
+2. 每个 goroutine 内调用 `c.FileStore.NextGeneration()`（`compact.go:927`）：
+   `FileStore.currentGeneration` 在 `f.mu` 下 +1（`file_store.go:413-418`），
+   因此一次 snapshot 的多个 split 拿到不同 generation，顺序不确定。
+3. `writeNewFiles(gen, 0, ...)` 先 `sequence++`（`compact.go:1149-1157`），
+   所以每个 split 的首个文件都是 `gen-000000001.tsm`。
+4. `level = min(sequence, 4)`（`compact.go:219-227`）→ 这些文件全部是 Level 1。
+
+| series 基数 card | concurrency | throttle | 一次 snapshot 文件数 |
+|---|---|---|---|
+| `< 2e6` | 1 | `card < 3e6 && avg < 15s` | 1 |
+| `2e6 .. 3e6` | `card / 2e6` | 同上 | `card / 2e6` |
+| `>= 3e6` | 4（强制） | false | 4 |
+
+**数值案例**: `card=4,200,000` → `concurrency=4`（`>=3e6` 强制 4）→ 4 个 goroutine 分别拿到
+generation 11/12/13/14（顺序不确定）→ 输出
+`000000011-000000001.tsm` ... `000000014-000000001.tsm`。
+连续两次这样的 snapshot 就积累 8 个 L1 generation，才达到 `PlanLevel(1)` 的
+`minGenerations=8`（`compact.go:354-357`）。
+
+```mermaid
+sequenceDiagram
+    participant Engine as Engine.WriteSnapshot
+    participant Cache as Cache
+    participant Goroutine as snapshot goroutine[i]
+    participant FS as FileStore
+    participant Comp as Compactor
+
+    Engine->>Cache: Split(concurrency)
+    Cache-->>Engine: splits[0..n-1]（ring.split 按 i%n 分配 partition）
+    loop 每个 split
+        Engine->>Goroutine: go writeNewFiles(...)
+        Goroutine->>FS: NextGeneration()（f.mu 下 +1）
+        FS-->>Goroutine: gen
+        Goroutine->>Comp: writeNewFiles(gen, 0, ...)
+        Comp->>Comp: sequence++ → 1..k，level = min(sequence,4) = 1
+        Comp-->>Engine: files
+    end
+    Engine->>FS: Replace(nil, newFiles)
 ```
 
 ## 2. CompactionPlanner — 文件分代与级别
@@ -278,23 +405,37 @@ func (e *Engine) compact(wg *sync.WaitGroup) {
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│ TSM 文件名格式: XXXXXX-YY.tsm                           │
-├──────────┬──────────────────────────────────────────────┤
-│ XXXXXX   │ Generation ID (6 位数字)                      │
-│ YY       │ Sequence Number (2 位数字)                    │
-└──────────┴──────────────────────────────────────────────┘
+│ TSM 文件名格式: GGGGGGGGG-SSSSSSSSS.tsm                 │
+├───────────┬─────────────────────────────────────────────┤
+│ GGGGGGGGG │ Generation ID（十进制，9 位零填充）          │
+│ SSSSSSSSS │ Sequence Number（十进制，9 位零填充）        │
+└───────────┴─────────────────────────────────────────────┘
+
+写出：fmt.Sprintf("%09d-%09d", generation, sequence)   // file_store.go:1345
 
 示例:
-  000001-01.tsm  → Generation 1, Sequence 1 (Level 1)
-  000002-01.tsm  → Generation 2, Sequence 1 (Level 1)
-  000003-02.tsm  → Generation 3, Sequence 2 (Level 2)
-  000004-03.tsm  → Generation 4, Sequence 3 (Level 3)
+  000000001-000000001.tsm  → Generation 1, Sequence 1 (Level 1)
+  000000002-000000001.tsm  → Generation 2, Sequence 1 (Level 1)
+  000000003-000000002.tsm  → Generation 3, Sequence 2 (Level 2)
+  000000004-000000003.tsm  → Generation 4, Sequence 3 (Level 3)
+  000000005-000000004.tsm  → Generation 5, Sequence 4 (Level 4)
 ```
+
+> **为什么必须零填充**：FileStore 在 Open/Replace 后用
+> `sort.Sort(tsmReaders(f.files))` 按 `Path()` 字典序排序
+> (`file_store.go:1067,1701-1703`)；`KeyCursor` 在 block 时间范围重叠时也按
+> `Path()` 打破平局 (`file_store.go:1427-1445`)。9 位零填充保证
+> “字典序 == generation 数值序 == 新旧顺序”。自定义 `FormatFileNameFunc`
+> 若破坏该性质，重叠 block 的“新值覆盖旧值”前提不再成立。
+>
+> **解析**：`DefaultParseFileName` 先按 `.` 去掉扩展名，再按 `-` 切分，两段用
+> `strconv.ParseUint(..., 10, 32)` 解析；宽度本身不参与解析
+> (`file_store.go:1352-1375`)。实际写路径 `compact.go:1152`、`engine.go:1283`。
 
 ### 2.2 Compaction Level 定义
 
 ```go
-// tsdb/engine/tsm1/compact.go:177 — level
+// tsdb/engine/tsm1/compact.go:219 — level
 func (t *tsmGeneration) level() int {
     // 源码注释提到 Level 0，但当前实现直接用 sequence 映射:
     // sequence=1 -> level 1, sequence=2 -> level 2, sequence=3 -> level 3。
@@ -315,26 +456,28 @@ func (t *tsmGeneration) level() int {
 | **4** | Full compaction | 写冷超过 `compactFullWriteColdDuration` 或强制 full |
 | **5** | Optimize compaction 调度队列 | `PlanOptimize(lastWrite)` 找到冷 shard 优化组，经过 holdoff 后调度 |
 
-> **具体案例**: 假设你每秒写入 1000 个点，Cache 大小阈值 25MB。
+> **具体案例**: 假设每个点编码后约 30B，写入 100k points/s（≈3MB/s），Cache 阈值 25MB。
 >
 > ```
 > 时间线:
 >
-> t=0s    开始写入数据 → 进入 Cache
-> t=25s   Cache 达到 25MB → 触发 Snapshot → 写入 000001-01.tsm (Level 1)
-> t=50s   Cache 又满了 → 写入 000002-01.tsm (Level 1)
-> 后台检测: 相邻 Level 1 generation 达到规划阈值后触发 Level 1 Compaction
->         → 合并多个 sequence=1 generation → 写入 sequence=2 文件 (Level 2)
-> t=75s   Cache 又满了 → 写入 000003-01.tsm (Level 1)
-> t=100s  Cache 又满了 → 写入 000004-01.tsm (Level 1)
-> 后台检测: Level 1 generation 数量达到规划阈值后 → Level 1 Compaction
->         → 合并 → 写入 sequence=2 文件 (Level 2)
-> t=102s  后台检测: Level 2 generation 达到阈值 → Level 2 Compaction
->         → 合并 → 写入 sequence=3 文件 (Level 3)
+> t=0s      开始写入 → 进入 Cache
+> t≈8.7s    Cache 达到 25MB（25MB / 3MB/s）→ Snapshot → 000000001-000000001.tsm (Level 1)
+> t≈17.4s   第二个 Snapshot → 000000002-000000001.tsm (Level 1)
+> t≈26.1s   第三个 Snapshot → 000000003-000000001.tsm (Level 1)
 > ...
-> t=300s  写入停止 → 10 秒后触发 Full Compaction (Level 4)
->         → 合并所有 Level 2/3 文件 → 写入最终的大文件
+> t≈69.6s   第 8 个 Snapshot 完成，相邻 L1 generation 达到 minGenerations=8
+>           → L1 Compaction 合并 8 个 sequence=1 generation
+>           → 输出 000000008-000000002.tsm (Level 2)   // generation = max(输入 generation) = 8
+> ...
+> L2-L4 各自每积累 4 个同级 generation（step=4）触发一次合并
+> t=...     写入停止约 4 小时后（DefaultCompactFullWriteColdDuration, tsdb/config.go:38）
+>           → Full Compaction (Level 4)
+>           → 合并所有 Level 2/3 文件 → 写入最终的大文件
 > ```
+>
+> 若写入速率只有 1k points/s（≈30KB/s），写满 25MB 需要约 14 分钟，而不是 25 秒。
+> 演示时可把 `compact-full-write-cold-duration` 调成 10s 以快速触发 Full。
 >
 > 最终效果：几十个小文件合并成了 1 个大文件，查询时只需扫描 1 个文件。
 
@@ -422,7 +565,7 @@ func (c *DefaultPlanner) PlanLevel(level int) ([]CompactionGroup, int64) {
 ### 2.4 DefaultPlanner.Plan — Full Compaction
 
 ```go
-// tsdb/engine/tsm1/compact.go:528 — Plan
+// tsdb/engine/tsm1/compact.go:485 — Plan
 func (c *DefaultPlanner) Plan(lastWrite time.Time) ([]CompactionGroup, int64) {
     generations := c.findGenerations()
 
@@ -497,8 +640,146 @@ func (c *DefaultPlanner) Plan(lastWrite time.Time) ([]CompactionGroup, int64) {
     }
     c.lastPlanCheck = time.Now()
 
-    // ... 后续 Level 4 文件分组逻辑 ...
+    // lastPlanCheck 优化之后
+    if len(generations) <= 1 && !generations.hasTombstones() {
+        return nil, 0
+    }
+
+    // 1) 反向找最后一个 Level 4 generation：它们是“最旧”的文件。
+    //    反向遍历可避免较早的低 level generation 阻止较晚的高 level generation。
+    end, start := 0, 0
+    for i := len(generations) - 1; i >= 0; i-- {
+        if generations[i].level() >= 4 {
+            end = i + 1
+            break
+        }
+    }
+
+    // 2) 前向确定 start：跳过已压满/超大的老文件。
+    //    注意 hasTombstones 是“粘性”的：一旦遇到带 tombstone 的 generation，
+    //    后续不再调整 start。
+    var hasTombstones bool
+    for i, g := range generations[:end] {
+        if g.hasTombstones() {
+            hasTombstones = true
+        }
+        if hasTombstones {
+            continue
+        }
+        // 超过 2GB 且首块已满：不再重压
+        if g.size() > uint64(tsdb.MaxTSMFileSize) &&
+            g.files[0].FirstBlockCount >= tsdb.DefaultMaxPointsPerBlock {
+            start = i + 1
+        }
+        // 前面的文件增长得比后面的快：跳过特别大的，先压小的
+        if i > 0 && g.size()*2 < generations[i-1].size() {
+            start = i
+            break
+        }
+    }
+
+    // 3) 以 step=4 分组；in-use 或 2GB 满块 generation 会截断当前组。
+    const step = 4
+    generations = generations[start:end]
+
+    var groups tsmGenerationGroups
+    var currentGroup tsmGenerations
+    for i := 0; i < len(generations); {
+        moveToNextGroup := func() {
+            if len(currentGroup) > 0 {
+                i += len(currentGroup)
+                groups = append(groups, currentGroup)
+                currentGroup = nil
+            } else {
+                i++
+            }
+        }
+        currentGroup = make(tsmGenerations, 0, step)
+        for j := 0; j < step && (j+i) < len(generations); j++ {
+            gen := generations[j+i]
+            if c.isInUse(gen) {
+                break
+            }
+            if gen.size() >= uint64(tsdb.MaxTSMFileSize) &&
+                gen.files[0].FirstBlockCount >= tsdb.DefaultMaxPointsPerBlock &&
+                !gen.hasTombstones() {
+                break
+            }
+            currentGroup = append(currentGroup, gen)
+        }
+        moveToNextGroup()
+    }
+    if len(groups) == 0 {
+        return nil, 0
+    }
+
+    // 4) 不足 4 个且无 tombstone 的组跳过。
+    var compactable tsmGenerationGroups
+    for _, generationGroup := range groups {
+        if len(generationGroup) < 4 && !generationGroup.hasTombstones() {
+            continue
+        }
+        compactable = append(compactable, generationGroup)
+    }
+
+    // 5) 展开为文件路径并排序，一次性 acquire（全有或全无）。
+    var tsmFiles []CompactionGroup
+    for _, generationGroup := range compactable {
+        var cGroup CompactionGroup
+        for _, generation := range generationGroup {
+            for _, f := range generation.files {
+                cGroup = append(cGroup, f.Path)
+            }
+        }
+        sort.Strings(cGroup)
+        tsmFiles = append(tsmFiles, cGroup)
+    }
+    if !c.acquire(tsmFiles) {
+        return nil, int64(len(tsmFiles))
+    }
+    return tsmFiles, int64(len(tsmFiles))
 }
+```
+
+**Level 4 分组的数值案例**:
+
+```
+案例 A: 9 个连续 L4 generation g1..g9，无 tombstone、无 in-use、无超大文件
+  end   = 9（最后一个 L4 在 i=8，end=9）
+  start = 0（没有触发任何跳过条件）
+  分组（step=4）: [g1,g2,g3,g4]、[g5,g6,g7,g8]、[g9]
+  compactable: 前两组保留；第三组 len=1 < 4 且无 tombstone → 跳过
+  → 返回 2 个 CompactionGroup（共 8 个文件）
+
+案例 B: 同上，但 g3 正在被查询使用（isInUse(g3)=true）
+  第一组在 j=2 命中 g3 → break，currentGroup=[g1,g2]
+  i 前进到 3，继续分组: [g4,g5,g6,g7]、[g8,g9]
+  compactable: [g4..g7] 保留；[g1,g2] 与 [g8,g9] 都 <4 且无 tombstone → 跳过
+  → 只返回 1 组
+  这说明 in-use 会让某些 generation 在本轮永远不被选中，等下一次 tick 再试。
+```
+
+```mermaid
+flowchart TD
+    A["findGenerations"] --> B{"forceFull || 写冷 > 4h ?"}
+    B -->|是| C["FullAll: 全量组"]
+    B -->|否| D["lastPlanCheck 早退"]
+    D --> E{"len(generations) <= 1 && 无 tombstone ?"}
+    E -->|是| F["return nil, 0"]
+    E -->|否| G["end: 反向找最后一个 L4"]
+    G --> H["start: 前向跳过 2GB 满块/过大块<br>(hasTombstones 粘性)"]
+    H --> I["generations = generations[start:end]"]
+    I --> J["step=4 分组<br>in-use / 2GB 满块截断"]
+    J --> K{"len(group) == 0 ?"}
+    K -->|是| F
+    K -->|否| L{"len(group) < 4 && 无 tombstone ?"}
+    L -->|是| M["跳过该组"]
+    M --> N["处理下一组"]
+    L -->|否| O["展开文件路径 + sort.Strings"]
+    N --> O
+    O --> P{"acquire(全有或全无)"}
+    P -->|false| Q["return nil, len(tsmFiles)"]
+    P -->|true| R["return groups"]
 ```
 
 ### 2.5 DefaultPlanner.PlanOptimize — Optimize Compaction
@@ -563,6 +844,87 @@ func (c *DefaultPlanner) PlanOptimize(lastWrite time.Time) (compactGroup []Compa
 > 多个 sequence 文件进一步收敛。若 level 4 计划组里已有优化过的文件，
 > `PlanCompactions` 也会把该 level 4 group 提升到 level 5 队列，避免优化等级倒退。
 
+### 2.6 PlanCompactions — 计划分队列
+
+```go
+// tsdb/engine/tsm1/engine.go:2360 — planCompactionsInner
+level1Groups := e.planCompactionsLevel(1)   // PlanLevel(1) + PointsPerBlock=1000
+level2Groups := e.planCompactionsLevel(2)
+level3Groups := e.planCompactionsLevel(3)
+l4Groups, _ := e.CompactionPlan.Plan(e.LastModified())
+l5Groups, _, l5GenCount := e.CompactionPlan.PlanOptimize(e.LastModified())
+
+level4Groups := make([]PlannedCompactionGroup, 0, len(l4Groups))
+level5Groups := make([]PlannedCompactionGroup, 0, len(l4Groups)+len(l5Groups))
+
+// 1) L4 组里只要有一个“已优化”文件，整组提升为 L5，防止优化等级倒退。
+for _, group := range l4Groups {
+    if isOpt, filename, heur := e.IsGroupOptimized(group); isOpt {
+        level5Groups = append(level5Groups, PlannedCompactionGroup{
+            Group:          group,
+            PointsPerBlock: e.CompactionPlan.GetAggressiveCompactionPointsPerBlock(), // 10000
+        })
+    } else {
+        level4Groups = append(level4Groups, PlannedCompactionGroup{
+            Group:          group,
+            PointsPerBlock: tsdb.DefaultMaxPointsPerBlock, // 1000
+        })
+    }
+}
+
+// 2) 原生 L5 组：单 generation 时全部 aggressive；多 generation 时按 IsGroupOptimized 决定。
+for _, group := range l5Groups {
+    if l5GenCount == 1 {
+        level5Groups = append(level5Groups, PlannedCompactionGroup{group, aggressive})
+    } else if isOpt, _, _ := e.IsGroupOptimized(group); isOpt {
+        level5Groups = append(level5Groups, PlannedCompactionGroup{group, aggressive})
+    } else {
+        level5Groups = append(level5Groups, PlannedCompactionGroup{group, 1000})
+    }
+}
+
+// 3) 队列长度写入 Stats：TSMCompactionsQueue[0..2]、TSMFullCompactionsQueue、TSMOptimizeCompactionsQueue。
+```
+
+**启发式 `isFileOptimized(f)`（engine.go:2137-2159）**:
+
+```
+从 Compactor.FileStore.Stats() 找 f 的 FirstBlockCount；
+找不到 → warn 并降级为 0；
+FirstBlockCount >= aggressivePointsPerBlock（默认 10000）→ 认为是已优化。
+IsGroupOptimized(group)（engine.go:2162-2170）: 组内任一文件命中即整组命中。
+
+为什么用“首块点数”而不是文件大小:
+  optimize 会把块压到 aggressive 上限，首块是否达到 10000 是“已优化”的廉价指纹；
+  代价是 backfill 写入的大首块会造成误判，把普通 L4 组提升为 aggressive L5（多写一次）。
+```
+
+**数值案例**: L4 组含 `000000010-000000004.tsm`（首块 10000 点）与
+`000000011-000000001.tsm`（首块 1000 点）→ `IsGroupOptimized=true` → 整组进入 L5，
+`PointsPerBlock=10000`；`compactGroup` 内 `pointsPerBlock=10000` 传给 `CompactFull`，
+输出块最多 10000 点。
+
+```mermaid
+flowchart TD
+    A["PlanLevel(1)"] --> P["planCompactionsInner"]
+    B["PlanLevel(2)"] --> P
+    C["PlanLevel(3)"] --> P
+    D["Plan(lastWrite)"] --> E["l4Groups"]
+    F["PlanOptimize(lastWrite)"] --> G["l5Groups + l5GenCount"]
+    E --> H{"IsGroupOptimized(group)?"}
+    H -->|true| I["L5 队列, PointsPerBlock=10000 (aggressive)"]
+    H -->|false| J["L4 队列, PointsPerBlock=1000"]
+    G --> K{"l5GenCount == 1?"}
+    K -->|是| L["L5, aggressive"]
+    K -->|否| M{"IsGroupOptimized?"}
+    M -->|是| L
+    M -->|否| N["L5, 1000"]
+    I --> O["Stats 队列长度"]
+    J --> O
+    L --> O
+    N --> O
+```
+
 ## 3. 调度器 — 优先级管理
 
 ### 3.1 Scheduler 结构
@@ -586,11 +948,30 @@ type Scheduler struct {
 > `TSMOptimizeCompactionsActive`) 实现。实际的限流由 `compactionLimiter` (在 Engine 层)
 > 通过 `TryTake()` 非阻塞调用完成。
 
+Level 5 optimize 走**两级 limiter**（engine.go:2536-2560）：
+
+```
+获取顺序：compactionLimiter.TryTake() → optimizedCompactionLimiter.TryTake()
+失败语义：
+  - 第一个失败 → 返回 ErrCompactionLimited（本 tick 的 L5 调度结束）
+  - 第二个失败 → 归还第一个，返回 ErrOptimizeCompactionLimited（本 tick 的 L5 调度结束）
+释放顺序（goroutine 内 defer LIFO）：
+  defer compactionLimiter.Release()          // 先注册，最后执行
+  defer optimizedCompactionLimiter.Release() // 后注册，先执行
+
+默认容量（tsdb/store.go:497-524）：
+  compactionLimiter          = MaxConcurrentCompactions（0 → GOMAXPROCS/2，至少 1，且不超过 GOMAXPROCS）
+  optimizedCompactionLimiter = MaxConcurrentOptimizedCompactions（<=0 → 1，且不超过上面的 lim）
+
+调度器的 maxConcurrency 只用于“队列加权选择 + active 计数判断”；
+真正的并发准入在四个分发函数里的 TryTake()。
+```
+
 ### 3.2 next() — 选择执行哪个 level
 
 ```go
-// tsdb/engine/tsm1/scheduler.go:35 — scheduler.next
-func (s *Scheduler) next() (int, bool) {
+// tsdb/engine/tsm1/scheduler.go:36 — nextByQueueDepths
+func (s *Scheduler) nextByQueueDepths(depths [TotalCompactionLevels]int) (int, bool) {
     // 读取各级正在运行的 compaction 数量 (原子操作)
     level1Running := int(atomic.LoadInt64(&s.stats.TSMCompactionsActive[0]))
     level2Running := int(atomic.LoadInt64(&s.stats.TSMCompactionsActive[1]))
@@ -810,7 +1191,7 @@ func (m *mmapAccessor) init() (*indirectIndex, error) {
 Index Section 是 TSM 文件中所有 key 和 block 元数据的索引。解析过程扫描原始字节流，记录每个 key 的偏移位置。
 
 ```go
-// tsdb/engine/tsm1/reader.go:1295 — indirectIndex.UnmarshalBinary
+// tsdb/engine/tsm1/reader.go:1325 — indirectIndex.UnmarshalBinary
 func (d *indirectIndex) UnmarshalBinary(b []byte) error {
     d.b = b  // 保存 Index 字节引用
     if len(b) == 0 { return nil }
@@ -828,12 +1209,23 @@ func (d *indirectIndex) UnmarshalBinary(b []byte) error {
             return fmt.Errorf("indirectIndex: not enough data for key length value")
         }
 
-        // 跳过 key: keyLen(2B) + type(1B) + key(NB)
+        // 跳过 key 与 type: keyLen(2B) + key(NB) + type(1B)
+        // i += 3 + keyLen 同时跳过 2B 长度、key 本体与 1B type
         i += 3 + int32(binary.BigEndian.Uint16(b[i:i+2]))
+
+        // 边界检查: count(2B) 需要至少 2 字节
+        if i+indexCountSize >= iMax {
+            return fmt.Errorf("indirectIndex: not enough data for index entries count")
+        }
 
         // 读取 block 条目数量
         count := int32(binary.BigEndian.Uint16(b[i : i+2]))
         i += 2
+
+        // 边界检查: MinTime(8B) 需要至少 8 字节
+        if i+8 >= iMax {
+            return fmt.Errorf("indirectIndex: not enough data for min time")
+        }
 
         // 记录最小时间戳 (第一个 block 的 MinTime)
         minT := int64(binary.BigEndian.Uint64(b[i : i+8]))
@@ -882,28 +1274,34 @@ func (d *indirectIndex) UnmarshalBinary(b []byte) error {
 ```
 Index Section 字节布局:
 ┌─────────────────────────────────────────────────────────────┐
-│ Key[0]: keyLen(2B) + type(1B) + key(NB) + count(2B)        │
+│ Key[0]: keyLen(2B) + key(NB) + type(1B) + count(2B)        │
 │   → IndexEntry[0]: MinTime(8B) + MaxTime(8B) + Ofs(8B) + Sz(4B) │
 │   → IndexEntry[1]: ...                                      │
 │   → ...                                                     │
 ├─────────────────────────────────────────────────────────────┤
-│ Key[1]: keyLen(2B) + type(1B) + key(NB) + count(2B)        │
+│ Key[1]: keyLen(2B) + key(NB) + type(1B) + count(2B)        │
 │   → IndexEntry[0]: ...                                      │
 │   → ...                                                     │
 ├─────────────────────────────────────────────────────────────┤
 │ ...                                                         │
 └─────────────────────────────────────────────────────────────┘
 
+读侧：
+  readKey(b)     → 2B keyLen + key(NB)                        // reader.go:1775-1784
+  readEntries(b) → 1B type + 2B count + count × 28B           // reader.go:1786-1813
+  UnmarshalBinary 跳过 key 时用 i += 3 + keyLen（同时跳过 key 和 type） // reader.go:1354-1360
+
 offsets 数组 (mmap 匿名内存):
-┌──────┬──────┬──────┬──────┐
-│  0   │  87  │ 203  │ 345  │  → 每个值指向 Key[N] 在 Index 中的偏移
-└──────┴──────┴──────┴──────┘
+┌──────┬──────┬──────┐
+│  0   │  36  │  73  │  → 每个值指向 Key[N] 在 Index 中的偏移
+└──────┴──────┴──────┘
+  （示例三个 key 分别为 3B/4B/3B：record size = 2 + len(key) + 1 + 2 + 28 = 36/37/36）
 ```
 
 **二分查找定位 key**:
 
 ```go
-// tsdb/engine/tsm1/reader.go:772 — indirectIndex.Seek
+// tsdb/engine/tsm1/reader.go:894 — indirectIndex.Seek
 func (d *indirectIndex) Seek(key []byte) int {
     d.mu.RLock()
     defer d.mu.RUnlock()
@@ -955,7 +1353,7 @@ sequenceDiagram
 #### mmapAccessor.readBytes — 零拷贝读取
 
 ```go
-// tsdb/engine/tsm1/reader.go:1567 — mmapAccessor.readBytes
+// tsdb/engine/tsm1/reader.go:1649 — mmapAccessor.readBytes
 func (m *mmapAccessor) readBytes(entry *IndexEntry, b []byte) (uint32, []byte, error) {
     m.incAccess()
     m.mu.RLock()
@@ -982,7 +1380,7 @@ func (m *mmapAccessor) readBytes(entry *IndexEntry, b []byte) (uint32, []byte, e
 #### mmapAccessor.readBlock — 解码读取
 
 ```go
-// tsdb/engine/tsm1/reader.go:1548 — mmapAccessor.readBlock
+// tsdb/engine/tsm1/reader.go:1630 — mmapAccessor.readBlock
 func (m *mmapAccessor) readBlock(entry *IndexEntry, values []Value) ([]Value, error) {
     m.incAccess()
     m.mu.RLock()
@@ -1063,7 +1461,7 @@ sequenceDiagram
 #### tsmBatchKeyIterator — Compaction 专用迭代器
 
 ```go
-// tsdb/engine/tsm1/compact.go:1418 — tsmBatchKeyIterator
+// tsdb/engine/tsm1/compact.go:1421 — tsmBatchKeyIterator
 type tsmBatchKeyIterator struct {
     readers   []*TSMReader
     iterators []*BlockIterator
@@ -1079,6 +1477,23 @@ type tsmBatchKeyIterator struct {
     mergedUnsignedValues *tsdb.UnsignedArray
     mergedBooleanValues  *tsdb.BooleanArray
     mergedStringValues   *tsdb.StringArray
+
+    // per-key 临时缓冲：values[pos] 保存当前 key 已读到的值，
+    // buf/pos 用于在同一文件内连续读取同 key 的 block。
+    values map[string][]Value
+    pos    []int
+
+    // 错误累计：errs 最多保存 maxErrors 条，errSet 去重；
+    // 超出上限只增加 overflowErrors，不丢弃计数。
+    errs           TSMErrors
+    errSet         map[string]struct{}
+    maxErrors      int
+    overflowErrors int
+
+    fast       bool     // true = 未重叠 block 原样搬运（Level 3）
+    size       int      // 单 block 最大点数
+    tsmFiles   []string
+    currentTsm string
 
     merged    blocks
     interrupt chan struct{}
@@ -1115,10 +1530,12 @@ k.merge()
 
 ### 5.1 Compact 入口 — tsmBatchKeyIterator 路径
 
-当前源码中，`compact(fast bool, tsmFiles)` 不再分发到另一套迭代器；
-无论 `fast` 为 true 还是 false，都会创建 `NewTSMBatchKeyIterator(...)`。`fast`
-作为字段保存在 `tsmBatchKeyIterator` 中，影响后续 `combine*` 是否尽量复用完整 block
-或更积极地解码/重编码。
+无论 `fast` 为 true 还是 false，都创建 `NewTSMBatchKeyIterator(...)`；`fast` 保存在
+`tsmBatchKeyIterator.fast`。`fast=true` 时，combine* 对未重叠的剩余 block 直接
+`k.merged = append(k.merged, k.blocks[i])`，原样搬运（`compact.gen.go:130-139`）；
+`fast=false` 时才解码、按时间窗口去重合并，再按 `k.size` 重新分块编码。
+Level 3 使用 fast=true（`engine.go:2241-2257` 的 `compactLoPriorityLevel(..., 3, true, ...)`）；
+Level 1/2/4 与 optimize 使用 fast=false（`engine.go:2456/2485/2510/2537`）。
 
 ```mermaid
 sequenceDiagram
@@ -1163,34 +1580,93 @@ sequenceDiagram
 
 ```go
 // tsdb/engine/tsm1/compact.go:961 — compact
-func (c *Compactor) compact(fast bool, tsmFiles []string, logger *zap.Logger, pointsPerBlock int) ([]string, error) {
-    size := pointsPerBlock  // 通常 DefaultMaxPointsPerBlock (1000); optimize 路径可放大
+func (c *Compactor) compact(fast bool, tsmFiles []string, logger *zap.Logger,
+    pointsPerBlock int) ([]string, error) {
+    size := pointsPerBlock
 
-    // 1. 找到最大 generation 和 sequence
+    c.mu.RLock()
+    intC := c.compactionsInterrupt
+    c.mu.RUnlock()
+
     var maxGeneration, maxSequence int
+    minSeqByGen := make(map[int]int)
+
+    if c.FileStore == nil {
+        return nil, fmt.Errorf("compactor for %s has no file store: %w", c.Dir, errCompactionsDisabled)
+    }
     for _, f := range tsmFiles {
-        gen, seq, _ := c.parseFileName(f)
-        if gen > maxGeneration || (gen == maxGeneration && seq > maxSequence) {
+        gen, seq, err := c.FileStore.ParseFileName(f)   // 不是 c.parseFileName
+        if err != nil {
+            return nil, err
+        }
+        if gen > maxGeneration {                        // 高 gen 出现时重置 seq
             maxGeneration, maxSequence = gen, seq
+        }
+        if gen == maxGeneration && seq > maxSequence {
+            maxSequence = seq
+        }
+        if s, ok := minSeqByGen[gen]; !ok || seq < s {
+            minSeqByGen[gen] = seq
         }
     }
 
-    // 2. 打开所有输入文件的 TSMReader
-    var trs []*TSMReader
-    for _, file := range tsmFiles {
-        tr := c.FileStore.TSMReader(file)  // 获取已有 reader 的引用
-        trs = append(trs, tr)
+    // 输入的最高 level = min(该 generation 的最小 sequence, 4)
+    var maxInputLevel int
+    for _, minSeq := range minSeqByGen {
+        maxInputLevel = max(maxInputLevel, min(minSeq, 4))
+    }
+    // 输出 level = min(maxSequence+1, 4)，不得低于输入 level
+    if maxSequence+1 < maxInputLevel {
+        maxSequence = maxInputLevel - 1
     }
 
-    // 3. 创建 KeyIterator；当前实现统一使用 tsmBatchKeyIterator
+    var trs []*TSMReader
+    for _, file := range tsmFiles {
+        select {
+        case <-intC:
+            return nil, errCompactionAborted{}
+        default:
+        }
+        tr, err := c.FileStore.TSMReader(file)
+        if err != nil {
+            return nil, errCompactionAborted{fmt.Errorf("error creating reader for %q: %w", file, err)}
+        }
+        if tr == nil { // bad plan：文件不存在或不属于本 FileStore
+            return nil, errCompactionAborted{fmt.Errorf("bad plan: %s", file)}
+        }
+        defer tr.Unref()
+        trs = append(trs, tr)
+    }
+    if len(trs) == 0 {
+        logger.Debug("No input files")
+        return nil, nil
+    }
+
     tsm, err := NewTSMBatchKeyIterator(size, fast, DefaultMaxSavedErrors, intC, tsmFiles, trs...)
     if err != nil {
         return nil, err
     }
-
-    // 4. 写入新文件
-    return c.writeNewFiles(maxGeneration, maxSequence, tsmFiles, tsm, true)
+    return c.writeNewFiles(maxGeneration, maxSequence, tsmFiles, tsm, true, logger)
 }
+```
+
+**输出 level 不回退的数值案例**:
+
+```
+输入: 000000005-000000001.tsm（gen=5, seq=1，Level 1）
+      000000001-000000004.tsm（gen=1, seq=4，Level 4）
+
+遍历:
+  gen=5 > maxGeneration(0) → maxGeneration=5, maxSequence=1
+  minSeqByGen[5] = 1
+  gen=1 不 > 5；gen != maxGeneration → 不更新 seq
+  minSeqByGen[1] = 4
+
+maxInputLevel = max(min(1,4), min(4,4)) = 4
+maxSequence+1 = 2 < 4 → maxSequence = 3（保证输出不退回 Level 2）
+
+writeNewFiles 先 sequence++ → 4
+输出文件名: 000000005-000000004.tsm（level = min(4,4) = 4）
 ```
 
 ### 5.2 writeNewFiles — 文件轮转写入
@@ -1203,7 +1679,7 @@ func (c *Compactor) writeNewFiles(generation, sequence int, src []string, iter K
 
     for {
         sequence++
-        // 文件名: XXXXXX-YY.tsm.tmp
+        // 文件名: GGGGGGGGG-SSSSSSSSS.tsm.tmp
         fileName := filepath.Join(c.Dir, c.formatFileName(generation, sequence)+"."+TSMFileExtension+"."+TmpTSMFileExtension)
 
         // write 返回 (rollToNext, err): rollToNext=true 表示文件已满，需开新文件
@@ -1243,72 +1719,96 @@ func (c *Compactor) writeNewFiles(generation, sequence int, src []string, iter K
 
 ```go
 // tsdb/engine/tsm1/compact.go:1198 — write
-func (c *Compactor) write(path string, iter KeyIterator, throttle bool, logger *zap.Logger) (rollToNext bool, err error) {
+func (c *Compactor) write(path string, iter KeyIterator, throttle bool,
+    logger *zap.Logger) (rollToNext bool, err error) {
     fd, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_EXCL, 0666)
     if err != nil {
         return false, errCompactionInProgress{err: err}
     }
 
-    // 选择 TSMWriter: 索引 > 64MB 时用磁盘缓冲
-    var w TSMWriter
-    if iter.EstimatedIndexSize() > 64*1024*1024 {
-        w, _ = NewTSMWriterWithDiskBuffer(fd)
-    } else {
-        w, _ = NewTSMWriter(fd)
+    type syncingWriter interface {
+        io.Writer
+        Sync() error
     }
 
-    // defer 在函数返回时统一处理 w.Close() 与文件清理:
-    // - rollToNext 或 errCompactionInProgress(fs.ErrExist) 时保留文件;
-    // - 其他错误时调用 w.Remove() 删除文件 (compact.go:1233-1251)。
+    var w TSMWriter
+    var limitWriter syncingWriter = fd
+    if c.RateLimit != nil && throttle {
+        limitWriter = limiter.NewWriterWithRate(fd, c.RateLimit)
+    }
+    if iter.EstimatedIndexSize() > 64*1024*1024 {
+        w, err = NewTSMWriterWithDiskBuffer(limitWriter)
+    } else {
+        w, err = NewTSMWriter(limitWriter)
+    }
+    if err != nil {
+        return false, errors.Join(err, fd.Close())   // 不能吞掉 writer 创建错误
+    }
+
     defer func() {
-        // ... 见 compact.go:1233-1251, 根据 err/closeErr/rollToNext 决定是否删除文件
-        w.Close()
+        var eInProgress errCompactionInProgress
+        errs := []error{err}
+        closeErr := w.Close()
+        errs = append(errs, closeErr)
+        inProgress := errors.As(err, &eInProgress) && errors.Is(eInProgress.err, fs.ErrExist)
+        if closeErr == nil && (inProgress || rollToNext) {
+            return // 保留完整文件：轮转中，或另一个 compactor 已创建同名文件
+        } else if err != nil || closeErr != nil {
+            errs = append(errs, w.Remove()) // 删除半成品
+        }
+        err = errors.Join(errs...)
     }()
 
-    // 写入 Header (5 字节)
-    w.WriteHeader()
-
-    // 遍历 iterator，逐 block 写入
     for iter.Next() {
-        // 检查 compaction 是否被禁用 (非 intC select; 中断间接经由 iterator Read)
         c.mu.RLock()
         enabled := c.snapshotsEnabled || c.compactionsEnabled
         c.mu.RUnlock()
         if !enabled {
             return false, errCompactionAborted{}
         }
-
         key, minTime, maxTime, block, err := iter.Read()
         if err != nil {
             return false, err
         }
-
-        // 写入 block: CRC32(4B) + Data(NB)
+        if minTime > maxTime {
+            return false, fmt.Errorf("invalid index entry for block. min=%d, max=%d", minTime, maxTime)
+        }
         if err := w.WriteBlock(key, minTime, maxTime, block); errors.Is(err, ErrMaxBlocksExceeded) {
-            if err := w.WriteIndex(); err != nil {
-                return false, err
-            }
-            return true, err  // rollToNext=true，由 defer 关闭文件
+            if err := w.WriteIndex(); err != nil { return false, err }
+            return true, err
         } else if err != nil {
             return false, err
         }
-
-        // 检查文件大小限制 (2GB): 超过则 WriteIndex 并返回 rollToNext=true
         if w.Size() > tsdb.MaxTSMFileSize {
-            if err := w.WriteIndex(); err != nil {
-                return false, err
-            }
-            return true, errMaxFileExceeded  // Close 由 defer 处理
+            if err := w.WriteIndex(); err != nil { return false, err }
+            return true, errMaxFileExceeded
         }
     }
 
-    // 写入 Index + Footer
-    if err := w.WriteIndex(); err != nil {
+    if err := iter.Err(); err != nil {   // 迭代期间的 block 读取/解码错误
         return false, err
     }
+    if err := w.WriteIndex(); err != nil { return false, err }
     return false, nil
 }
 ```
+
+**defer 清理决策表**:
+
+| 条件 | 动作 | 结果 |
+|---|---|---|
+| `closeErr == nil && (rollToNext || inProgress(fs.ErrExist))` | 不删除 | 保留完整文件 |
+| `err != nil` 或 `closeErr != nil`（其他） | `w.Remove()` | 删除半成品 |
+| 正常 `WriteIndex` 成功 | 不删除 | 保留 |
+
+**三个容易误读的点**:
+
+- **header 是懒写的**: 源码**不调用** `w.WriteHeader()`；`NewTSMWriter` 不写头，
+  `WriteBlock` 在 `t.n == 0` 时懒写 5 字节 header（`writer.go:578-589`）。
+- `errMaxFileExceeded` 与 `ErrMaxBlocksExceeded` 是“换文件”信号，不是失败：
+  调用方 `writeNewFiles` 看到 `rollToNext=true` 会继续写下一个文件。
+- `iter.Err()` 返回 `TSMErrors`（最多 `DefaultMaxSavedErrors=100` 条，另有 dropped 计数），
+  上层 `MoveTsmOnReadErr` 只处理 `errBlockRead`。
 
 ### 5.3 Compaction 的文件大小限制
 
@@ -1364,7 +1864,7 @@ sequenceDiagram
 ```
 
 ```go
-// tsdb/engine/tsm1/file_store.go:733 — replace
+// tsdb/engine/tsm1/file_store.go:896 — replace
 func (f *FileStore) replace(oldFiles, newFiles []string, updatedFn func(r []TSMFile)) error {
     if len(oldFiles) == 0 && len(newFiles) == 0 {
         return nil
@@ -1545,6 +2045,28 @@ for i, b := range k.buf {
 }
 ```
 
+**同一文件内同 key 的连续 block 必须一次收全**：`BlockIterator` 在一个 key 有多个
+block 时会连续返回同一个 key。`PeekNext` 预读下一个 key，若仍等于当前 key 就继续
+`Next()/Read()`，并用 `cap(k.buf[i]) > len(k.buf[i])` 复用已分配的 slice 容量，
+避免反复扩容（`compact.go:1610-1638`）：
+
+```go
+blockKey := key
+for bytes.Equal(iter.PeekNext(), blockKey) {
+    iter.Next()
+    key, minTime, maxTime, typ, _, b, err := iter.Read()
+    if err != nil { k.AppendError(errBlockRead{k.currentTsm, err}) }
+    blk := &block{key: key, typ: typ, b: b, minTime: minTime, maxTime: maxTime,
+        tombstones: iter.r.TombstoneRange(key)}
+    if cap(k.buf[i]) > len(k.buf[i]) {
+        k.buf[i] = k.buf[i][:len(k.buf[i])+1]
+        k.buf[i][len(k.buf[i])-1] = blk
+    } else {
+        k.buf[i] = append(k.buf[i], blk)
+    }
+}
+```
+
 ### 6.3 mergeFloat / combineFloat — 类型化数组归并
 
 `mergeFloat()` 先排序 block，再判断是否需要 dedup。只要存在 tombstone、部分读取或时间范围重叠，
@@ -1569,10 +2091,28 @@ func (k *tsmBatchKeyIterator) mergeFloat() {
 }
 ```
 
-`combineFloat(dedup=true)` 中会解码重叠 block，并对每个 block 应用 tombstone：
+`combineFloat(dedup=true)` 先以第一个未读 block 的 `minTime/maxTime` 为种子，
+把所有重叠的未读 block 扩进窗口，再逐个解码、裁剪、排除 tombstone、归并：
 
 ```go
-// compact.gen.go:77-107 — combineFloat 摘要
+// compact.gen.go:60-72 — 窗口扩张
+first := k.blocks[0]
+minTime := first.minTime
+maxTime := first.maxTime
+for i := 0; i < len(k.blocks); i++ {
+    if k.blocks[i].overlapsTimeRange(minTime, maxTime) && !k.blocks[i].read() {
+        if k.blocks[i].minTime < minTime {
+            minTime = k.blocks[i].minTime
+        }
+        if k.blocks[i].maxTime > minTime && k.blocks[i].maxTime < maxTime {
+            maxTime = k.blocks[i].maxTime
+        }
+    }
+}
+```
+
+```go
+// compact.gen.go:77-107 — 解码 + 裁剪 + 归并
 var v tsdb.FloatArray
 if err := DecodeFloatArrayBlock(k.blocks[i].b, &v); err != nil {
     k.handleDecodeError(err, "float")
@@ -1580,6 +2120,9 @@ if err := DecodeFloatArrayBlock(k.blocks[i].b, &v); err != nil {
 }
 v.Exclude(k.blocks[i].readMin, k.blocks[i].readMax)
 v.Include(minTime, maxTime)
+if v.Len() > 0 {
+    k.blocks[i].markRead(v.MinTime(), v.MaxTime())   // markRead 记录实际消费范围
+}
 
 for _, ts := range k.blocks[i].tombstones {
     v.Exclude(ts.Min, ts.Max)
@@ -1588,18 +2131,54 @@ for _, ts := range k.blocks[i].tombstones {
 k.mergedFloatValues.Merge(&v)
 ```
 
+**窗口扩张数值例**: `A[100-300]` 与 `B[200-400]` 重叠：
+
+```
+种子 = A: minTime=100, maxTime=300
+扫描 B: overlapsTimeRange(100,300) = true
+        B.minTime(200) < 100? 否
+        B.maxTime(400) > 100 且 < 300? 否
+窗口仍为 [100,300]。
+B 解码后 Include(100,300) 只保留 200/300；B 的 400 留在下一轮。
+若 B 是 [200-250]（完全落在窗口内），B.maxTime(250) < maxTime(300) → 窗口收缩为 [100,250]。
+```
+
 `combineFloat(dedup=false)` 仍会对需要合并的小 block 解码并应用 tombstone；
 完整、未读且不需要合并的单个 block 可以直接追加到 `k.merged`：
 
 ```go
-// compact.gen.go:151-180 — combineFloat 非 dedup 路径摘要
-if i == len(k.blocks)-1 {
-    if !k.blocks[i].read() {
-        k.merged = append(k.merged, k.blocks[i])
+// compact.gen.go:118-151 — combineFloat 非 dedup 路径：满块直接搬运
+for ; i < len(k.blocks); i++ {
+    if k.blocks[i].read() {
+        continue
     }
-    i++
+    count, err := BlockCount(k.blocks[i].b)
+    if err != nil {
+        k.AppendError(err)
+        continue
+    }
+    if count < k.size {
+        break                      // 小块需要解码合并
+    }
+    k.merged = append(k.merged, k.blocks[i])   // 已满块原样复用编码字节
 }
 
+// compact.gen.go:130-139 — fast=true 的尾块路径
+if k.fast {
+    for i < len(k.blocks) {
+        if k.blocks[i].read() {
+            i++
+            continue
+        }
+        k.merged = append(k.merged, k.blocks[i])   // 原样追加，不解码
+        i++
+    }
+}
+```
+
+`fast=false` 的剩余小块才会解码、应用 tombstone、`markRead`、`Merge`：
+
+```go
 for i < len(k.blocks) && k.mergedFloatValues.Len() < k.size {
     var v tsdb.FloatArray
     DecodeFloatArrayBlock(k.blocks[i].b, &v)
@@ -1611,44 +2190,55 @@ for i < len(k.blocks) && k.mergedFloatValues.Len() < k.size {
 }
 ```
 
-**tsdb.FloatArray.Merge — 归并排序去重**:
+**tsdb.FloatArray.Merge — 原地覆盖合并**:
+
+`Merge(b)` 把 `b` 覆盖到 `a` 之上；同一时间戳取 `b` 的值。实现在生成的
+`tsdb/cursors/arrayvalues.gen.go:146`，有 4 条快路径，且**不分配 `result` 新对象**
+（除中段归并时的 `NewFloatArrayLen`）：
 
 ```go
-// tsdb/array.go — FloatArray.Merge
-func (a *FloatArray) Merge(other *FloatArray) {
-    // 归并排序: 两个已排序数组合并为一个
-    // 相同时间戳: 保留 other 的值 (后写覆盖)
-    // 时间复杂度: O(N + M)
-    // 空间复杂度: O(N + M) (新分配)
+// tsdb/cursors/arrayvalues.gen.go:146 — FloatArray.Merge
+func (a *FloatArray) Merge(b *FloatArray) {
+    if a.Len() == 0 { *a = *b; return }
+    if b.Len() == 0 { return }
 
-    result := &FloatArray{
-        Timestamps: make([]int64, 0, a.Len()+other.Len()),
-        Values:     make([]float64, 0, a.Len()+other.Len()),
+    // 快路径 1: a 完全在 b 之前 → 直接 append
+    if a.MaxTime() < b.MinTime() {
+        a.Timestamps = append(a.Timestamps, b.Timestamps...)
+        a.Values = append(a.Values, b.Values...)
+        return
+    }
+    // 快路径 2: b 完全在 a 之前 → prepend
+    if b.MaxTime() < a.MinTime() {
+        var tmp FloatArray
+        tmp.Timestamps = append(b.Timestamps, a.Timestamps...)
+        tmp.Values = append(b.Values, a.Values...)
+        *a = tmp
+        return
     }
 
-    i, j := 0, 0
-    for i < a.Len() && j < other.Len() {
-        if a.Timestamps[i] < other.Timestamps[j] {
-            result.Timestamps = append(result.Timestamps, a.Timestamps[i])
-            result.Values = append(result.Values, a.Values[i])
-            i++
-        } else if a.Timestamps[i] > other.Timestamps[j] {
-            result.Timestamps = append(result.Timestamps, other.Timestamps[j])
-            result.Values = append(result.Values, other.Values[j])
-            j++
+    // 慢路径: 双指针归并；相同时间戳写 b 的值（b 覆盖 a）
+    out := NewFloatArrayLen(a.Len() + b.Len())
+    i, j, k := 0, 0, 0
+    for i < len(a.Timestamps) && j < len(b.Timestamps) {
+        if a.Timestamps[i] < b.Timestamps[j] {
+            out.Timestamps[k], out.Values[k] = a.Timestamps[i], a.Values[i]; i++
+        } else if a.Timestamps[i] == b.Timestamps[j] {
+            out.Timestamps[k], out.Values[k] = b.Timestamps[j], b.Values[j]; i++; j++
         } else {
-            // 相同时间戳: 保留 other (新数据)
-            result.Timestamps = append(result.Timestamps, other.Timestamps[j])
-            result.Values = append(result.Values, other.Values[j])
-            i++
-            j++
+            out.Timestamps[k], out.Values[k] = b.Timestamps[j], b.Values[j]; j++
         }
+        k++
     }
-    // 追加剩余...
-
-    *a = *result
+    // 追加剩余元素，最后写回 a
+    a.Timestamps, a.Values = out.Timestamps[:k], out.Values[:k]
 }
 ```
+
+**覆盖顺序的前提**: 输入文件按 generation 升序传入 → `sort.Stable(k.blocks)` 只对
+“同 key、完全不重叠、且在前”的 block 返回 true（`compact.go:1406-1414` 的 `blocks.Less`），
+重叠块保持入参顺序 → 后出现的（更高 generation）`Merge` 覆盖先出现的值。
+若自定义文件名破坏 Path 序 == generation 序，该前提失效。
 
 ### 6.4 chunkFloat — 分块重编码
 
@@ -1692,14 +2282,21 @@ func (k *tsmBatchKeyIterator) chunkFloat(dst blocks) blocks {
 ```
 
 **EncodeFloatArrayBlock** 编码过程:
-1. Gorilla XOR 编码时间戳 → 压缩字节
-2. Gorilla XOR 编码值 → 压缩字节
-3. `packBlock`: type(1B) + tsLen(varint) + tsBytes + valueBytes
-4. 前缀 CRC32(4B)
+1. 时间戳：自适应 TimeEncoder（Delta + 十进制 Scale + Simple8b/RLE/Raw）
+   - 首字节 = 高 4 位编码类型（0=Raw, 1=PackedSimple, 2=RLE）| 低 4 位 log10(divisor)
+   - 随后 8B 首个 delta；其余 delta 除以 divisor 后进 Simple8b/RLE/Raw
+   - 证据: timestamp.go:46-49、165-176
+2. float 值：Gorilla XOR（float.go:17-19、77-90）
+   - 值段首字节 = floatCompressedGorilla << 4（0x10）
+   - 以 math.NaN()（0x7FF8000000000001）作为流结束哨兵，因此 NaN 不能作为数据值
+3. integer/unsigned 值：首字节高 4 位编码类型，后接首个值(8B) + Simple8b/RLE/Raw（int.go:125-134）
+4. boolean 值：首字节高 4 位类型 + uvarint 数量 + 位打包（bool.go:86-96）
+5. string 值：首字节高 4 位类型 + Snappy（batch_string.go:70-89）
+6. packBlock: type(1B) + uvarint(tsLen) + ts + values；外层再加 CRC32(4B)
 
 ### 6.5 tsmBatchKeyIterator 总体流程
 
-当前实现只有 batch key iterator 路径；`fast` 的区别体现在 `combine*` 是否尽量保留完整 block。
+当前实现只有 batch key iterator 路径；`fast=true` 时 `combine*` 尽量原样搬运完整 block，`fast=false` 时解码去重后重新分块编码。
 `mergeFloat()` 流程：
 
 ```mermaid
@@ -1747,6 +2344,51 @@ flowchart TD
 > 最终输出: `[100, 500, 600]` — tombstone 范围内的数据被物理删除
 >
 > 如果排除后同一 key 没有任何 merged block，`tsmBatchKeyIterator.Next()` 会继续读取下一个 key。
+
+### 6.6 一次完整的 compaction 数值推演
+
+> 场景：同一个 key（`cpu,host=web#!~#value`）分布在 3 个 TSM 文件中，另有 1 条 tombstone。
+
+输入文件（`f.files` 按 Path 升序 = generation 升序 = 最旧→最新）:
+
+```
+000000001-000000001.tsm  gen1  block [100,450]  值 (100,1)(200,2)(300,3)(400,4)(450,45)
+000000002-000000001.tsm  gen2  block [400,600]  值 (400,40)(500,50)(600,60)
+000000003-000000002.tsm  gen3  block [700,900]  值 (700,700)(800,800)(900,900)
+tombstone 关联 gen2 的 key: {Min:500, Max:500}
+```
+
+| 步骤 | 代码位置 | 中间结果 |
+|---|---|---|
+| 1. 收集 blocks | `NewTSMBatchKeyIterator.Next` | `k.blocks = [B1(100-450), B2(400-600), B3(700-900)]`，B2 携带 tombstone `{500,500}` |
+| 2. 稳定排序 | `sort.Stable(k.blocks)`（compact.go:1406-1414） | B1/B2 重叠 → `blocks.Less` 不交换，保持输入顺序（generation 升序） |
+| 3. 判定 dedup | `mergeFloat` | B1↔B2 重叠、B2 有 tombstone → `dedup=true` |
+| 4. 第一轮窗口 | `combineFloat(true)` | `first=B1`，窗口 `[100,450]`；只解码 B1、B2 |
+| 5. B1 解码 | `DecodeFloatArrayBlock` | `[(100,1),(200,2),(300,3),(400,4),(450,45)]`；`Exclude(MaxInt64,MinInt64)` 无操作；`markRead(100,450)` |
+| 6. B2 解码 | 同上 | `[(400,40),(500,50),(600,60)]` → `Include(100,450)` → `[(400,40)]`；`markRead(400,400)`；tombstone `Exclude(500,500)` 对 400 无影响 |
+| 7. Merge | `mergedFloatValues.Merge(&v)` | `100,200,300,400→40,450`（400 被 gen2 覆盖） |
+| 8. 第二轮窗口 | B1 已读 → 前移到 B2 | 窗口 `[400,600]`；B2 `Exclude(400,400)` 去掉已读的 400 |
+| 9. B2 剩余 | 同上 | `[(500,50),(600,60)]` → tombstone 删 500 → `[(600,60)]`；`markRead(500,600)` |
+| 10. B3 | 与 `[400,600]` 不重叠 | 本轮跳过 |
+| 11. 第三轮 | B2 已读 → B3 | 窗口 `[700,900]`；解码 B3，`markRead(700,900)`，Merge |
+| 12. chunkFloat | `k.size=1000` | 9 个值 < 1000 → 单个输出 block |
+| 13. writeNewFiles | `maxGeneration=max(1,2,3)=3`，`maxSequence=2` | `sequence++ → 3`，输出 `000000003-000000003.tsm` |
+
+期望输出（一个文件、一个 block）:
+
+```
+000000003-000000003.tsm
+  block [100,900]
+  values: (100,1)(200,2)(300,3)(400,40)(450,45)(600,60)(700,700)(800,800)(900,900)
+  说明: 500 被 tombstone 删除；400 的旧值 4 被 gen2 的 40 覆盖。
+```
+
+关键不变量:
+- `first.markRead(minT, maxT)` 记录的是**本轮实际消费的窗口**，不是整个 block；
+  下一轮靠 `blocks[i].read()` 跳过已读完的 block、靠 `Exclude(readMin, readMax)` 裁掉已读值。
+- `markRead` 取并集（`file_store.go:1408-1420` 的语义）：第二轮 `markRead(500,600)` 与
+  第一轮 `markRead(400,400)` 合并成 `{readMin:400, readMax:600}`，因此 B2 在第二轮后
+  被判定为完全读完。
 
 ## 7. 错误处理
 
@@ -1812,7 +2454,7 @@ type compactionStrategy struct {
 Planner 通过 `filesInUse` map 防止多个 plan 返回同一文件:
 
 ```go
-// tsdb/engine/tsm1/compact.go:660 — acquire
+// tsdb/engine/tsm1/compact.go:726 — acquire
 func (c *DefaultPlanner) acquire(groups []CompactionGroup) bool {
     c.mu.Lock()
     defer c.mu.Unlock()
@@ -1833,7 +2475,7 @@ func (c *DefaultPlanner) acquire(groups []CompactionGroup) bool {
     return true
 }
 
-// tsdb/engine/tsm1/compact.go:684 — Release
+// tsdb/engine/tsm1/compact.go:753 — Release
 func (c *DefaultPlanner) Release(groups []CompactionGroup) {
     c.mu.Lock()
     defer c.mu.Unlock()
@@ -1845,10 +2487,17 @@ func (c *DefaultPlanner) Release(groups []CompactionGroup) {
 }
 ```
 
+**两套互斥必须区分**（`errCompactionInProgress` 来自第二层，不是 Planner）：
+
+| 层级 | 数据结构 | 生命周期 | 作用 |
+|---|---|---|---|
+| Planner `acquire/Release` | `filesInUse map[string]struct{}`（compact.go:726-760） | 跨 tick 的计划占用，tick 末尾 `ReleaseCompactionPlans` 或 goroutine 内 `Release` | 防止同一文件被两个计划（如 L4 与 L5）同时选中 |
+| Compactor `add/remove` | `files map[string]struct{}`（compact.go:797、1311-1345） | 单次 `CompactFast/CompactFull` 的在途保护，`defer c.remove(tsmFiles)` | 任一文件已在集合中 → 返回 `errCompactionInProgress{}`；真正打开文件前再兜底一次 |
+
 ### 7.0.4 forceFull 机制
 
 ```go
-// tsdb/engine/tsm1/compact.go:222 — ForceFull
+// tsdb/engine/tsm1/compact.go:309 — ForceFull
 func (c *DefaultPlanner) ForceFull() {
     c.mu.Lock()
     defer c.mu.Unlock()
@@ -1863,17 +2512,17 @@ func (c *DefaultPlanner) ForceFull() {
 ### 7.0.5 Compactor 中的 Rate Limiting 和 Interrupt
 
 ```go
-// tsdb/engine/tsm1/compact.go:1111 — write() 中的限速
+// tsdb/engine/tsm1/compact.go:1198 — write() 中的限速
 if c.RateLimit != nil && throttle {
     limitWriter = limiter.NewWriterWithRate(fd, c.RateLimit)
 }
 
-// tsdb/engine/tsm1/compact.go:1117 — TSMWriter 磁盘缓冲
+// tsdb/engine/tsm1/compact.go:1224 — TSMWriter 磁盘缓冲
 if iter.EstimatedIndexSize() > 64*1024*1024 {
     w, err = NewTSMWriterWithDiskBuffer(limitWriter)  // 索引 > 64MB 时用磁盘缓冲
 }
 
-// tsdb/engine/tsm1/compact.go:900 — compact() 中的 interrupt channel
+// tsdb/engine/tsm1/compact.go:961 — compact() 中的 interrupt channel
 c.mu.RLock()
 intC := c.compactionsInterrupt
 c.mu.RUnlock()
@@ -1907,25 +2556,36 @@ Compaction 通过 `compactionsInterrupt` channel 实现优雅停止。关闭此 
 **中断语义**: 中断不是立即停止——当前正在写入的 block 会完成，然后在下一个检查点返回错误。调用方（`compactGroup`）会清理已创建的临时文件。
 
 ```go
-// tsdb/engine/tsm1/engine.go:2271 — compactGroup
+// tsdb/engine/tsm1/engine.go:2591 — compactGroup
 func (s *compactionStrategy) compactGroup() {
-    group := s.group  // 使用 s.group，不是参数
-    // ... 日志记录 ...
+    group := s.group
+    log, logEnd := logger.NewOperation(s.logger, "TSM compaction", "tsm1_compact_group", logger.Shard(s.engine.id))
+    defer logEnd()
+
+    // 策略构造器可能传 0；必须兜底为 1000
+    pointsPerBlock := s.pointsPerBlock
+    if pointsPerBlock <= 0 {
+        pointsPerBlock = tsdb.DefaultMaxPointsPerBlock
+    }
 
     var (
         err   error
         files []string
     )
-
-    // 根据 fast 标志选择 compaction 路径
     if s.fast {
-        files, err = s.compactor.CompactFast(group)
+        files, err = s.compactor.CompactFast(group, log, pointsPerBlock)
     } else {
-        files, err = s.compactor.CompactFull(group)
+        files, err = s.compactor.CompactFull(group, log, pointsPerBlock)
     }
 
     if err != nil {
-        // 错误类型 1: Compaction 进行中 (类型断言)
+        // 出错时统一清理已写出的 .tsm.tmp 文件
+        defer func(fs []string) {
+            if removeErr := s.compactor.RemoveTmpFiles(fs); removeErr != nil {
+                log.Warn("Unable to remove temporary file(s)", zap.Error(removeErr))
+            }
+        }(files)
+
         _, inProgress := err.(errCompactionInProgress)
         if err == errCompactionsDisabled || inProgress {
             log.Info("Aborted compaction", zap.Error(err))
@@ -1936,26 +2596,29 @@ func (s *compactionStrategy) compactGroup() {
         }
 
         log.Warn("Error compacting TSM files", zap.Error(err))
-
-        // 错误类型 2: TSM 文件损坏 (errBlockRead) — 通过 errors.As + MoveTsmOnReadErr 处理
-        // MoveTsmOnReadErr (engine.go:2663-2675) 内部用 errors.As(err, &blockReadErr)
-        // 捕获 errBlockRead，再调用 replaceFn([]string{path}, nil) 移除损坏文件，
-        // 最后 os.Rename(path, path+".bad") 标记为 .bad。
-        // replaceFn = s.fileStore.Replace (2 参数版本，无 callback)。
         MoveTsmOnReadErr(err, log, s.fileStore.Replace)
 
-        // 错误类型 3: 其他错误 (含 errCompactionAborted) — errorStat++, sleep, 返回
         atomic.AddInt64(s.errorStat, 1)
         time.Sleep(time.Second)
         return
     }
 
-    // 成功: 替换旧文件 (FileStore.Replace 是 2 参数版本: oldFiles, newFiles)
     if err := s.fileStore.Replace(group, files); err != nil {
-        // 替换失败: 删除新文件
-        for _, file := range files { os.Remove(file) }
+        log.Error("Error replacing new TSM files", zap.Error(err))
         atomic.AddInt64(s.errorStat, 1)
+        time.Sleep(time.Second)
+
+        // 删除新文件，下次 tick 重试
+        for _, file := range files {
+            if err := os.Remove(file); err != nil {
+                log.Error("Unable to remove file", zap.String("path", file), zap.Error(err))
+            }
+        }
         return
+    }
+
+    for i, f := range files {
+        log.Info("Compacted file", zap.Int("tsm1_index", i), zap.String("tsm1_file", f))
     }
     atomic.AddInt64(s.successStat, 1)
 }
@@ -1979,59 +2642,99 @@ flowchart TD
     C -->|"成功"| I["s.fileStore.Replace(group, files)<br>successStat++"]
 ```
 
-### 7.2 损坏文件处理
+### 7.1 TSMErrors 与“部分成功”
+
+`tsmBatchKeyIterator.AppendError` 用 `errSet`（错误字符串集合）去重，
+最多保存 `DefaultMaxSavedErrors = 100` 条；超出上限时不再保存，只把
+`overflowErrors++`（`compact.go:1485-1499`）。因此错误总数 = `len(errs) + overflowErrors`。
 
 ```go
-// tsdb/engine/tsm1/file_store.go:555 — Open 中的损坏文件处理
-// 每个文件在独立 goroutine 中打开，结果通过 channel 传递
-func (f *FileStore) Open() error {
-    // ... 每个文件在 goroutine 中打开 ...
-    if err != nil {
-        // 打开失败: 记录日志，重命名为 .bad
-        f.logger.Error("Cannot read corrupt tsm file, renaming", ...)
-        file.Close()
-        os.Rename(file.Name(), file.Name()+"."+BadTSMFileExtension)
-        // 通过 channel 发送错误
-        readerC <- &res{r: df, err: fmt.Errorf("cannot read corrupt file %s: %v", ...)}
-        return  // goroutine 退出
+// tsdb/engine/tsm1/compact.go:1485-1499 — AppendError
+func (k *tsmBatchKeyIterator) AppendError(err error) bool {
+    s := err.Error()
+    if _, ok := k.errSet[s]; ok {
+        return true                  // 重复错误：已保存过，返回 true
     }
-
-    // 主循环: 从 channel 读取结果
-    for range files {
-        res := <-readerC
-        if res.err != nil {
-            return res.err  // 任何错误导致 Open() 失败!
-        }
-        f.files = append(f.files, res.r)
+    if k.maxErrors > len(k.errs) {
+        k.errs = append(k.errs, err)
+        k.errSet[s] = struct{}{}
+        return true                  // 新错误且未超上限
     }
+    k.overflowErrors++               // 超上限：只计数，返回 false
+    return false
 }
 ```
 
-> **重要**: 损坏文件会导致 `Open()` 返回错误，而不是静默跳过。
-> 如果需要跳过损坏文件，调用者必须在 `Open()` 失败后自行处理（例如删除 .bad 文件后重试）。
+**部分成功语义**: 单个 block 解码失败**不会**中止整个 compaction；`write()` 的
+`iter.Next()` 循环继续处理后续 key/block，循环结束后才检查 `iter.Err()`。
+若 `iter.Err()` 非空，`write()` 返回错误，本次 compaction 视为失败并清理临时文件
+（`compact.go:1286-1310`）；若错误可被 `errors.As(err, &errBlockRead)` 捕获，
+上层 `MoveTsmOnReadErr` 会把损坏文件 rename 成 `.bad`（`engine.go:2663-2675`）。
+
+**数值案例**: 3 个 block 解码失败，且三个错误字符串互不相同 →
+`len(errs)=3`、`overflowErrors=0`、`iter.Err()` 返回 3 条错误；若同一损坏 block
+被重试 150 次、错误字符串相同 → `len(errs)=1`，不会因重复而溢出。
+
+### 7.2 损坏文件处理
+
+`FileStore.Open()` 对每个文件启动 goroutine，通过**无缓冲** `readerC := make(chan *res)`
+回传结果（`file_store.go:613`）；主循环遇到第一个错误立即 `return res.err`，
+其余 goroutine 会阻塞在发送上（`file_store.go:631-670`）。
+
+| 错误类型 | 判定 | 动作 | 结果 |
+|---|---|---|---|
+| mmap 系统限制 | `errors.Is(err, MmapError{})` | **不 rename** | 返回 “system limit for vm.max_map_count may be too low”；原文件保留 |
+| 普通损坏 | 其他错误 | `logger.Error("Cannot read corrupt tsm file, renaming")` → `os.Rename(file.Name(), file.Name()+".bad")` | 成功则返回 “cannot read corrupt file”；rename 失败则返回 rename 错误（原文件仍在） |
+
+```go
+// tsdb/engine/tsm1/file_store.go:645-667 — 两类失败路径
+if err != nil {
+    if errors.Is(err, MmapError{}) {
+        readerC <- &res{r: df, err: fmt.Errorf("cannot read file %s, system limit for vm.max_map_count may be too low: %w", file.Name(), err)}
+        return
+    }
+    // 普通损坏：rename 成 .bad
+    f.logger.Error("Cannot read corrupt tsm file, renaming", zap.String("path", file.Name()), zap.Int("id", idx), zap.Error(err))
+    if e := os.Rename(file.Name(), file.Name()+"."+BadTSMFileExtension); e != nil {
+        readerC <- &res{r: df, err: fmt.Errorf("cannot rename corrupt file %s: %w", file.Name(), e)}
+        return
+    }
+    readerC <- &res{r: df, err: fmt.Errorf("cannot read corrupt file %s: %w", file.Name(), err)}
+    return
+}
+```
+
+> **重要**: 两类错误都会让 `Open()` 返回错误，而不是静默跳过。区别只在是否把原文件
+> rename 成 `.bad`；mmap 限制属于部署问题，保留原文件以便调高系统限制后重试。
 
 ## 8. TSM 文件统计
 
 ### 8.1 FileStat — 文件元数据
 
 ```go
-// tsdb/engine/tsm1/file_store.go:199 — FileStat
+// tsdb/engine/tsm1/file_store.go:237 — FileStat
 type FileStat struct {
-    Path         string
-    HasTombstone bool
-    Size         uint32
-    LastModified int64
-    MinTime      int64  // 文件中最小时间戳
-    MaxTime      int64  // 文件中最大时间戳
-    MinKey       []byte // 文件中最小 key
-    MaxKey       []byte // 文件中最大 key
+    Path             string
+    HasTombstone     bool
+    Size             uint32
+    LastModified     int64
+    MinTime, MaxTime int64
+    MinKey, MaxKey   []byte
+    Generation       int
+    Sequence         int
+}
+
+// tsdb/engine/tsm1/file_store.go:252 — ExtFileStat
+type ExtFileStat struct {
+    FileStat
+    FirstBlockCount int  // 由 ExtStats() 额外计算，可能失败
 }
 ```
 
 ### 8.2 TSMReader.Stats — 获取文件统计
 
 ```go
-// tsdb/engine/tsm1/reader.go:563 — TSMReader.Stats
+// tsdb/engine/tsm1/reader.go:666 — TSMReader.Stats
 func (t *TSMReader) Stats() FileStat {
     minTime, maxTime := t.index.TimeRange()
     minKey, maxKey := t.index.KeyRange()
@@ -2044,6 +2747,8 @@ func (t *TSMReader) Stats() FileStat {
         MinKey:       minKey,
         MaxKey:       maxKey,
         HasTombstone: t.tombstoner.HasTombstones(),
+        Generation:   t.generation,
+        Sequence:     t.sequence,
     }
 }
 ```
@@ -2051,8 +2756,8 @@ func (t *TSMReader) Stats() FileStat {
 ### 8.3 FileStore.Stats — 懒缓存 (双检锁)
 
 ```go
-// tsdb/engine/tsm1/file_store.go:694 — FileStore.Stats
-func (f *FileStore) Stats() []FileStat {
+// tsdb/engine/tsm1/file_store.go:858 — FileStore.Stats
+func (f *FileStore) Stats() []ExtFileStat {
     // 第一次检查: RLock 快速路径
     f.mu.RLock()
     if len(f.lastFileStats) > 0 {
@@ -2072,11 +2777,16 @@ func (f *FileStore) Stats() []FileStat {
 
     // 容量检查: 如果缓存容量远小于文件数，重新分配
     if cap(f.lastFileStats) < len(f.files)/2 {
-        f.lastFileStats = make([]FileStat, 0, len(f.files))
+        f.lastFileStats = make([]ExtFileStat, 0, len(f.files))
     }
 
     for _, fd := range f.files {
-        f.lastFileStats = append(f.lastFileStats, fd.Stats())
+        stats, err := fd.ExtStats()
+        if err != nil {
+            // ExtStats 出错时 embedded FileStat 仍然有效，只记录警告并继续
+            f.logger.Warn("error during fd.Stats", zap.Error(err))
+        }
+        f.lastFileStats = append(f.lastFileStats, stats)
     }
     return f.lastFileStats
 }
@@ -2088,7 +2798,7 @@ func (f *FileStore) Stats() []FileStat {
 ### 8.4 EngineStatistics — 引擎统计
 
 ```go
-// tsdb/engine/tsm1/engine.go:636 — EngineStatistics
+// tsdb/engine/tsm1/engine.go:684 — EngineStatistics
 type EngineStatistics struct {
     CacheCompactions        int64
     CacheCompactionsActive  int64
@@ -2121,15 +2831,15 @@ type EngineStatistics struct {
 
 ```mermaid
 flowchart TD
-    A["Cache Snapshot"] -->|"Level 1"| B["000001-01.tsm<br>小文件，快速写入"]
-    B -->|"Level 1"| C["000002-01.tsm<br>中等文件，初步压缩"]
-    C -->|"Level 2"| D["000003-01.tsm<br>较大文件，更好压缩"]
-    D -->|"Level 3"| E["000004-01.tsm<br>大文件，最优压缩"]
-    E -->|"Level 4 (Full)"| F["000005-01.tsm<br>最大文件，全局最优"]
+    A["Cache Snapshot"] -->|"Level 1"| B["000000001-000000001.tsm<br>小文件，快速写入"]
+    B -->|"Level 1"| C["000000002-000000001.tsm<br>中等文件，初步压缩"]
+    C -->|"Level 2"| D["000000003-000000002.tsm<br>较大文件，更好压缩"]
+    D -->|"Level 3"| E["000000004-000000003.tsm<br>大文件，最优压缩"]
+    E -->|"Level 4 (Full)"| F["000000005-000000004.tsm<br>最大文件，全局最优"]
 ```
 
 **多级 Compaction 的优势**：
-1. **渐进式压缩**：每级 compact 4 个文件，避免一次性 compact 所有文件
+1. **渐进式压缩**：L1 每积累 8 个 generation、L2-L4 每积累 4 个 generation 触发一次 compaction，避免一次性 compact 所有文件
 2. **写入放大控制**：每次只 compact 同级别的文件，减少写入量
 3. **查询性能**：较低级别的文件数量少，查询时需要扫描的文件更少
 
@@ -2182,3 +2892,25 @@ Full compaction 需要读取所有文件并写入一个新文件。当文件总�
 ### 11.6 Tombstone 处理延迟
 
 Tombstone 只有在 compaction 时才会被真正删除。如果 compaction 不频繁，tombstone 会持续占用空间。
+
+### 11.7 常量与配置来源
+
+| 常量 / 配置 | 值 | 来源 | 影响 |
+|---|---|---|---|
+| `CacheSnapshotMemorySize` | 25 MiB | `tsdb/config.go:29` | Cache 达到该大小触发 snapshot |
+| `CacheSnapshotWriteColdDuration` | 10 min | `tsdb/config.go:34` | 写入停止后触发 snapshot |
+| `CompactFullWriteColdDuration` | 4 h | `tsdb/config.go:38` | 写入停止后触发 Full compaction |
+| `DefaultMaxPointsPerBlock` | 1000 | `tsdb/config.go:53` | 普通 compaction 的每块点数 |
+| `DefaultAggressiveMaxPointsPerBlock` | 10000 | `tsdb/config.go:57` | optimize/aggressive compaction 的每块点数 |
+| `MaxTSMFileSize` | 2 GiB | `tsdb/config.go:86` | 输出文件轮转阈值 |
+| `DefaultMaxSavedErrors` | 100 | `compact.go:45-48` | iterator 最多保存的错误条数 |
+| `fsyncEvery` | 25 MiB | `writer.go:104` | 写入过程中周期性 fsync |
+| `maxKeyLength` / `maxIndexEntries` | 65535 / 65535 | `writer.go:97-100` | 2B 字段上限 |
+| `indexEntrySize/indexCountSize/indexTypeSize` | 28 / 2 / 1 | `writer.go:88-94` | Index 区字节布局 |
+| 调度权重 | `[0.4, 0.3, 0.2, 0.1, 0.01]` | `scheduler.go:7` | 队列加权选择 |
+| optimize holdoff | 初始 1h，后续 5min | `engine.go:2171-2175` | L5 调度间隔 |
+| compaction tick | 1s | `engine.go:2178` | compaction 主循环周期 |
+| `compactionLimiter` 默认 | `GOMAXPROCS/2`（≥1，≤GOMAXPROCS） | `store.go:497-511` | 并发 compaction 总数 |
+| `optimizedCompactionLimiter` 默认 | 1（≤ compaction limiter） | `store.go:514-524` | 并发 optimize 数 |
+| 吞吐限速 | 48 MiB/s，burst 48 MiB/s | `tsdb/config.go:44,49` | compaction 写带宽 |
+| purger 轮询 | 1s | `file_store.go:1676` | 延迟删除 in-use 文件 |

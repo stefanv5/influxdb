@@ -48,9 +48,9 @@ sequenceDiagram
     Note over Select: 对每个聚合函数<br>并行构建迭代器 (errgroup.Group)
 
     Select->>Engine: 6 CreateIterator(ctx, measurement, opt)
-    Engine->>Index: 7 SeriesIDSet() → 获取匹配的 series
+    Engine->>Index: 7 MeasurementExists → TagSets → (Reverse) → LimitTagSets
     Engine->>Engine: 8 createTagSetIterators (并行)
-    Engine->>Storage: 9 每个 series 构建 point cursor<br/>底层读取 Cache + TSM
+    Engine->>Storage: 9 buildCursor → newFloatAscendingCursor → KeyCursor.ReadFloatBlock（逐点）
     Storage-->>Engine: 10 返回 series iterator
     Engine->>Iterator: 11 每个 series 内 NewCallIterator<br/>mean → FloatMeanReducer
     Engine->>Iterator: 12 NewParallelMergeIterator<br/>合并同一 TagSet 内 series
@@ -100,85 +100,193 @@ type TaskManager struct {
 
 ```go
 // query/compile.go:106 — Compile
-func Compile(stmt *influxql.SelectStatement, opt CompileOptions) (Statement, error) {
-    // 1. 创建编译器并克隆语句 (避免修改原始 AST)
+func Compile(stmt *influxql.SelectStatement, opt CompileOptions) (_ Statement, err error) {
     c := newCompiler(opt)
     c.stmt = stmt.Clone()
-
-    // 2. 预处理: 提取时间范围, 重写条件
-    if err := c.preprocess(c.stmt); err != nil {
+    if err := c.preprocess(c.stmt); err != nil {   // 1. 条件/时间范围/维度/FILL
         return nil, err
     }
-
-    // 3. 编译: 验证字段类型, 构建 IteratorOptions
-    if err := c.compile(c.stmt); err != nil {
+    if err := c.compile(c.stmt); err != nil {      // 2. 字段/类型/子查询
         return nil, err
     }
     c.stmt.TimeAlias = c.TimeFieldName
     c.stmt.Condition = c.Condition
 
-    // 4. 后处理重写
-    c.stmt.RewriteDistinct()       // DISTINCT → 内部调用
-    c.stmt.RewriteTimeFields()     // 从字段列表移除 "time"
-    c.stmt.RewriteRegexConditions() // 重写正则条件以利用索引
+    // 3. recover 兜底: 某些畸形语句会在重写阶段 panic
+    defer func() {
+        if e := recover(); e != nil && err == nil {
+            var ok bool
+            err, ok = e.(error)
+            if !ok {
+                err = fmt.Errorf("panic: %v", e)
+            }
+            err = fmt.Errorf("likely malformed statement, unable to rewrite: %w", err)
+        }
+    }()
 
+    c.stmt.RewriteDistinct()        // DISTINCT → 内部调用
+    c.stmt.RewriteTimeFields()      // 从字段列表移除 "time"
+    c.stmt.RewriteRegexConditions() // 重写正则条件以利用索引
     return c, nil
 }
 ```
 
-**preprocess 做了什么**:
-- 提取 `WHERE time > ... AND time < ...` 中的时间范围
-- 将 `now()` 替换为当前时间
-- 重写正则条件 (`=~`, `!~`)
-- 验证 `FILL` 选项与聚合函数的兼容性
-- 验证 `GROUP BY` 维度
+**`preprocess`（`compile.go:135-183`）只做五件事**:
 
-**compile 做了什么**:
-- 验证所有字段表达式的类型
-- 确定 `Interval.Duration` (从 `GROUP BY time(1m)`)
-- 计算 `ExtraIntervals` (用于 `FILL(linear)` 需要的额外窗口)
-- 重写 `DISTINCT` 为内部实现
-- 验证 `LIMIT`, `OFFSET`, `SLIMIT`, `SOFFSET` 的合法性
+1. `influxql.ConditionExpr(stmt.Condition, &NowValuer{...})`：一次遍历同时拆出
+   条件表达式与 `TimeRange`（`now()` 在这里被替换为固定时间）；
+2. `validateCondition`（`compile.go:1031`）拒绝非法条件；
+3. `compileDimensions`（`compile.go:922`）：校验并规范化 `GROUP BY time/tag`，
+   写回 `stmt.Dimensions`，同时设置 `Interval.Duration/Offset`；
+4. `c.FillOption = stmt.Fill`；
+5. 补默认时间范围：`TimeRange.Min` 为零 → `influxql.MinTime`；`TimeRange.Max`
+   为零时，**聚合查询**（`Interval != 0`）用 `Options.Now`，**raw 查询**用
+   `influxql.MaxTime`。
+
+**`compile`（`compile.go:184-205`）只做三件事**: `compileFields` →
+`validateFields`（`compile.go:994`）→ 遍历 sources 对每个 `*influxql.SubQuery`
+调用 `c.subquery`（子查询的 `OmitTime = true`）。它**不**负责时间范围、FILL 或
+`ExtraIntervals`。
+
+**`ExtraIntervals` 是 warmup 语义**（`compile.go:42-50`）: 为了让
+`derivative` / `difference` / `cumulative_sum` / `moving_average` /
+`exponential_moving_average` 等在第一个输出窗口就有前值，编译期会把映射到 shard
+的时间范围向前（降序时向后）扩展若干窗口：
+
+```go
+// compile.go:1154-1170
+if !c.Interval.IsZero() && c.ExtraIntervals > 0 {
+    newTime := timeRange.Min.Add(time.Duration(-c.ExtraIntervals) * c.Interval.Duration)
+    // 升序: StartTime -= ExtraIntervals * Interval; 降序: EndTime += ExtraIntervals * Interval
+}
+```
+
+各函数对 `ExtraIntervals` 的贡献：`derivative`/`non_negative_derivative` = 1
+（`compile.go:472`）、`elapsed` = 1（`508`）、`difference` = 1（`537`）、
+`moving_average` = 窗口大小 N（`592`）、EMA/DEMA/TEMA/RSI 等 = warmup N（`651`）、
+`chande_momentum_oscillator` = N（`735`）。
 
 #### 步骤 3: Prepare — 构建 IteratorOptions
 
 ```go
-// query/iterator.go:620 — newIteratorOptionsStmt
-func newIteratorOptionsStmt(stmt *influxql.SelectStatement, opt SelectOptions) (IteratorOptions, error) {
-    opt := IteratorOptions{
-        StartTime:  timeRange.Min.UnixNano(),
-        EndTime:    timeRange.Max.UnixNano(),
-        Ascending:  stmt.TimeAscending(),
-        Ordered:    true,  // 顶层迭代器始终有序
+// query/iterator.go:638 — newIteratorOptionsStmt
+func newIteratorOptionsStmt(stmt *influxql.SelectStatement, sopt SelectOptions) (opt IteratorOptions, err error) {
+    valuer := &influxql.NowValuer{Location: stmt.Location}
+    condition, timeRange, err := influxql.ConditionExpr(stmt.Condition, valuer)
+    if err != nil {
+        return IteratorOptions{}, err
     }
 
-    // Interval (GROUP BY time)
-    opt.Interval.Duration, _ = stmt.GroupByInterval()
-    opt.Interval.Offset, _ = stmt.GroupByOffset()
-
-    // Dimensions (GROUP BY tag)
-    opt.Dimensions = stmt.Dimensions
-    opt.GroupBy = stmt.GroupBy
-
-    // Fill
-    opt.Fill = stmt.Fill
-    opt.FillValue = stmt.FillValue
-
-    // LIMIT / OFFSET / SLIMIT / SOFFSET
-    opt.Limit, opt.Offset = stmt.Limit, stmt.Offset
-    opt.SLimit, opt.SOffset = stmt.SLimit, stmt.SOffset
-
-    // Location (时区)
+    // 时间默认值: 缺省 Min → influxql.MinTime, 缺省 Max → influxql.MaxTime
+    if !timeRange.Min.IsZero() {
+        opt.StartTime = timeRange.Min.UnixNano()
+    } else {
+        opt.StartTime = influxql.MinTime
+    }
+    if !timeRange.Max.IsZero() {
+        opt.EndTime = timeRange.Max.UnixNano()
+    } else {
+        opt.EndTime = influxql.MaxTime
+    }
     opt.Location = stmt.Location
 
+    // 负 interval 归零; 只有正 interval 才读取 GROUP BY offset
+    interval, err := stmt.GroupByInterval()
+    if interval < 0 {
+        interval = 0
+    } else if interval > 0 {
+        opt.Interval.Offset, err = stmt.GroupByOffset()
+    }
+    opt.Interval.Duration = interval
+
+    opt.Ordered = true // 顶层 iterator 始终有序
+
+    // Dimensions 与 GroupBy 同时构建: GroupBy 是集合, 供分组判断使用
+    opt.GroupBy = make(map[string]struct{}, len(opt.Dimensions))
+    for _, d := range stmt.Dimensions {
+        if d, ok := d.Expr.(*influxql.VarRef); ok {
+            opt.Dimensions = append(opt.Dimensions, d.Val)
+            opt.GroupBy[d.Val] = struct{}{}
+        }
+    }
+
+    opt.Condition = condition
+    opt.Ascending = stmt.TimeAscending()
+    opt.Dedupe = stmt.Dedupe
+    opt.StripName = stmt.StripName
+    opt.Fill, opt.FillValue = stmt.Fill, stmt.FillValue
+    if opt.Fill == influxql.NullFill && stmt.Target != nil {
+        // 写 target 时 NULL 会被忽略, fill(null) 没有意义 → 降为 NoFill
+        opt.Fill = influxql.NoFill
+    }
+    opt.Limit, opt.Offset = stmt.Limit, stmt.Offset
+    opt.SLimit, opt.SOffset = stmt.SLimit, stmt.SOffset
+    opt.MaxSeriesN = sopt.MaxSeriesN
+    opt.Authorizer = sopt.Authorizer
     return opt, nil
 }
 ```
 
+> **注意**: 函数名里的参数是 `sopt SelectOptions`，不是 `opt`；旧文档
+> `opt := IteratorOptions{...}` 的写法会遮蔽返回值。`StartTime/EndTime` 的默认值
+> 不是 0，而是 `influxql.MinTime` / `influxql.MaxTime`（`iterator.go:640-657`）。
+
+#### 步骤 3b: IteratorOptions — 查询层与存储层的唯一契约
+
+`query/iterator.go:579-636` 的 `IteratorOptions` 是 select.go 与 TSM1 Engine
+之间**唯一**的参数契约（`<T>` 表示 float/integer/unsigned/string/boolean 五套生成代码）。
+
+| 字段 | 生产者 | 消费者 | 默认值 | 不设的后果 |
+|---|---|---|---|---|
+| `Expr` | `buildFieldIterator` | Engine 的 `createCallIterator`/`createVarRefIterator` | nil | 无法判断 Call/VarRef，first/last 快路径失效 |
+| `Aux` | `buildCursor`（valueMapper.refs） | `IteratorScanner` | nil | `SELECT value, host` 丢失 host 列 |
+| `Sources` | `Select` | 仅 RPC 编码（OSS 不再使用） | nil | OSS 无影响 |
+| `Interval` | `newIteratorOptionsStmt` | `Window()`、`IntervalIterator`、`FillIterator` | 零值 | 视为 raw 查询，不切窗口 |
+| `Dimensions` | 同上（`stmt.Dimensions`） | reduce/merge 的 `Tags.Subset` | nil | 不按 tag 分组 |
+| `GroupBy` | 同上（集合） | per-series limit、merge 分组判断 | 空 map | `len(Dimensions) != len(GroupBy)` 判断失真 |
+| `Location` | `stmt.Location` | `Window()` 的时区修正 | nil | 按 UTC 切窗 |
+| `Fill` / `FillValue` | `newIteratorOptionsStmt` | `FillIterator` | NoFill / nil | 空窗口不填充 |
+| `Condition` | `preprocess` → `opt.Condition` | `filterIterator`、索引 | nil | 不过滤 |
+| `StartTime` / `EndTime` | `ConditionExpr` 或默认 | `SeekTime`/`StopTime`/`Window` | MinTime/MaxTime | 全时间范围扫描 |
+| `Ascending` | `stmt.TimeAscending()` | 所有 iterator 的方向 | false | 默认降序，与预期相反 |
+| `Limit` / `Offset` | `stmt` | `newLimitIterator` | 0 | 不限制 |
+| `SLimit` / `SOffset` | `stmt` | `LimitTagSets` | 0 | 不限制 series |
+| `StripName` / `Dedupe` | `stmt` | emitter / DedupeIterator | false | 保留 measurement 名 / 不去重 |
+| `Ordered` | 恒 true（顶层） | `MergeSorted()`、reduce | false | 归并走无序路径 |
+| `MaxSeriesN` | `sopt` | `createSeriesIterator` | 0 | 不限制 series 数 |
+| `InterruptCh` | `sopt` | `InterruptIterator` | nil | 无法中断 |
+| `Authorizer` | `sopt` | `createSeriesIterator` 等 | nil | 不做权限过滤 |
+
+**三个时间函数**（`iterator.go:784-888`）:
+
+- `SeekTime()`：升序返回 `StartTime`，降序返回 `EndTime`（`iterator.go:790-797`）；
+- `StopTime()`：升序返回 `EndTime`，降序返回 `StartTime`（`iterator.go:801-808`）；
+- `Window(t)`：`Interval` 为零 → `[StartTime, EndTime+1)`（右开是为了包含
+  `EndTime`）；否则先 `t -= Offset`、按 `Location` 求 zone、对负模做
+  `dt += Duration` 修正、用 `influxql.MinTime/MaxTime` 夹取，再在 start/end
+  两处做 DST 二次 zone 修正（`iterator.go:811-888`）。
+
+**数值例**: `StartTime=10:00, EndTime=12:00, Ascending=false` →
+`SeekTime()=12:00`、`StopTime()=10:00`。这正好解释了 08 号文档里
+`reset(seek, end)` 的实参顺序，以及"降序裁掉 `< StartTime`"的边界
+（`end` 参数就是 `StopTime()`）。
+
+**DST 例**: `Interval=1h, Offset=30m, Location=Asia/Shanghai` 跨夏令时切换日时，
+`t` 与 `start` 可能落在不同的 zone offset 上；源码在算出 `start` 后用
+`opt.Zone(start)` 再查一次，仅当偏移差 `< Interval.Duration` 时才修正，避免产生
+倒流窗口（`iterator.go:842-853`）。
+
+**`MergeSorted() == Ordered`**（`iterator.go:784-786`）: raw 查询走
+`SortedMergeIterator`，聚合查询走 `MergeIterator`。
+
+**`Dimensions` vs `GroupBy`**: 三处判断依据——子查询（`newIteratorOptionsSubstatement`）、
+per-series limit（`engine.go:3050-3056`）、merge 分组（`createCallIterator` 的
+`len(opt.Dimensions)==0` 快路径）。
+
 #### 步骤 4: buildCursor — 构建查询游标
 
 ```go
-// query/select.go:623 — buildCursor
+// query/select.go:622 — buildCursor
 func buildCursor(ctx context.Context, stmt *influxql.SelectStatement, ic IteratorCreator, opt IteratorOptions) (Cursor, error) {
     // 0. Tracing: 如果有 span，记录 build_cursor 调用
     span := tracing.SpanFromContext(ctx)
@@ -427,7 +535,7 @@ func (b *exprIteratorBuilder) buildCallIterator(ctx context.Context, expr *influ
 #### 步骤 5b: callIterator — 构建聚合迭代器
 
 ```go
-// query/select.go:577 — callIterator
+// query/select.go:579 — callIterator
 func (b *exprIteratorBuilder) callIterator(ctx context.Context, expr *influxql.Call, opt IteratorOptions) (Iterator, error) {
     inputs := make([]Iterator, 0, len(b.sources))
     if err := func() error {
@@ -478,11 +586,17 @@ func (b *exprIteratorBuilder) callIterator(ctx context.Context, expr *influxql.C
 源会在 `callIterator` 内通过 `buildExprIterator` 构建子查询输入，然后显式调用
 `NewCallIterator(input, opt)` 包装。任一构建步骤失败时，源码会调用
 `Iterators(inputs).Close()` 清理已创建输入；`Iterators(inputs).Merge(opt)` 失败时也会关闭 inputs。
-count() 在多 shard 合并时改用 sum() 的逻辑仍在 `Iterators.Merge()` 中。普通 measurement
-聚合的 `NewCallIterator` 不在 select.go 外层直接包 `ArrayCursor`，而是在 TSM1
-`Engine.createCallIterator` 中对每个 series iterator 先包一层 `CallIterator`，再用
-`NewParallelMergeIterator` 合并同一 TagSet；select.go 外层主要负责 source/shard merge、
-Interval、Fill、Limit。详见第 4.1 节。
+count() 在多 shard 合并时改用 sum() 的逻辑仍在 `Iterators.Merge()` 中
+（`iterator.go:145-164`，`count` → `sum`、`sum_hll` → `merge_hll`）。层级关系是：
+
+1. TSM1 `Engine.createCallIterator` 对每个 series iterator 先包一层 `NewCallIterator`
+   （`engine.go:2985`），再用 `NewParallelMergeIterator` 合并同一 TagSet——这是**第一级聚合**；
+2. `select.go` 的 `Iterators(inputs).Merge(opt)`（`select.go:612`）在最外层再包一级
+   `NewCallIterator`（`iterator.go:162`）做跨 source/shard 的**二次聚合**
+   （count→sum；mean 按 `Aggregated` 加权求和后再除以总点数，等价全局 mean），然后才接 Interval、Fill、Limit。
+
+所以 select.go 外层确实会包 `CallIterator`，但宾语不是 `ArrayCursor`（`ArrayCursor` 只属于
+storage/reads 路径，见 §1.2 末与 §1.3）。详见第 4.1 节。
 
 #### 步骤 5c: 后处理 — IntervalIterator + FillIterator
 
@@ -549,62 +663,155 @@ sequenceDiagram
     Emitter-->>Client: 查询结果
 ```
 
-#### Storage Reads ArrayCursor 合并 Cache + TSM 数据 — 序列图
+#### 两条读取路径：InfluxQL 逐点 cursor vs storage/reads 批量 Array Cursor
 
-这一节描述的是 TSM1 / storage reads 的 typed array cursor 底层读取方式，不是
-InfluxQL `Engine.CreateIterator` 的外层 point iterator 结构。InfluxQL 会先构建
-`query.Iterator`，需要读取某个 series/field 时才进入这里的 `arrayCursorIterator`
-和 `KeyCursor`。
+这两条路径**互不经过对方**，唯一共享的 **cursor 组件**是 `KeyCursor`（此外两条路径都读 `Cache.Values`，也共用 `FileStore` 的 locations / tombstone 辅助函数）。`arrayCursorIterator`
+**只服务 storage/reads（Flux）**，InfluxQL 的 `query` 包从不调用
+`Engine.CreateCursorIterator`。
+
+| 维度 | InfluxQL（模块 3） | storage/reads（Flux，模块 8/9） |
+|---|---|---|
+| 入口 | `Engine.CreateIterator` → `createVarRefIterator` / `createCallIterator` → `Engine.buildCursor` | `Engine.CreateCursorIterator` → `arrayCursorIterator.Next` |
+| 逐 series 构造 | `buildFloatCursor` → `newFloatCursor` → `newFloatAscendingCursor` | `buildFloatArrayCursor` → `newFloatArrayAscendingCursor()` + `reset(...)` |
+| 读 block | `KeyCursor.ReadFloatBlock`（逐点） | `KeyCursor.ReadFloatArrayBlock`（批量） |
+| 每次返回 | 1 个 point | 最多 1000 点（`DefaultMaxPointsPerBlock`） |
+| 消费者 | `query.Iterator` 链 | `storage/reads` → Flux Table |
 
 ```mermaid
-sequenceDiagram
-    participant Engine as TSM1 Engine
-    participant KC as KeyCursor
-    participant Cache as Cache (内存)
-    participant TSM as TSM File (磁盘)
-    participant AEC as ArrayAscendingCursor
-    participant Merged as Merged ArrayCursor
-
-    Engine->>KC: newKeyCursor(key, tsmFiles, ascending)
-    KC->>KC: 读取 TSM Index (内存 mmap)<br>确定每个文件的 block 位置
-
-    Note over KC: 构建 cursor 叠加顺序:<br>1. Cache (最新数据)<br>2. TSM files (按时间倒序, 新→旧)
-
-    KC->>Cache: ① cache.Values(key)
-    Cache->>Cache: 读取 live cache entry
-    Cache->>Cache: 如果存在 snapshot<br/>同时读取 snapshot cache entry
-    Cache->>Cache: snapshot + live 合并后 Deduplicate
-    Cache-->>KC: []Value{t1:10, t2:20, t3:30}
-
-    KC->>TSM: ② 读取 TSM block (mmap)
-    TSM-->>KC: []Value{t0:5, t1:8, t2:15}
-
-    Note over KC: 创建 Cursor 链:<br>Cache cursor 在最上层<br>TSM cursor 在下层
-
-    KC->>AEC: newFloatArrayAscendingCursor(cacheValues)
-    KC->>AEC: newFloatArrayAscendingCursor(tsmValues)
-
-    Note over Merged: 合并策略: Cache 覆盖 TSM<br>相同时间戳取 Cache 中的值
-
-    Merged->>Cache: ③ Next() → [t0:5] (TSM)
-    Note over Merged: Cache 没有 t0, 从 TSM 读取
-
-    Merged->>Cache: ④ Next() → [t1:10] (Cache 覆盖)
-    Note over Merged: Cache 和 TSM 都有 t1<br>Cache 优先 (更新的数据)
-
-    Merged->>Cache: ⑤ Next() → [t2:20] (Cache 覆盖)
-    Merged->>Cache: ⑥ Next() → [t3:30] (仅 Cache)
-
-    Merged-->>Engine: 批量返回 (每次最多 1000 个值)
-    Note over Engine: ArrayCursor 批量读取减少<br>函数调用开销, 提升吞吐
+flowchart TD
+    subgraph "InfluxQL 路径（query 包）"
+        Q1["Engine.CreateIterator<br/>engine.go:2811"] --> Q2["createVarRefIterator / createCallIterator<br/>engine.go:3006 / 2903"]
+        Q2 --> Q3["Engine.buildCursor<br/>engine.go:3372"]
+        Q3 --> Q4["buildFloatCursor → newFloatCursor<br/>engine.gen.go:16 / iterator.gen.go:368"]
+        Q4 --> Q5["newFloatAscendingCursor<br/>iterator.gen.go:388"]
+        Q5 --> Q6["KeyCursor.ReadFloatBlock<br/>file_store.gen.go:10"]
+        Q6 --> Q7["query.Iterator 链（逐点）"]
+    end
+    subgraph "storage/reads 路径（Flux）"
+        R1["Engine.CreateCursorIterator<br/>engine_cursor.go:9"] --> R2["arrayCursorIterator.Next<br/>array_cursor_iterator.go:39"]
+        R2 --> R3["buildFloatArrayCursor<br/>array_cursor_iterator.gen.go:18"]
+        R3 --> R4["newFloatArrayAscendingCursor()<br/>+ reset(seek, stop, cacheValues, keyCursor)"]
+        R4 --> R5["KeyCursor.ReadFloatArrayBlock<br/>file_store_array.gen.go:12"]
+        R5 --> R6["*FloatArray（最多 1000 点）"]
+    end
+    C[("Cache")]
+    K[("KeyCursor")]
+    Q4 -. "Cache.Values(key) / Engine.KeyCursor" .-> C
+    Q4 -. "持有" .-> K
+    R3 -. "Cache.Values(key) / Engine.KeyCursor" .-> C
+    R3 -. "持有" .-> K
 ```
 
 **关键设计点**:
-- Cache 始终在 TSM 之上，相同时间戳取 Cache 的值（Cache 是最新未持久化的写入）
-- `Cache.Values` 会同时读取 snapshot cache 和 live cache；snapshot 写 TSM 期间，新写入进入 live cache，查询需要同时看到两边
-- TSM 文件按时间倒序叠加，最新的文件在最上层（compaction 可能产生重叠）
-- ArrayCursor 每次批量返回最多 1000 个值，减少 per-point 函数调用开销
-- 所有底层数据通过 mmap 访问，OS page cache 负责热数据缓存
+- Cache 在 cursor **内部**（`c.cache.values`），`KeyCursor` 完全不持有 Cache；
+  `Next()` 只读 cursor 自有的 `c.cache.values` / `c.tsm.values`，不会在 `Next()` 中回访 Cache。
+- TSM 候选 block 的顺序由 `ascLocations`（MinTime 升序）或 `descLocations`
+  （MaxTime 升序，重叠时按 path 稳定排序）决定，不是「文件按时间倒序」。
+- 每次 `Read*Block` 会先 `Exclude(readMin, readMax)` 去掉已读区间、按
+  `TombstoneRange` 剔除删除点，再把时间窗口重叠的后续 block `Include`+`Merge`
+  （详见 16 号文档 §3.8/§3.9）。
+- InfluxQL 每次只前进一个点（`peekCache`/`peekTSM` 双指针，时间戳相同 Cache 优先）；
+  storage/reads 一次最多返回 1000 点。
+
+### 1.3 存储侧 iterator 树与 InfluxQL 逐点 cursor
+
+§1.2 的 `buildCursor` 只是查询层的入口；真正把 `SELECT` 变成数据流的是
+TSM1 `Engine.CreateIterator` 向下构建的存储侧 iterator 树。它与 storage/reads
+的 array cursor 是**两套并行实现**。
+
+```mermaid
+flowchart TD
+    A["preparedStatement.Select<br/>select.go"] --> B["buildCursor<br/>select.go:623"]
+    B --> C["buildAuxIterator / buildFieldIterator<br/>select.go:778/851"]
+    C --> D["buildExprIterator<br/>select.go"]
+    D --> E["callIterator / buildVarRefIterator<br/>select.go:579/170"]
+    E --> F["IteratorCreator.CreateIterator<br/>tsdb/shard.go:895"]
+    F --> G["Engine.CreateIterator<br/>engine.go:2811"]
+    G -->|"first/last + Interval.IsZero()"| H["createVarRefIterator(refOpt)<br/>Limit=1 / Ascending=(name==first)"]
+    G -->|"Call"| I["createCallIterator<br/>engine.go:2903"]
+    G -->|"VarRef"| J["createVarRefIterator<br/>engine.go:3006"]
+    I --> K["createTagSetIterators → createTagSetGroupIterators → createVarRefSeriesIterator<br/>engine.go:3093 / 3159 / 3195"]
+    J --> L["MeasurementExists → TagSets<br/>Reverse → LimitTagSets"]
+    L --> M["createTagSetIterators<br/>engine.go:3093"]
+    M --> N["buildCursor → buildFloatCursor<br/>engine.go:3372 / engine.gen.go:16"]
+    N --> O["newFloatAscendingCursor<br/>iterator.gen.go:388"]
+    O --> P["KeyCursor.ReadFloatBlock<br/>file_store.gen.go:10"]
+    K --> N
+    I --> Q["NewCallIterator per series<br/>+ ParallelMergeIterator(GOMAXPROCS)"]
+```
+
+**1. `Engine.CreateIterator` 的三条分叉**（`engine.go:2811-2850`）:
+
+- `opt.Expr` 是 `*influxql.Call` 且 `opt.Interval.IsZero()` 且函数名为 `first`/`last` 时，
+  构造 `refOpt`：`Limit=1`、`Ascending = (call.Name == "first")`、`Ordered=true`、
+  `Expr=call.Args[0]`，然后走 `createVarRefIterator`。这就是 `first`/`last` 只读 1 个点的原因。
+- 其他 Call 走 `createCallIterator`；`inputs` 为空时返回 `nil, nil`。
+- VarRef 直接走 `createVarRefIterator`。
+- 两条路径最后都包 `newMergeFinalizerIterator`，由 finalizer 在 GC 时兜底 `Close()`。
+
+**2. `createCallIterator`**（`engine.go:2903-3004`）: 先 `MeasurementExists`(2906)；
+TSI 索引下若命中 `createSeriesIterator` 快路径（被聚合的字段必须是内部字段 `_seriesKey`，
+且 `count`/`sum_hll`、`len(opt.Aux)==0`、无 Dimensions、`SLimit==SOffset==0`、`!StripName`、
+`Ordered=false` 时），直接返回 `NewCallIterator(seriesIterator, opt)`(2925)。
+否则取 `TagSets`(2941/2944) → 降序 `Reverse`(2954) → `LimitTagSets`(2959)；
+对每个 TagSet：先 `select <-opt.InterruptCh`(2966-2972) 检查一次，
+`createTagSetIterators`(2972) 后对每个 series 包 `NewCallIterator`(2985)，
+再用 `NewParallelMergeIterator(inputs, opt, GOMAXPROCS(0))`(2993) 合并同一 TagSet。
+
+**3. `createVarRefIterator`**（`engine.go:3006-3085`）: `MeasurementExists`(3009) →
+`TagSets`(3021/3024) → 降序 `TagSet.Reverse`(3034) → `LimitTagSets`(3039) →
+`createTagSetIterators`(3043) → per-series limit（`Dimensions != GroupBy` 时用
+`newLimitIterator`，3050-3056）→ `Iterators.Merge`(3059) → 分组 limit
+（`newLimitIterator` vs `query.NewLimitIterator`，3062-3073）。
+
+**4. 逐点 cursor 的结构与读取**（`tsdb/engine/tsm1/iterator.gen.go`）:
+
+```go
+// iterator.gen.go:375 — floatAscendingCursor
+type floatAscendingCursor struct {
+    cache struct {
+        values Values   // Cache.Values(key)，接口切片 []Value
+        pos    int
+    }
+    tsm struct {
+        values    []FloatValue  // ReadFloatBlock 解码出的逐点切片
+        pos       int
+        keyCursor *KeyCursor
+    }
+}
+```
+
+- `peekCache()`（406-414）与 `peekTSM()`（416-440）分别返回两个数据源当前位置的时间戳/值；
+- `nextFloat()`（442-476）双指针推进：`ckey == tkey` 时 **Cache 优先**并同时前进两个指针，
+  `ckey < tkey` 取 Cache，否则取 TSM；
+- `nextTSM()`（478 起）调用 `KeyCursor.Next()` + `ReadFloatBlock`（`file_store.gen.go:10`），
+  把 TSM 数据补齐到 `c.tsm.values`。
+
+**5. `ReadFloatBlock` vs `ReadFloatArrayBlock`**:
+
+| 维度 | `ReadFloatBlock`（InfluxQL） | `ReadFloatArrayBlock`（storage/reads） |
+|---|---|---|
+| 实现文件 | `file_store.gen.go:10` | `file_store_array.gen.go:12` |
+| 返回 | `[]FloatValue`（逐点接口切片） | `*tsdb.FloatArray`（时间戳/值两个并行数组） |
+| 重叠处理 | `Exclude`/`TombstoneRange`/`Include`/`Merge`，逻辑相同 | 同左 |
+| 消费方式 | `peekTSM`/`nextFloat` 每次取 1 点 | 数组游标双指针批量归并 |
+
+两者都以 `c.current[0]` 为首块，都对 tombstone 和已读区间做同样处理；差别只在
+结果的表示与消费粒度。
+
+**6. 案例**: 2 个 series（`host=web01`、`host=web02`）落在 1 个 shard 上，查询
+`SELECT mean(value) FROM cpu GROUP BY time(1m)`。每个 series 的
+`KeyCursor.ReadFloatBlock` 逐点读出原始值，`NewCallIterator`（`FloatMeanReducer`）
+把整段数据压成 `(windowStart, mean, Aggregated=n)`；同一 TagSet 的 2 个 series 由
+`NewParallelMergeIterator` 并行归并；select.go 外层再做一次 `CallIterator` 聚合
+（按 `Aggregated` 加权求和后再除，等价全局 mean），最后 `IntervalIterator` 对齐窗口。若查询是
+`SELECT first(value) ...`，`Engine.CreateIterator` 直接 `Limit=1`，每个 series 只读 1 点。
+
+**7. 并发与生命周期**: Engine 侧 goroutine 数约为 `min(GOMAXPROCS, series 数)`
+（`NewParallelMergeIterator`）；`InterruptCh` 在 `createCallIterator` 中每个 TagSet
+检查一次；`newMergeFinalizerIterator` 用 `runtime.SetFinalizer`
+（`tsdb/engine/tsm1/iterator.gen.go:131-160`）兜底关闭，正常情况下仍由
+`Iterators.Close()` 显式释放（见 §4.5）。
 
 ## 2. 聚合算子详解
 
@@ -658,12 +865,13 @@ flowchart TD
     B --> B2["first, last"]
     B --> B3["cumulative_sum"]
     B --> B4["sample (蓄水池抽样)"]
+    B --> B5["integral (stream 载体 + 内建窗口)"]
 
     C --> C1["mean, median, mode"]
     C --> C2["stddev, spread"]
     C --> C3["percentile, distinct"]
     C --> C4["top, bottom"]
-    C --> C5["integral, holt_winters"]
+    C --> C5["holt_winters"]
 
     D --> D1["first, last"]
     D --> D2["top, bottom, percentile, sample"]
@@ -697,7 +905,7 @@ type FloatPointEmitter interface {
 ### 2.3 流式聚合 — FloatFuncReducer
 
 ```go
-// query/functions.gen.go:48 — FloatFuncReducer
+// query/functions.gen.go:39 — FloatFuncReducer
 type FloatFuncReducer struct {
     prev *FloatPoint
     fn   FloatReduceFunc  // func(prev, curr *FloatPoint) (int64, float64, []interface{})
@@ -731,7 +939,7 @@ func (r *FloatFuncReducer) Emit() []FloatPoint {
 ### 2.4 窗口聚合 — FloatSliceFuncReducer
 
 ```go
-// query/functions.gen.go:85 — FloatSliceFuncReducer
+// query/functions.gen.go:76 — FloatSliceFuncReducer
 type FloatSliceFuncReducer struct {
     points []FloatPoint
     fn     FloatReduceSliceFunc  // func(a []FloatPoint) []FloatPoint
@@ -759,7 +967,7 @@ func (r *FloatSliceFuncReducer) Emit() []FloatPoint {
 > 然后把结果**相加**（sum=8）。这就是为什么 count 在多 Shard 合并时用 sum。
 
 ```go
-// query/call_iterator.go:102 — FloatCountReduce
+// query/call_iterator.go:106 — FloatCountReduce
 func FloatCountReduce(prev *IntegerPoint, curr *FloatPoint) (int64, int64, []interface{}) {
     if prev == nil {
         return ZeroTime, 1, nil  // 第一个点: count = 1
@@ -797,7 +1005,11 @@ sequenceDiagram
     Call-->>Client: IntegerPoint{Value: 8}
 ```
 
-**为什么 count 改用 sum？** 每个 shard 已经独立执行了 count，得到的是部分计数。最终结果需要将所有部分计数相加，这就是 sum 的语义。代码在 `query/iterator.go:140`：
+**count(distinct(x))** 走的是另一条路：`select.go:500-513` 先为
+`distinct(x)` 构建 `buildExprIterator`，再对它调用 `newCountIterator`。即
+distinct 负责去重产点，count 只数这些点；多 shard 合并时仍按 count→sum 汇总。
+
+**为什么 count 改用 sum？** 每个 shard 已经独立执行了 count，得到的是部分计数。最终结果需要将所有部分计数相加，这就是 sum 的语义。代码在 `query/iterator.go:146`：
 
 ```go
 if call.Name == "count" {
@@ -808,7 +1020,7 @@ if call.Name == "count" {
 #### SUM — 求和
 
 ```go
-// query/call_iterator.go:296 — FloatSumReduce
+// query/call_iterator.go:300 — FloatSumReduce
 func FloatSumReduce(prev, curr *FloatPoint) (int64, float64, []interface{}) {
     if prev == nil {
         return ZeroTime, curr.Value, nil  // 第一个点: sum = value
@@ -826,7 +1038,7 @@ flowchart LR
 #### MIN / MAX — 最小值 / 最大值
 
 ```go
-// query/call_iterator.go:174 — FloatMinReduce
+// query/call_iterator.go:178 — FloatMinReduce
 func FloatMinReduce(prev, curr *FloatPoint) (int64, float64, []interface{}) {
     if prev == nil || curr.Value < prev.Value ||
        (curr.Value == prev.Value && curr.Time < prev.Time) {
@@ -835,7 +1047,7 @@ func FloatMinReduce(prev, curr *FloatPoint) (int64, float64, []interface{}) {
     return prev.Time, prev.Value, prev.Aux
 }
 
-// query/call_iterator.go:238 — FloatMaxReduce
+// query/call_iterator.go:242 — FloatMaxReduce
 func FloatMaxReduce(prev, curr *FloatPoint) (int64, float64, []interface{}) {
     if prev == nil || curr.Value > prev.Value ||
        (curr.Value == prev.Value && curr.Time < prev.Time) {
@@ -857,7 +1069,7 @@ flowchart LR
 #### FIRST / LAST — 最早 / 最晚
 
 ```go
-// query/call_iterator.go:358 — FloatFirstReduce
+// query/call_iterator.go:362 — FloatFirstReduce
 func FloatFirstReduce(prev, curr *FloatPoint) (int64, float64, []interface{}) {
     if prev == nil || curr.Time < prev.Time ||
        (curr.Time == prev.Time && curr.Value > prev.Value) {
@@ -866,7 +1078,7 @@ func FloatFirstReduce(prev, curr *FloatPoint) (int64, float64, []interface{}) {
     return prev.Time, prev.Value, prev.Aux
 }
 
-// query/call_iterator.go:436 — FloatLastReduce
+// query/call_iterator.go:440 — FloatLastReduce
 func FloatLastReduce(prev, curr *FloatPoint) (int64, float64, []interface{}) {
     if prev == nil || curr.Time > prev.Time ||
        (curr.Time == prev.Time && curr.Value > prev.Value) {
@@ -889,7 +1101,7 @@ func FloatLastReduce(prev, curr *FloatPoint) (int64, float64, []interface{}) {
 > 就像两个班的平均分：一班平均 80 分 30 人，二班平均 90 分 20 人，总平均 = (80×30 + 90×20) / 50 = 84。
 
 ```go
-// query/functions.go:98 — FloatMeanReducer
+// query/functions.go:104 — FloatMeanReducer
 type FloatMeanReducer struct {
     sum   float64
     count uint32
@@ -938,10 +1150,24 @@ sequenceDiagram
     Mean-->>Client: mean = 37/8 = 4.625
 ```
 
+#### MEDIAN — 中位数
+
+`newMedianIterator`（`call_iterator.go:549-575`）用 `SliceFuncReducer`：
+对窗口内所有点按值排序；奇数个取正中间，偶数个取中间两个的均值
+（`FloatMedianReduceSlice`）。它需要缓冲整个窗口（O(N) 内存），并把结果时间设为
+`ZeroTime`（由 reduce 回填窗口起点）。
+
+#### MODE — 众数
+
+`newModeIterator`（`call_iterator.go:629-655`）同样用 `SliceFuncReducer`：
+统计窗口内出现次数最多的值；**并列时取最小的值**（源码按值排序后扫描，先出现的
+最小值获胜）。结果时间同样是 `ZeroTime`，支持 float/integer/unsigned/string/boolean
+五种类型。
+
 #### STDDEV — 标准差
 
 ```go
-// query/call_iterator.go:849 — FloatStddevReduceSlice
+// query/call_iterator.go:853 — FloatStddevReduceSlice
 func FloatStddevReduceSlice(a []FloatPoint) []FloatPoint {
     if len(a) < 2 {
         return []FloatPoint{{Time: ZeroTime, Value: math.NaN()}}
@@ -976,15 +1202,15 @@ func FloatStddevReduceSlice(a []FloatPoint) []FloatPoint {
 ```mermaid
 flowchart LR
     A["输入: [2, 4, 4, 4, 5, 5, 7, 9]"] --> B["第一遍: mean = 5.0"]
-    B --> C["第二遍: variance = 4.0"]
-    C --> D["stddev = sqrt(4.0/7) = 0.756"]
-    D --> E["输出: FloatPoint{Value: 0.756}"]
+    B --> C["第二遍: 平方偏差和 = 9+1+1+1+0+0+4+16 = 32"]
+    C --> D["样本方差 = 32 / (8-1) = 4.571"]
+    D --> E["样本标准差 = sqrt(32/7) ≈ 2.138"]
 ```
 
 #### PERCENTILE — 百分位数
 
 ```go
-// query/call_iterator.go:1050 — NewFloatPercentileReduceSliceFunc
+// query/call_iterator.go:1054 — NewFloatPercentileReduceSliceFunc
 func NewFloatPercentileReduceSliceFunc(percentile float64) FloatReduceSliceFunc {
     return func(a []FloatPoint) []FloatPoint {
         length := len(a)
@@ -1019,7 +1245,7 @@ flowchart LR
 #### SPREAD — 极差
 
 ```go
-// query/functions.go:190 — FloatSpreadReducer
+// query/functions.go:196 — FloatSpreadReducer
 type FloatSpreadReducer struct {
     min, max float64
     count    uint32
@@ -1045,7 +1271,7 @@ func (r *FloatSpreadReducer) Emit() []FloatPoint {
 #### DISTINCT — 去重
 
 ```go
-// query/functions.gen.go:399 — FloatDistinctReducer
+// query/functions.gen.go:412 — FloatDistinctReducer
 type FloatDistinctReducer struct {
     m map[float64]FloatPoint  // 用 map 去重
 }
@@ -1071,7 +1297,7 @@ func (r *FloatDistinctReducer) Emit() []FloatPoint {
 #### TOP / BOTTOM — 前 N / 后 N
 
 ```go
-// query/functions.go:1878 — FloatTopReducer
+// query/functions.go:1884 — FloatTopReducer
 type FloatTopReducer struct {
     h *floatPointsByFunc  // 最小堆
 }
@@ -1121,19 +1347,21 @@ func (r *FloatTopReducer) Emit() []FloatPoint {
 ```mermaid
 flowchart TD
     A["输入: [3, 7, 1, 9, 4, 6, 2, 8], N=3"] --> B["堆操作"]
-    B --> C["加入 3: [3]"]
-    C --> D["加入 7: [3, 7]"]
-    D --> E["加入 1: [1, 7, 3]"]
-    E --> F["加入 9: 替换堆顶1 → [3, 7, 9]"]
-    F --> G["加入 4: 不替换 (4比3大=false)"]
-    G --> H["加入 6: 替换堆顶3 → [6, 7, 9]"]
-    H --> I["最终: [9, 7, 6] (降序)"]
+    B --> C["① 加入 3: 堆 [3]"]
+    C --> D["② 加入 7: 堆 [3, 7]"]
+    D --> E["③ 加入 1: 堆 [1, 7, 3]"]
+    E --> F["④ 加入 9: 1<9 替换堆顶 → [3, 7, 9]"]
+    F --> G["⑤ 加入 4: 3<4 替换堆顶 → [4, 7, 9]"]
+    G --> H["⑥ 加入 6: 4<6 替换堆顶 → [6, 7, 9]"]
+    H --> I["⑦ 加入 2: 6<2 为假, 不替换"]
+    I --> J["⑧ 加入 8: 6<8 替换堆顶 → 堆 [7, 8, 9]"]
+    J --> K["Emit 降序: [9, 8, 7]"]
 ```
 
 #### SAMPLE — 蓄水池抽样
 
 ```go
-// query/functions.gen.go:453 — FloatSampleReducer
+// query/functions.gen.go:472 — FloatSampleReducer
 type FloatSampleReducer struct {
     count  int
     rng    *rand.Rand
@@ -1160,7 +1388,7 @@ func (r *FloatSampleReducer) AggregateFloat(p *FloatPoint) {
 #### DERIVATIVE — 导数
 
 ```go
-// query/functions.go:277 — FloatDerivativeReducer
+// query/functions.go:283 — FloatDerivativeReducer
 type FloatDerivativeReducer struct {
     interval      Interval
     prev          FloatPoint
@@ -1230,7 +1458,7 @@ flowchart LR
 #### DIFFERENCE — 差分
 
 ```go
-// query/functions.go:454 — FloatDifferenceReducer
+// query/functions.go:460 — FloatDifferenceReducer
 type FloatDifferenceReducer struct {
     isNonNegative bool
     prev          FloatPoint
@@ -1255,7 +1483,7 @@ func (r *FloatDifferenceReducer) Emit() []FloatPoint {
 #### MOVING_AVERAGE — 移动平均
 
 ```go
-// query/functions.go:603 — FloatMovingAverageReducer
+// query/functions.go:609 — FloatMovingAverageReducer
 type FloatMovingAverageReducer struct {
     pos  int       // 环形缓冲区当前位置
     sum  float64   // 当前窗口的和
@@ -1307,7 +1535,7 @@ flowchart TD
 #### CUMULATIVE_SUM — 累积和
 
 ```go
-// query/functions.go:1129 — FloatCumulativeSumReducer
+// query/functions.go:1136 — FloatCumulativeSumReducer
 type FloatCumulativeSumReducer struct {
     curr FloatPoint
 }
@@ -1331,7 +1559,7 @@ func (r *FloatCumulativeSumReducer) Emit() []FloatPoint {
 #### ELAPSED — 时间间隔
 
 ```go
-// query/functions.gen.go:420 — FloatElapsedReducer
+// query/functions.gen.go:439 — FloatElapsedReducer
 type FloatElapsedReducer struct {
     unitConversion int64
     prev           FloatPoint
@@ -1352,7 +1580,7 @@ func (r *FloatElapsedReducer) Emit() []IntegerPoint {
 #### HOLT_WINTERS — Holt-Winters 预测
 
 ```go
-// query/functions.go:1207 — FloatHoltWintersReducer
+// query/functions.go:1217 — FloatHoltWintersReducer
 type FloatHoltWintersReducer struct {
     m              int       // 季节周期
     seasonal       bool      // 是否季节性
@@ -1376,7 +1604,7 @@ type FloatHoltWintersReducer struct {
 #### EMA / DEMA / TEMA — 指数移动平均
 
 ```go
-// query/functions.go:743 — ExponentialMovingAverageReducer
+// query/functions.go:749 — ExponentialMovingAverageReducer
 type ExponentialMovingAverageReducer struct {
     ema        gota.EMA  // EMA 计算器
     holdPeriod uint32    // 预热期
@@ -1417,7 +1645,7 @@ func (r *ExponentialMovingAverageReducer) Emit() []FloatPoint {
 #### INTEGRAL — 积分
 
 ```go
-// query/functions.go:1557 — FloatIntegralReducer
+// query/functions.go:1563 — FloatIntegralReducer
 type FloatIntegralReducer struct {
     interval Interval        // 时间间隔
     sum      float64         // 累积积分值
@@ -1443,12 +1671,44 @@ func NewFloatIntegralReducer(interval Interval, opt IteratorOptions) *FloatInteg
 // 因为积分可能产生多个输出点 (每个窗口一个)。
 ```
 
-**积分算法**: 梯形法则 (Trapezoidal Rule)。对于相邻两点 (t1, v1) 和 (t2, v2)，积分贡献为 `(v1 + v2) / 2 * (t2 - t1)`。
+**积分算法**: 梯形法则 (Trapezoidal Rule)，并按 `interval.Duration` 归一化。
+对于相邻两点 (t1, v1) 和 (t2, v2)：
+
+```
+elapsed = (t2 - t1) / interval.Duration
+sum    += 0.5 * (v1 + v2) * elapsed
+```
+
+`interval` 来自 `IteratorOptions.IntegralInterval()`（`iterator.go:915-922`）：
+优先取 `integral(value, <duration>)` 的第二参数，否则固定为 **1s**
+（注意它不继承 `GROUP BY time()` 的 interval）。`FloatIntegralReducer` 是
+**stream 载体**（`call_iterator.go:1512-1519` 的 `newFloatStreamFloatIterator`），
+内部自行按 `opt.Window` 切窗，并在 `Close()`（`functions.go:1655-1663`）刷出最后
+一个窗口。
+
+#### 默认 interval 与 warmup 扩展量
+
+部分函数在用户没给 interval 时有默认值，编译期还会据此扩展读取范围：
+
+| 函数 | interval 来源 | 默认值 | 额外读取（ExtraIntervals） |
+|---|---|---|---|
+| `derivative` / `non_negative_derivative` | 第 2 参数 → `GROUP BY` interval → 1s | 1s | 1 个窗口（`compile.go:472`） |
+| `elapsed` | 第 2 参数 | 1ns（`iterator.go:906-912`） | 1 个窗口（`compile.go:508`） |
+| `difference` / `non_negative_difference` | `GROUP BY` interval | — | 1 个窗口（`compile.go:537`） |
+| `cumulative_sum` | `GROUP BY` interval | — | 1 个窗口（`compile.go:556-563`） |
+| `moving_average` | 第 2 参数（窗口大小 N） | — | N 个窗口（`compile.go:592`） |
+| `integral` | 第 2 参数 | 1s（`iterator.go:915-922`） | — |
+| EMA/DEMA/TEMA/RSI | 第 2 参数（warmup N） | — | N 个窗口（`compile.go:651`） |
+| `chande_momentum_oscillator` | 第 2 参数 | — | N 个窗口（`compile.go:735`） |
+
+`ExtraIntervals` 只影响**映射到 shard 的时间范围**（`Prepare` 里把
+`StartTime -= ExtraIntervals*Interval`，降序时 `EndTime += ...`），不会多输出点；
+这样第一个输出窗口也能拿到前值（见 §1.2 步骤 3b）。
 
 ### 2.6 Reduce Iterator — 窗口聚合的核心
 
 ```go
-// query/iterator.gen.go:996 — floatReduceFloatIterator
+// query/iterator.gen.go:998 — floatReduceFloatIterator
 type floatReduceFloatIterator struct {
     input    *bufFloatIterator
     create   func() (FloatPointAggregator, FloatPointEmitter)
@@ -1459,74 +1719,126 @@ type floatReduceFloatIterator struct {
 }
 ```
 
-**reduce() 方法 — 窗口聚合的核心逻辑**:
+**reduce() 方法 — 窗口聚合的核心逻辑**（`iterator.gen.go:1047-1160`）:
 
 ```go
-// query/iterator.gen.go:1047 — reduce
+// query/iterator.gen.go:1049 — floatReduceFloatIterator.reduce
 func (itr *floatReduceFloatIterator) reduce() ([]FloatPoint, error) {
-    // 1. 读取第一个非 nil 点，确定窗口
-    p := itr.input.peek()
-    startTime, endTime := itr.opt.Window(p.Time)
+    // 1. 用 Next()+unread() 取第一个非 Nil 点并确定窗口
+    //    不能先 peek() 再 NextInWindow(): buf 只有一个槽, 连续 unread 会丢点
+    var (
+        startTime, endTime int64
+        window             struct {
+            name string
+            tags string   // 注意是 string, 来自 Tags.Subset(...).ID()
+        }
+    )
+    for {
+        p, err := itr.input.Next()
+        if err != nil || p == nil {
+            return nil, err
+        } else if p.Nil {
+            continue
+        }
+        itr.input.unread(p)
+        startTime, endTime = itr.opt.Window(p.Time)
+        window.name, window.tags = p.Name, p.Tags.Subset(itr.opt.Dimensions).ID()
+        break
+    }
 
-    // 2. 确定当前的 name 和 tags (按维度分组)
-    window.name = p.Name
-    window.tags = p.Tags.Subset(itr.opt.Dimensions)
-
-    // 3. 为每个 series 创建独立的 Aggregator/Emitter
-    seriesMap := map[string]*floatReduceFloatPoint{}
-
-    // 4. 读取窗口内的所有点
+    // 2. 逐点聚合; 每个 name/tag 组合一个 Aggregator
+    m := make(map[string]*floatReduceFloatPoint)
     for {
         curr, err := itr.input.NextInWindow(startTime, endTime)
-        if curr == nil { break }
+        if err != nil {
+            return nil, err
+        } else if curr == nil {
+            break
+        } else if curr.Nil {
+            continue
+        } else if curr.Name != window.name {
+            itr.input.unread(curr)   // 跨 series 必须先 unread 再 break
+            break
+        }
+        if tags := curr.Tags.Subset(itr.opt.Dimensions); tags.ID() != window.tags {
+            itr.input.unread(curr)   // 同一窗口内跨 tags 同样要回退
+            break
+        }
 
-        // 检查是否跨越了不同的 series
-        if curr.Name != window.name { break }
-        if curr.Tags.Subset(itr.opt.Dimensions).ID() != window.tags { break }
-
-        // 获取或创建该 series 的 aggregator
-        key := curr.Tags.Subset(itr.dims).ID()
-        rp, ok := seriesMap[key]
-        if !ok {
+        tags := curr.Tags.Subset(itr.dims) // 分组维度可能比桶维度更细
+        id := tags.ID()
+        rp := m[id]
+        if rp == nil {
             aggregator, emitter := itr.create()
             rp = &floatReduceFloatPoint{
                 Name:       curr.Name,
-                Tags:       curr.Tags.Subset(itr.dims),
+                Tags:       tags,
                 Aggregator: aggregator,
                 Emitter:    emitter,
             }
-            seriesMap[key] = rp
+            m[id] = rp
         }
-
-        // 调用聚合器
-        if !curr.Nil {
-            rp.Aggregator.AggregateFloat(curr)
-        }
+        rp.Aggregator.AggregateFloat(curr)
     }
 
-    // 5. 从所有 aggregator 收集结果
-    var points []FloatPoint
-    for _, rp := range seriesMap {
-        pts := rp.Emitter.Emit()
-        for i := range pts {
-            pts[i].Name = rp.Name
-            pts[i].Tags = rp.Tags
-            // 替换 ZeroTime 为窗口起点
-            if pts[i].Time == ZeroTime {
-                pts[i].Time = startTime
+    // 3. 先按 key 排序, 保证多 series 输出顺序稳定
+    keys := make([]string, 0, len(m))
+    for k := range m {
+        keys = append(keys, k)
+    }
+    if len(keys) > 0 {
+        var sorted sort.Interface = sort.StringSlice(keys)
+        if itr.opt.Ascending {
+            sorted = sort.Reverse(sorted)
+        }
+        sort.Sort(sorted)
+    }
+
+    // 4. 逐个 Emit; 只有 emitter 返回非 ZeroTime 时才可能乱序
+    sortedByTime := true
+    a := make([]FloatPoint, 0, len(m))
+    for _, k := range keys {
+        rp := m[k]
+        points := rp.Emitter.Emit()
+        for i := len(points) - 1; i >= 0; i-- {
+            points[i].Name = rp.Name
+            if !itr.keepTags {          // keepTags=true 时保留原标签(子查询路径)
+                points[i].Tags = rp.Tags
             }
+            if points[i].Time == ZeroTime {
+                points[i].Time = startTime
+            } else {
+                sortedByTime = false
+            }
+            a = append(a, points[i])
         }
-        points = append(points, pts...)
     }
 
-    // 6. 排序
-    if itr.opt.Ordered {
-        sort.Sort(floatPoints(points))
+    // 5. 仅当可能乱序且要求有序时才做稳定排序
+    if !sortedByTime && itr.opt.Ordered {
+        var sorted sort.Interface = floatPointsByTime(a)
+        if itr.opt.Ascending {
+            sorted = sort.Reverse(sorted)
+        }
+        sort.Stable(sorted)
     }
-
-    return points, nil
+    return a, nil
 }
 ```
+
+> **易错点**:
+> - `window.tags` 是 `string`，赋值来自 `Tags.Subset(...).ID()`；不是 `Tags` 对象，
+>   所以比较时直接 `!= window.tags`。
+> - 跨 series 或跨 tags 时**必须 `unread(curr)` 再 `break`**，否则当前窗口的边界点
+>   被永久吞掉，下一个窗口会少一个数据点。
+> - 首点用的是 `Next()` + `unread()`，不是 `peek()`：`bufFloatIterator` 只有一个
+>   `buf` 槽，`peek()` 内部就是 `Next()+unread`；如果再对另一个点 `unread`，前一个
+>   缓冲点会被覆盖（`iterator.gen.go:56-125`）。`reduce` 里最多只缓存一个点，正是
+>   因为这个单槽契约。
+> - `keepTags` 控制是否覆写 `Tags`：子查询路径需要保留原始标签，普通聚合才裁剪为
+>   `dims` 子集。
+> - 输出顺序先按 key 排序（升序时 `sort.Reverse`，因为随后是逆序弹出），只有
+>   emitter 产出非 `ZeroTime` 且 `opt.Ordered` 时才 `sort.Stable` 按时间稳定排序。
 
 > **小白解释**: reduce() 就像一个"分组计票站"。
 > 数据流进来后，先按时间窗口分组（每分钟一组），再按 series 分组（每个 host 一组）。
@@ -1544,7 +1856,8 @@ sequenceDiagram
 
     Input->>Buf: [t1:10,web] [t2:20,web] [t3:30,db] [t4:40,web] [t5:50,db]
 
-    Reducer->>Buf: peek() → 确定窗口 [10:00, 10:01)
+    Reducer->>Buf: Next() 读首点 → unread() 回退
+    Note over Reducer: Window(首点时间) → [10:00, 10:01)<br/>window.name/tags = 首点 Subset(Dimensions).ID()
     Reducer->>Buf: NextInWindow(10:00, 10:01)
 
     Buf-->>Reducer: [t1:10,web]
@@ -1566,7 +1879,7 @@ sequenceDiagram
 **NextInWindow — 窗口边界检测**:
 
 ```go
-// query/iterator.gen.go:94 — bufFloatIterator.NextInWindow
+// query/iterator.gen.go:96 — bufFloatIterator.NextInWindow
 func (itr *bufFloatIterator) NextInWindow(startTime, endTime int64) (*FloatPoint, error) {
     v, err := itr.Next()
     if v == nil || err != nil {
@@ -1584,7 +1897,7 @@ func (itr *bufFloatIterator) NextInWindow(startTime, endTime int64) (*FloatPoint
 ### 2.7 Stream Iterator — 流式聚合
 
 ```go
-// query/iterator.gen.go:1163 — floatStreamFloatIterator
+// query/iterator.gen.go:1166 — floatStreamFloatIterator
 type floatStreamFloatIterator struct {
     input    *bufFloatIterator
     create   func() (FloatPointAggregator, FloatPointEmitter)
@@ -1609,7 +1922,7 @@ type floatStreamFloatIterator struct {
 ### 3.1 LIMIT / OFFSET — 点级限制
 
 ```go
-// query/iterator.gen.go:648 — floatLimitIterator
+// query/iterator.gen.go:651 — floatLimitIterator
 type floatLimitIterator struct {
     input FloatIterator
     opt   IteratorOptions
@@ -1679,7 +1992,7 @@ flowchart TD
 ### 3.2 SLIMIT / SOFFSET — Series 级限制
 
 ```go
-// query/result.go:47 — LimitTagSets
+// query/result.go:48 — LimitTagSets
 func LimitTagSets(a []*TagSet, slimit, soffset int) []*TagSet {
     if slimit == 0 && soffset == 0 {
         return a  // 无限制
@@ -1734,7 +2047,7 @@ func (b *exprIteratorBuilder) buildCallIterator(ctx context.Context, expr *influ
 ### 4.1 MergeIterator vs SortedMergeIterator
 
 ```go
-// query/iterator.go:111 — Iterators.Merge
+// query/iterator.go:122 — Iterators.Merge
 func (a Iterators) Merge(opt IteratorOptions) (Iterator, error) {
     call, ok := opt.Expr.(*influxql.Call)
 
@@ -1786,7 +2099,7 @@ func (a Iterators) Merge(opt IteratorOptions) (Iterator, error) {
 ### 4.2 MergeIterator 的堆实现
 
 ```go
-// query/iterator.gen.go:258 — floatMergeHeap
+// query/iterator.gen.go:261 — floatMergeHeap
 type floatMergeHeap struct {
     items []*floatMergeHeapItem
     opt   IteratorOptions
@@ -1815,62 +2128,122 @@ func (h *floatMergeHeap) Less(i, j int) bool {
 
 ### 4.3 MergeIterator.Next — 窗口归并逻辑
 
+`floatMergeIterator` 不是"每点 Pop/Push"：它维护一个 **当前 iterator**（`itr.curr`），
+只要当前 iterator 还在同一窗口就持续从它取点；只有越窗时才 `unread` + `Push` 回去。
+
+```mermaid
+flowchart TD
+    A["Next()"] --> B{"closed?"}
+    B -->|"是"| C["return nil, nil"]
+    B -->|"否"| D{"已 init?"}
+    D -->|"否"| E["遍历 heap.items<br/>peek(): err 立即返回, nil 跳过<br/>heap.Init"]
+    D -->|"是"| F{"curr == nil?"}
+    E --> F
+    F -->|"是"| G{"heap 空?"}
+    G -->|"是"| H["return nil, nil"]
+    G -->|"否"| I["Pop → curr.Next()<br/>用 p.Name / Tags.ID() / Window(p.Time) 设窗<br/>首点无条件 return p"]
+    F -->|"否"| J["curr.Next()"]
+    J --> K{"p == nil?"}
+    K -->|"是"| L["curr = nil; continue"]
+    K -->|"否"| M{"name / tags.ID() /<br/>升序 p.Time >= endTime /<br/>降序 p.Time < startTime"}
+    M -->|"都在窗口内"| N["return p, nil"]
+    M -->|"越窗"| O["curr.unread(p)<br/>heap.Push(curr)<br/>curr = nil; continue"]
+    I --> P["下一个 Next() 从 curr 续读"]
+```
+
 ```go
-// query/iterator.gen.go:174 — floatMergeIterator.Next
+// query/iterator.gen.go:177-257 — floatMergeIterator.Next
 func (itr *floatMergeIterator) Next() (*FloatPoint, error) {
+    itr.mu.RLock()
+    defer itr.mu.RUnlock()
+    if itr.closed {
+        return nil, nil
+    }
+
+    // 1. 惰性初始化: 这里才 peek 每个输入并建堆
+    //    (Select() 返回前不做重活, 以便中断能生效)
+    if !itr.init {
+        items := itr.heap.items
+        itr.heap.items = make([]*floatMergeHeapItem, 0, len(items))
+        for _, item := range items {
+            if p, err := item.itr.peek(); err != nil {
+                return nil, err        // peek 错误立即上抛, 不吞
+            } else if p == nil {
+                continue
+            }
+            itr.heap.items = append(itr.heap.items, item)
+        }
+        heap.Init(itr.heap)
+        itr.init = true
+    }
+
     for {
-        // 懒初始化: 从每个 input 读取第一个点
-        if !itr.init {
-            itr.init = true
-            for _, item := range itr.heap.items {
-                p, _ := item.itr.peek()
-                if p == nil { continue }
-                heap.Push(itr.heap, item)
+        // 2. 没有当前 iterator: Pop 一个, 读首点并"无条件"设置窗口后返回
+        if itr.curr == nil {
+            if len(itr.heap.items) == 0 {
+                return nil, nil
             }
-        }
-
-        // 弹出堆顶
-        item := heap.Pop(itr.heap).(*floatMergeHeapItem)
-        p, _ := item.itr.Next()
-
-        // 设置当前窗口
-        if itr.window.name == "" {
-            itr.window.name = p.Name
-            itr.window.tags = p.Tags.Subset(itr.opt.Dimensions).ID()
-            itr.window.startTime, itr.window.endTime = itr.opt.Window(p.Time)
-        }
-
-        // 检查是否还在当前窗口内
-        inWindow := true
-        if p.Name != itr.window.name { inWindow = false }
-        if p.Tags.Subset(itr.opt.Dimensions).ID() != itr.window.tags { inWindow = false }
-        if itr.opt.Ascending && p.Time >= itr.window.endTime { inWindow = false }
-        if !itr.opt.Ascending && p.Time < itr.window.startTime { inWindow = false }
-
-        if inWindow {
-            // 继续从同一个 iterator 读取 (同一窗口内的点)
-            if next, _ := item.itr.peek(); next != nil {
-                heap.Push(itr.heap, item)
+            itr.curr = heap.Pop(itr.heap).(*floatMergeHeapItem)
+            p, err := itr.curr.itr.Next()
+            if err != nil {
+                return nil, err
             }
+            tags := p.Tags.Subset(itr.heap.opt.Dimensions)
+            itr.window.name, itr.window.tags = p.Name, tags.ID()
+            itr.window.startTime, itr.window.endTime = itr.heap.opt.Window(p.Time)
             return p, nil
         }
 
-        // 超出窗口: unread 并推回堆
-        item.itr.unread(p)
-        heap.Push(itr.heap, item)
+        // 3. 继续从当前 iterator 读
+        p, err := itr.curr.itr.Next()
+        if err != nil {
+            return nil, err
+        }
+        if p == nil {           // 该输入耗尽
+            itr.curr = nil
+            continue
+        }
 
-        // 重置窗口
-        itr.window.name = ""
+        // 4. 四个越窗条件: name / tags.ID() / 升序 p.Time >= endTime /
+        //    降序 p.Time < startTime
+        inWindow := true
+        if window := itr.window; window.name != p.Name {
+            inWindow = false
+        } else if tags := p.Tags.Subset(itr.heap.opt.Dimensions); window.tags != tags.ID() {
+            inWindow = false
+        } else if opt := itr.heap.opt; opt.Ascending && p.Time >= window.endTime {
+            inWindow = false
+        } else if !opt.Ascending && p.Time < window.startTime {
+            inWindow = false
+        }
+
+        // 5. 越窗: 回退该点, 把 iterator 推回堆, 下次重新选
+        if !inWindow {
+            itr.curr.itr.unread(p)
+            heap.Push(itr.heap, itr.curr)
+            itr.curr = nil
+            continue
+        }
+        return p, nil
     }
 }
 ```
+
+> **易错点**:
+> - `itr.window` 的首点设置是**无条件**的：新的 `curr` 一 Pop 出来就设窗并立即返回，
+>   首窗不是靠空串哨兵判断的：每次 Pop 出新 curr 都会直接设窗并返回。
+> - `next` 点严格按"当前 iterator 优先"，不是每个点都 Pop/Push；只有越窗才换。
+> - `floatMergeHeap.Less`（`iterator.gen.go:268-275`）对 `peek()` 错误返回
+>   `true`/`false`，**错误被吞**；真正的错误只能等某个 `Next()` 暴露。
+> - `Close()` 用 `mu.Lock()` 并 `errors.Join` 聚合所有输入错误
+>   （`iterator.gen.go:161-173`）。
 
 ### 4.4 其他重要迭代器
 
 #### ParallelMergeIterator — 并行归并 (iterator.go:182)
 
 ```go
-// query/iterator.go:182 — NewParallelMergeIterator
+// query/iterator.go:200 — NewParallelMergeIterator
 func NewParallelMergeIterator(inputs []Iterator, opt IteratorOptions, parallelism int) Iterator
 ```
 
@@ -1879,7 +2252,7 @@ func NewParallelMergeIterator(inputs []Iterator, opt IteratorOptions, parallelis
 #### InterruptIterator — 中断迭代器 (iterator.go:393)
 
 ```go
-// query/iterator.go:393 — NewInterruptIterator
+// query/iterator.go:411 — NewInterruptIterator
 func NewInterruptIterator(input Iterator, closing <-chan struct{}) Iterator
 ```
 
@@ -1888,7 +2261,7 @@ func NewInterruptIterator(input Iterator, closing <-chan struct{}) Iterator
 #### CloseInterruptIterator — 关闭中断迭代器 (iterator.go:412)
 
 ```go
-// query/iterator.go:412 — NewCloseInterruptIterator
+// query/iterator.go:430 — NewCloseInterruptIterator
 func NewCloseInterruptIterator(input Iterator, closing <-chan struct{}) Iterator
 ```
 
@@ -1897,7 +2270,7 @@ func NewCloseInterruptIterator(input Iterator, closing <-chan struct{}) Iterator
 #### DedupeIterator — 去重迭代器 (iterator.go:334)
 
 ```go
-// query/iterator.go:334 — NewDedupeIterator
+// query/iterator.go:352 — NewDedupeIterator
 func NewDedupeIterator(input Iterator) Iterator
 ```
 
@@ -1906,18 +2279,67 @@ func NewDedupeIterator(input Iterator) Iterator
 #### TagSubsetIterator — 标签子集迭代器 (iterator.go:310)
 
 ```go
-// query/iterator.go:310 — NewTagSubsetIterator
+// query/iterator.go:328 — NewTagSubsetIterator
 func NewTagSubsetIterator(input Iterator, opt IteratorOptions) Iterator
 ```
 
 将每个点的标签裁剪为 `opt.Dimensions` 的子集。用于 GROUP BY 部分标签时。
+
+### 4.5 Iterator 生命周期与错误传播
+
+`Iterator` 接口只有两个方法（`query/iterator.go:28-31`）：
+
+```go
+type Iterator interface {
+    Stats() IteratorStats
+    Close() error
+}
+```
+
+**1. 所有权与 Close 语义**。`Iterators.Close`（`query/iterator.go:52-60`）忽略 nil，
+只保留**第一个**错误；生成的 merge iterator 用 `errors.Join` 聚合所有输入错误
+（`query/iterator.gen.go:161-173`）。谁创建谁负责 Close：`buildCursor` 失败时
+`Iterators(inputs).Close()`；查询正常结束时由 Emitter/Executor 关闭最外层。
+
+**2. reduce vs stream 的刷尾差异**。`floatReduceFloatIterator.Close` 只
+`return itr.input.Close()`（`query/iterator.gen.go:1020`），**不 flush**；reduce 的
+输出在 `reduce()` 返回时已经 Emit。stream 则在输入耗尽时，对实现 `io.Closer` 的
+aggregator 先 `Close()` 再 `Emit()`（`query/iterator.gen.go:1226-1245`）。
+`FloatIntegralReducer.Close`（`query/functions.go:1655-1663`）负责送出最后一个窗口；
+若提前 Close，最后一个窗口会丢。
+
+**3. 提前终止的代价**。`InterruptIterator` 每 256 点检查一次通道
+（`if itr.count&0xFF == 0xFF`，`query/iterator.gen.go:925-941`），中断时
+`return nil, itr.Close()`；`CloseInterruptIterator` 用 goroutine + `sync.Once`
+（`951-980`）。`Iterators.Merge` 在 `opt.InterruptCh != nil` 时自动包一层
+`NewInterruptIterator`（`query/iterator.go:140-142`）。案例：
+`SELECT integral(value) ... LIMIT 1` 在 `LIMIT` 满足后提前 Close，integral 的最后
+一个窗口可能来不及 `Close()` 刷出——这是 stream 载体 + 提前终止的固有代价。
+
+**4. 错误传播**。`mergeHeap.Less` 吞 `peek` 错误（见 §4.3），只有 `Next()` 会暴露；
+`bufIterator.peek` 会把 `Next` 的错误原样返回。因此"初始化阶段"的错误可能被延迟到
+第一次 `Next`。
+
+**5. Finalizer 兜底**。`tsdb/engine/tsm1/iterator.gen.go:131-160` 的
+`newFloatFinalizerIterator` 用 `runtime.SetFinalizer` 在 GC 时异步 `Close()` 并打
+error 日志；代价是对象至少多活一个 GC 周期，且 finalizer 不保证及时执行。
+
+**6. 谁 Close 谁**:
+
+| 对象 | 创建者 | 持有者 | 释放者 | 提前 Close 的后果 |
+|---|---|---|---|---|
+| `KeyCursor`（InfluxQL） | `buildFloatCursor` | point cursor | `cursor.Close()` | TSM 引用泄漏（无 Unref） |
+| per-series `CallIterator` | `Engine.createCallIterator` | `ParallelMergeIterator` | 上层 Merge 的 Close | stream 聚合最后一窗丢失 |
+| `MergeIterator` | `Iterators.Merge` | select.go | Emitter/Executor | 输入未关闭，资源泄漏 |
+| `FillIterator` | `buildExprIterator` | 外层链 | 外层 Close | 无（无内部状态需刷） |
+| `FinalizerIterator` | `Engine.CreateIterator` | 调用方 | 显式 Close 或 GC | 延迟释放，日志噪声 |
 
 ## 5. Fill Iterator — 空窗口填充
 
 ### 5.1 四种填充模式
 
 ```go
-// query/iterator.gen.go:706 — floatFillIterator
+// query/iterator.gen.go:708 — floatFillIterator
 type floatFillIterator struct {
     input     *bufFloatIterator
     prev      FloatPoint      // 上一个非 nil 点 (用于 PreviousFill 和 LinearFill)
@@ -1947,75 +2369,137 @@ type floatFillIterator struct {
 ### 5.2 FillIterator.Next — 填充逻辑
 
 ```go
-// query/iterator.gen.go:758 — floatFillIterator.Next
+// query/iterator.gen.go:760 — floatFillIterator.Next
 func (itr *floatFillIterator) Next() (*FloatPoint, error) {
-    // 1. 读取下一个真实点
-    p, err := itr.input.Next()
-
-    // 2. 检查是否需要填充
-    // 如果真实点的时间 > 期望时间，说明有空隙
-    if p == nil || (itr.opt.Ascending && p.Time > itr.window.time) ||
-       (!itr.opt.Ascending && p.Time < itr.window.time) {
-        // 需要填充
-        goto CONSTRUCT
+    // 1. 惰性初始化: 用首点确定 series 与起始窗口
+    if !itr.init {
+        p, err := itr.input.peek()
+        if p == nil || err != nil {
+            return nil, err
+        }
+        itr.window.name, itr.window.tags = p.Name, p.Tags
+        itr.window.time = itr.startTime
+        if itr.startTime == influxql.MinTime {
+            itr.window.time, _ = itr.opt.Window(p.Time)
+        }
+        if itr.opt.Location != nil {
+            _, itr.window.offset = itr.opt.Zone(itr.window.time)
+        }
+        itr.init = true
     }
 
-    // 3. 更新 prev
-    if !p.Nil {
+    p, err := itr.input.Next()
+    if err != nil {
+        return nil, err
+    }
+
+    // 2. 跨 series: 先 unread, 再重置 window/prev
+    if p == nil || p.Name != itr.window.name || p.Tags.ID() != itr.window.tags.ID() {
+        if itr.opt.Ascending && itr.window.time <= itr.endTime {
+            itr.input.unread(p)
+            p = nil
+            goto CONSTRUCT
+        } else if !itr.opt.Ascending && itr.window.time >= itr.endTime && itr.endTime != influxql.MinTime {
+            itr.input.unread(p)
+            p = nil
+            goto CONSTRUCT
+        }
+        if p == nil {
+            return nil, nil
+        }
+        itr.window.name, itr.window.tags = p.Name, p.Tags
+        itr.window.time = itr.startTime
+        if itr.window.time == influxql.MinTime {
+            itr.window.time, _ = itr.opt.Window(p.Time)
+        }
+        if itr.opt.Location != nil {
+            _, itr.window.offset = itr.opt.Zone(itr.window.time)
+        }
+        itr.prev = FloatPoint{Nil: true}   // 新 series 的 PreviousFill 从 NULL 开始
+    }
+
+CONSTRUCT:
+    // 3. 真实点超前(升序)或落后(降序)于期望窗口 → 造合成点
+    if p == nil || (itr.opt.Ascending && p.Time > itr.window.time) ||
+        (!itr.opt.Ascending && p.Time < itr.window.time) {
+        if p != nil {
+            itr.input.unread(p)
+        }
+
+        p = &FloatPoint{
+            Name: itr.window.name,
+            Tags: itr.window.tags,
+            Time: itr.window.time,
+            Aux:  itr.auxFields,   // 与 itr 共享底层数组, 不能长期持有
+        }
+
+        switch itr.opt.Fill {
+        case influxql.LinearFill:
+            if !itr.prev.Nil {
+                next, err := itr.input.peek()
+                if err != nil {
+                    return nil, err
+                } else if next != nil && next.Name == itr.window.name &&
+                    next.Tags.ID() == itr.window.tags.ID() {
+                    interval := int64(itr.opt.Interval.Duration)
+                    start := itr.window.time / interval
+                    p.Value = linearFloat(start, itr.prev.Time/interval,
+                        next.Time/interval, itr.prev.Value, next.Value)
+                } else {
+                    p.Nil = true
+                }
+            } else {
+                p.Nil = true
+            }
+        case influxql.NullFill:
+            p.Nil = true
+        case influxql.NumberFill:
+            // FillValue 在 select.go:634-636 已被转成 int64,
+            // 直接断言 float64 会 panic; 必须走 castToFloat (query/cast.go:33)
+            p.Value, _ = castToFloat(itr.opt.FillValue)
+        case influxql.PreviousFill:
+            if !itr.prev.Nil {
+                p.Value = itr.prev.Value
+                p.Nil = itr.prev.Nil   // 连 Nil 一起复制, prev 是 NULL 则填充点也是 NULL
+            } else {
+                p.Nil = true
+            }
+        }
+    } else {
         itr.prev = *p
     }
 
-    // 4. 推进窗口
+    // 4. 推进窗口: 升序 +=, 降序 -=
     if itr.opt.Ascending {
         itr.window.time += int64(itr.opt.Interval.Duration)
     } else {
         itr.window.time -= int64(itr.opt.Interval.Duration)
     }
 
-    return p, nil
-
-CONSTRUCT:
-    // 构造合成点
-    p = &FloatPoint{
-        Name: itr.window.name,
-        Tags: itr.window.tags,
-        Time: itr.window.time,
-    }
-
-    // 应用填充策略
-    switch itr.opt.Fill {
-    case influxql.NullFill:
-        p.Nil = true
-
-    case influxql.NumberFill:
-        p.Value = itr.opt.FillValue.(float64)
-
-    case influxql.PreviousFill:
-        if !itr.prev.Nil {
-            p.Value = itr.prev.Value
-        } else {
-            p.Nil = true
-        }
-
-    case influxql.LinearFill:
-        next, err := itr.input.peek()
-        if !itr.prev.Nil && next != nil &&
-           next.Name == itr.window.name && next.Tags.ID() == itr.window.tags.ID() {
-            // 线性插值: 先除以 interval 对齐时间，避免大数精度问题
-            interval := int64(itr.opt.Interval.Duration)
-            start := itr.window.time / interval
-            p.Value = linearFloat(start, itr.prev.Time/interval, next.Time/interval, itr.prev.Value, next.Value)
-        } else {
-            p.Nil = true
+    // 5. 跨 DST zone offset 变化时平移窗口
+    if itr.opt.Location != nil {
+        if _, offset := itr.opt.Zone(itr.window.time - 1); offset != itr.window.offset {
+            diff := itr.window.offset - offset
+            if abs(diff) < int64(itr.opt.Interval.Duration) {
+                itr.window.time += diff
+            }
+            itr.window.offset = offset
         }
     }
-
-    // 推进窗口
-    itr.window.time += int64(itr.opt.Interval.Duration)
-
     return p, nil
 }
 ```
+
+> **易错点**:
+> - 初始化用 `peek()` 只读不消费；但跨 series 时必须 `input.unread(p)` 后
+>   `goto CONSTRUCT`，否则新 series 的首点丢失。
+> - `NumberFill` 的 `FillValue` 在 `buildCursor` 里已从 `int` 转成 `int64`
+>   （`select.go:634-636`），所以填充时必须 `castToFloat`，不能 `.(float64)`。
+> - 升序/降序的窗口推进方向相反（`+=` / `-=`），且降序的 `endTime` 是
+>   `StopTime()`（即 `StartTime`）。
+> - `PreviousFill` 复制 `prev.Nil`：前一个点是 NULL 时填充点也应是 NULL。
+> - `p.Aux = itr.auxFields` 是与 iterator 共享的底层数组，返回给上层后不能跨
+>   `Next()` 持久化。
 
 **特殊处理**: `count()` + `NullFill` 自动转换为 `NumberFill(0)`，因为空窗口的计数应该是 0 而不是 NULL。
 
@@ -2042,7 +2526,7 @@ flowchart TD
 ## 6. Interval Iterator — 时间对齐
 
 ```go
-// query/iterator.gen.go:883 — floatIntervalIterator
+// query/iterator.gen.go:885 — floatIntervalIterator
 type floatIntervalIterator struct {
     input FloatIterator
     opt   IteratorOptions
@@ -2112,7 +2596,7 @@ if !opt.Ascending {
     }
 }
 
-// query/result.go:39 — TagSet.Reverse
+// query/result.go:40 — TagSet.Reverse
 func (t *TagSet) Reverse() {
     for i, j := 0, len(t.Filters)-1; i < j; i, j = i+1, j-1 {
         t.Filters[i], t.Filters[j] = t.Filters[j], t.Filters[i]
@@ -2128,7 +2612,7 @@ func (t *TagSet) Reverse() {
 > 最后比 `Window(time)`；升序/降序在每个维度上都反转比较方向。
 
 ```go
-// query/iterator.gen.go:265 — floatMergeHeap.Less (简化视图，仅展示时间维度)
+// query/iterator.gen.go:268 — floatMergeHeap.Less (简化视图，仅展示时间维度)
 func (h *floatMergeHeap) Less(i, j int) bool {
     if h.opt.Ascending {
         return x.Time < y.Time  // 升序: 时间小的在堆顶
@@ -2154,7 +2638,7 @@ if itr.opt.Ascending {
 ### 8.0 Cursor 接口与实现
 
 ```go
-// query/cursor.go — Cursor 接口
+// query/cursor.go:70 — Cursor 接口
 type Cursor interface {
     Scan(row *Row) bool
     Stats() IteratorStats
@@ -2166,18 +2650,110 @@ type Cursor interface {
 
 **Cursor 实现类型**:
 
-| 类型 | 用途 |
-|------|------|
-| `scannerCursor` | 单个 IteratorScanner 的 Cursor |
-| `multiScannerCursor` | 多个 IteratorScanner 的 Cursor (多字段查询) |
-| `nullCursor` | 空 Cursor (无有效字段时) |
+| 类型 | 用途 | 位置 |
+|------|------|------|
+| `scannerCursor` | 单个 `IteratorScanner` 的 Cursor | `cursor.go:231` |
+| `multiScannerCursor` | 多个 `IteratorScanner`（多聚合/多字段） | `cursor.go:269` |
+| `nullCursor` | 无有效字段时 | `cursor.go` |
+| `filterCursor` | 包在 Cursor 外层做条件过滤（子查询路径） | `cursor.go:349` |
+| `RowCursor` | 把 `[]Row` 包成 Cursor，**仅测试使用**（`iterator_mapper_test.go:13`） | `cursor.go:92` |
+
+```mermaid
+flowchart LR
+    A["buildCursor<br/>select.go:622"] --> B["buildAuxIterator / buildFieldIterator"]
+    B --> C["scannerCursor / multiScannerCursor"]
+    C --> D["IteratorScanner<br/>NewIteratorScanner(itr, keys, fill)"]
+    D --> E["Iterator<br/>Float/Integer/..."]
+    C -. "子查询条件" .-> F["filterCursor<br/>valuer 无 IntegerFloatDivision"]
+    D -. "ScanAt 写入 m" .-> G["map[string]interface{}"]
+    C --> H["Row.Values"]
+```
+
+### 8.1 IteratorScanner / ScanAt — 行装配的位置
+
+`IteratorScanner` 是把 `Iterator` 的 point 流转换成 `map[string]interface{}` 的适配器，
+`scannerCursorBase` 再从该 map 求值表达式并写入 `Row.Values`。
+
+```go
+// query/iterator.gen.go:496-578 — floatIteratorScanner
+type floatIteratorScanner struct {
+    input        *bufFloatIterator
+    err          error
+    keys         []influxql.VarRef   // keys[0]=主值, keys[i+1]=Aux[i]
+    defaultValue interface{}         // FillValue 或 SkipDefault
+}
+
+func (s *floatIteratorScanner) ScanAt(ts int64, name string, tags Tags, m map[string]interface{}) {
+    p, err := s.input.Next()
+    if err != nil {
+        s.err = err
+        return
+    } else if p == nil {
+        s.useDefaults(m)
+        return
+    } else if p.Time != ts || p.Name != name || !p.Tags.Equals(&tags) {
+        s.useDefaults(m)
+        s.input.unread(p)   // 该 scanner 没有这个 (ts,name,tags), 回退
+        return
+    }
+
+    // keys[0] 写主值; Nil 点按 FillValue 处理
+    if k := s.keys[0]; k.Val != "" {
+        if p.Nil {
+            if s.defaultValue != SkipDefault {
+                m[k.Val] = castToType(s.defaultValue, k.Type)
+            }
+        } else {
+            m[k.Val] = p.Value
+        }
+    }
+    // keys[i+1] 写 Aux[i]
+    for i, v := range p.Aux {
+        k := s.keys[i+1]
+        switch v.(type) {
+        case float64, int64, uint64, string, bool:
+            m[k.Val] = v
+        default:
+            if s.defaultValue != SkipDefault {
+                m[k.Val] = castToType(s.defaultValue, k.Type)
+            }
+        }
+    }
+}
+```
+
+> **契约**: `keys[0]` 对应 `p.Value`，`keys[i+1]` 对应 `p.Aux[i]`；`keys[0].Val == ""`
+> 表示本次查询没有主值（raw 查询把所有字段都放在 Aux 里）。`SkipDefault` 表示
+> `PreviousFill` 的哨兵值，缺失时**不写** map，让上层保留 NULL。
+
+### 8.2 scannerCursor 与 multiScannerCursor
+
+- `scannerCursor`（`cursor.go:231-244`）只持有一个 scanner；`Scan` 调
+  `scannerCursorBase.Scan`，后者用 `valuer.Eval` 逐列求值（见 §9.2）。
+- `multiScannerCursor.scan`（`cursor.go:285-324`）先让每个 scanner `Peek()`，按
+  `(name, tags.ID(), time)` 选出最小（升序）或最大（降序）的 series/时间戳；
+  选定后对该 `(ts,name,tags)` 调用**所有** scanner 的 `ScanAt`（没有该行的 scanner
+  会 `useDefaults`/`unread`）。series 变化时 `clear(m)` 清空 map，避免上一行残留。
+- `scannerCursorBase.Scan`（`cursor.go:184-230`）：`time` 列特判为
+  `time.Unix(0, row.Time)`；其他列 `valuer.Eval(expr)`；`NaN` 转 `NullFloat`；
+  series 变化时 `row.Series.id++`。
+
+### 8.3 filterCursor 与 RowCursor
+
+- `filterCursor`（`cursor.go:349-405`）在 Cursor 外层做条件过滤：`Scan` 先让内层
+  Cursor 产出一行，再用 `IteratorMap.Value(row)` 把条件涉及的名字填进 map，
+  `valuer.EvalBool(filter)` 为真才放行。它的 `ValuerEval` **没有**设置
+  `IntegerFloatDivision`（`cursor.go:359-365`），所以这里的 int/int 除法是整数除法——
+  这是子查询条件与 SELECT 结果表达式求值的一个细微差异。
+- `RowCursor`（`cursor.go:92`）只是把现成的 `[]Row` 包装成 Cursor，仓库内只有
+  `iterator_mapper_test.go` 使用。
 
 ## 9. 数学运算 — BinaryExpr
 
 ### 9.1 运算在 Cursor 层执行
 
 ```go
-// query/cursor.go:134 — scannerCursorBase
+// query/cursor.go:139 — scannerCursorBase
 type scannerCursorBase struct {
     valuer influxql.ValuerEval
 }
@@ -2192,134 +2768,48 @@ cur.valuer = influxql.ValuerEval{
 }
 ```
 
-### 9.2 BinaryExpr 求值
+### 9.2 查询结果表达式求值（influxql.ValuerEval）
+
+查询结果里的表达式（`SELECT a/b`、`SELECT sin(value)`）在 **Cursor 层**求值。
+求值器在 `query/cursor.go:173-179` 构造，求值点是 `query/cursor.go:207`
+（`scannerCursorBase.Scan` 内 `cur.valuer.Eval(expr)`）：
 
 ```go
-// storage/reads/influxql_eval.go:41 — evalBinaryExpr
-func evalBinaryExpr(expr *influxql.BinaryExpr, m Valuer) interface{} {
-    lhs := evalExpr(expr.LHS, m)
-    rhs := evalExpr(expr.RHS, m)
-
-    // nil 和 bool 有隐式 false 兼容：WHERE tag='x' AND missing_bool
-    // 中缺失的布尔值按 false 参与 AND/OR。
-    switch lhs := lhs.(type) {
-    case bool:
-        rhs, ok := rhs.(bool)
-        switch expr.Op {
-        case influxql.AND:         return ok && (lhs && rhs)
-        case influxql.OR:          return ok && (lhs || rhs)
-        case influxql.BITWISE_AND: return ok && (lhs && rhs)
-        case influxql.BITWISE_OR:  return ok && (lhs || rhs)
-        case influxql.BITWISE_XOR: return ok && (lhs != rhs)
-        case influxql.EQ:          return ok && (lhs == rhs)
-        case influxql.NEQ:         return ok && (lhs != rhs)
-        }
-
-    case float64:
-        // rhs 可能是 float64 或 int64，统一转换为 float64
-        rhsf, ok := rhs.(float64)
-        if !ok {
-            if rhsi, ok := rhs.(int64); ok {
-                rhsf = float64(rhsi)
-            }
-        }
-        switch expr.Op {
-        case influxql.ADD: return lhs + rhsf
-        case influxql.SUB: return lhs - rhsf
-        case influxql.MUL: return lhs * rhsf
-        case influxql.DIV:
-            if rhsf == 0 { return float64(0) }  // 除零返回 0
-            return lhs / rhsf
-        case influxql.MOD: return math.Mod(lhs, rhsf)
-        case influxql.EQ:  return lhs == rhsf
-        case influxql.NEQ: return lhs != rhsf
-        case influxql.LT:  return lhs < rhsf
-        case influxql.LTE: return lhs <= rhsf
-        case influxql.GT:  return lhs > rhsf
-        case influxql.GTE: return lhs >= rhsf
-        }
-
-    case int64:
-        // rhs 如果是 float64，int64 自动提升为 float64
-        if rhsf, ok := rhs.(float64); ok {
-            lhsf := float64(lhs)
-            switch expr.Op {
-            case influxql.ADD: return lhsf + rhsf
-            case influxql.SUB: return lhsf - rhsf
-            // ... (提升为 float64 运算)
-            }
-        }
-        // rhs 是 int64 时，保持整数运算
-        rhsi, ok := rhs.(int64)
-        switch expr.Op {
-        case influxql.ADD: return lhs + rhsi
-        case influxql.SUB: return lhs - rhsi
-        case influxql.MUL: return lhs * rhsi
-        case influxql.DIV:
-            if rhsi == 0 { return float64(0) }  // 源码如此: int 除零返回 float64(0)
-            return lhs / rhsi
-        case influxql.MOD:
-            if rhsi == 0 { return int64(0) }
-            return lhs % rhsi
-        case influxql.BITWISE_AND: return lhs & rhsi
-        case influxql.BITWISE_OR:  return lhs | rhsi
-        case influxql.BITWISE_XOR: return lhs ^ rhsi
-        }
-
-    case string:
-        switch expr.Op {
-        case influxql.EQ:
-            rhs, ok := rhs.(string); if !ok { return nil }
-            return lhs == rhs
-        case influxql.NEQ:
-            rhs, ok := rhs.(string); if !ok { return nil }
-            return lhs != rhs
-        case influxql.EQREGEX:
-            rhs, ok := rhs.(*regexp.Regexp); if !ok { return nil }
-            return rhs.MatchString(lhs)
-        case influxql.NEQREGEX:
-            rhs, ok := rhs.(*regexp.Regexp); if !ok { return nil }
-            return !rhs.MatchString(lhs)
-        }
-
-    case []byte:
-        // tag value 在部分路径里以 []byte 进入求值器；等值比较先转 string。
-        switch expr.Op {
-        case influxql.EQ:
-            rhs, ok := rhs.(string); if !ok { return nil }
-            return string(lhs) == rhs
-        case influxql.NEQ:
-            rhs, ok := rhs.(string); if !ok { return nil }
-            return string(lhs) != rhs
-        case influxql.EQREGEX:
-            rhs, ok := rhs.(*regexp.Regexp); if !ok { return nil }
-            return rhs.Match(lhs)
-        case influxql.NEQREGEX:
-            rhs, ok := rhs.(*regexp.Regexp); if !ok { return nil }
-            return !rhs.Match(lhs)
-        }
-    }
-}
+valuer: influxql.ValuerEval{
+    Valuer: influxql.MultiValuer(
+        MathValuer{},           // query/math.go:85 — sin/cos/sqrt/...
+        influxql.MapValuer(m),  // 当前行的列值
+    ),
+    IntegerFloatDivision: true,
+},
 ```
 
-> **源码细节**: `int64 / int64` 除零分支实际返回 `float64(0)`，不是
-> `int64(0)`；`int64 % int64` 除零才返回 `int64(0)`。这会让
-> `SELECT int_field / 0` 的结果类型与普通整数除法不一致。
+**两份同名实现，不可混用**:
 
-**支持的运算**: `+`, `-`, `*`, `/`, `%`, `==`, `!=`, `<`, `<=`, `>`, `>=`, `AND`, `OR`, `&`, `|`, `^`, `=~`, `!~`
-
-**除零处理**: 返回 0，不报错；float 除零和 int 除零的 `/` 分支都返回 `float64(0)`。
-
-**类型提升**: int64 与 float64 混合运算时，int64 自动提升为 float64。
+| 语义 | 查询结果（本节，`influxql.ValuerEval`） | 存储读谓词（09 §5.5，`storage/reads.evalBinaryExpr`） |
+|---|---|---|
+| int64/int64 `/` | **恒为 float64**；除零返回 `float64(0)` | 整数除法；除零返回 `float64(0)` |
+| int64%int64 除零 | `int64(0)` | `int64(0)` |
+| uint64 | 有 float64/uint64 提升分支（`ast.go:4691/4772`） | **无 `case uint64`，二元运算落到 `nil`** |
+| `[]byte` | 无 case | 有（`influxql_eval.go:250`，按 string 比较） |
+| bool AND/OR | 先求值两侧，再 `ok && ...`（非短路） | 相同（非短路） |
+| nil 与 bool | nil 隐式转 false（`ast.go:4479-4490`） | 相同（`influxql_eval.go:44-54`） |
+| 类型不符 | 返回 `nil` | 返回 `nil` |
 
 **案例**:
 
 ```sql
-SELECT int_value / 0 FROM cpu        -- 返回 0，但底层类型是 float64(0)
-SELECT * FROM cpu WHERE host =~ /web[0-9]+/ AND active = true
+SELECT int_value / 0 FROM cpu   -- float64(0)，不报错
+SELECT int_value / 2 FROM cpu   -- 运行时 float64；列声明类型仍是 Integer
 ```
 
-第二个条件依赖 `string`/`[]byte` 的 regex 分支和 `bool` 的 AND 分支；这些都在 `storage/reads/influxql_eval.go` 的 `evalBinaryExpr` 中处理。
+列声明类型由 `influxql.TypeValuerEval.EvalType`（`ast.go:4915`）推断，它**没有**
+设置 `IntegerFloatDivision`，所以 `int/2` 被推断为 Integer，而运行期值是 float64。
+这才是真正存在的类型不一致；「`/0` 与普通整数除法不一致」的旧结论不成立
+（本路径下普通 int/int 除法同样是 float64，见 `ast.go:4617-4628`）。
+
+存储读谓词的求值语义（DIV/MOD 除零、unsigned 缺失、`EvalBool` 非 bool 视为 false）
+见 **09 号文档 §5.5**，不要写在本节。
 
 ### 9.3 数学函数
 
@@ -2400,7 +2890,7 @@ func asFloat(x interface{}) (float64, bool) {
 ### 10.1 Aux 字段的处理
 
 ```go
-// query/point.gen.go:20 — FloatPoint
+// query/point.gen.go:21 — FloatPoint
 type FloatPoint struct {
     Name  string
     Tags  Tags
@@ -2423,46 +2913,117 @@ type FloatPoint struct {
 ### 10.2 valueMapper — 字段映射
 
 ```go
-// query/select.go:882 — valueMapper
+// query/select.go:881-888 — valueMapper
 type valueMapper struct {
-    calls map[influxql.Expr]string  // 聚合表达式 -> 符号名
-    refs  []*influxql.VarRef        // 原始字段引用
+    // 表达式字符串 -> 符号 (相同签名的节点共享一个 val%d)
+    symbols map[string]influxql.VarRef
+    // 具体表达式 -> 符号 (只对走过 Visit 的表达式生效)
+    table   map[influxql.Expr]influxql.VarRef
+    // 收集到的 Call / VarRef
+    calls   map[*influxql.Call]struct{}
+    refs    map[*influxql.VarRef]struct{}
+    i       int
 }
 ```
 
-**无聚合函数时**: 使用 `buildAuxIterator` 创建迭代器，通过 `floatIteratorMapper` 映射字段到 `Value` 和 `Aux`。
+**三步流程**:
+
+1. **Map/Visit 分配符号**（`select.go:904-954`）: `Map` 先 `influxql.Walk(v, expr)`，
+   `Visit` 对 Call（`isMathFunction` 的除外）与 VarRef 登记，然后
+   `symbolName := fmt.Sprintf("val%d", v.i)`、用 `influxql.TypeValuerEval` 推断类型，
+   写入 `symbols[expr.String()]` 并 `v.i++`。
+2. **rewriteExpr 替换表达式**（`select.go:956` 起）: 把原表达式整体替换成
+   `VarRef{Val: "val0", Type: ...}`；`table` 保留"原表达式 → 符号"的映射。
+3. **生成 Aux 与 scanner keys**（`select.go:685-691`、`712`、`752`）: `opt.Aux` 来自
+   `valueMapper.refs` 排序后的 `VarRef`；`auxKeys[i] = symbols[ref.String()]`；
+   `NewIteratorScanner(itr, keys, opt.FillValue)` 时，主值放 `keys[0]`，auxKeys 依次
+   放后面。
+
+**链路表**:
+
+| 阶段 | 输入 | 输出 |
+|---|---|---|
+| `valueMapper.Map` | `Field{Expr: mean(value)}` | 分配 `val0` 给 `mean(value)`、`val1` 给 `host` |
+| `rewriteExpr` | 原 AST | `Field{Expr: VarRef{Val:"val0"}}` |
+| `opt.Aux` | `refs` 集合 | `[host]`（只含非 driver 的 VarRef） |
+| scanner keys | `table[call]` + auxKeys | `[val0, val1]` |
+| `ScanAt` | point | `m["val0"]=p.Value`、`m["val1"]=p.Aux[0]` |
+| `Row.Values` | `valuer.Eval(VarRef{val0/val1})` | 按列顺序输出 |
+
+**两个具体例子**:
+
+- `SELECT value, host FROM cpu`（**无聚合**）: 两个 `VarRef` 都进 `refs`，
+  `calls` 为空 → 走 `buildAuxIterator`。`opt.Aux = [host, value]`（`influxql.VarRefs`
+  排序后），`keys = [{}, val_host, val_value]`；Engine 的
+  `createVarRefSeriesIterator` 对每个 Aux 建 cursor（tag 用 `literalValueCursor`），
+  `ScanAt` 把 `p.Aux[i]` 写到 `keys[i+1]`。注意此时 `keys[0]` 为空，**没有主值**，
+  `value` 也在 Aux 里。
+- `SELECT mean(value), host FROM cpu GROUP BY time(1m)`（**有聚合**）: `mean(value)`
+  是 call，成为 driver（`val0`），`host` 是 Aux（`val1`）。
+  `buildFieldIterator` 产出 `p.Value=mean`、`p.Aux[0]=host`，
+  `keys=[val0, val1]`，`ScanAt` 分别写 `m["val0"]=p.Value`、`m["val1"]=p.Aux[0]`。
+
+> **`floatIteratorMapper` 只出现在子查询路径**（`query/iterator_mapper.go`），
+> 普通查询不使用它；不要把它当成 `valueMapper` 的替代实现。
 
 ### 9.4 Tracing 支持
 
-`buildCursor`、`buildAuxIterator`、`buildFieldIterator` 都支持 OpenTelemetry tracing：
+`select.go` 只在三个位置创建 span，名称与 labels 都是固定的：
 
 ```go
-span := tracing.SpanFromContext(ctx)
-if span != nil {
-    span = span.StartSpan("build_cursor")  // 或 "build_aux_iterator", "build_field_iterator"
-    defer span.Finish()
-    span.SetLabels("statement", stmt.String())
-}
+// select.go:625 — buildCursor
+span = span.StartSpan("build_cursor")
+defer span.Finish()
+span.SetLabels("statement", stmt.String())
+ctx = tracing.NewContextWithSpan(ctx, span)   // 必须回写 ctx, 否则下游拿不到
+
+// select.go:781 — 第二个 iterator scanner
+span = span.StartSpan("iterator_scanner")
+defer span.Finish()
+span.SetLabels("auxiliary_fields", strings.Join(auxKeys, ","))
+
+// select.go:854 — 第一个 iterator scanner
+span = span.StartSpan("iterator_scanner")
+defer span.Finish()
+span.SetLabels("expr", expr.String(), "auxiliary_fields", strings.Join(auxKeys, ","))
 ```
 
-### 9.5 MaxBucketsN 限制 (compile.go:1201)
+> **注意**: 真实 span 名只有 `build_cursor` 与 `iterator_scanner`；旧文档的
+> `build_aux_iterator` / `build_field_iterator` 并不存在。`SetLabels` 的实参是
+> 交替的 key/value 字符串（可变参数），不是 map。
+
+### 9.5 MaxBucketsN 限制 (compile.go:1199)
+
+Prepare 阶段先在 `compile.go:1116-1151` 做**范围收缩**：当
+`c.TimeRange.MinTimeNano() == influxql.MinTime`（用户没给下界）且
+`MaxBucketsN > 0`、`MaxBucketsN < (last-MinNanoTime)/interval` 时，把
+`timeRange.Min` 改成 `last - interval*(MaxBucketsN-1)`，只映射必要的 shard 范围。
+
+随后才做桶数校验：
 
 ```go
-// query/compile.go:1201 — MaxBucketsN 检查
+// query/compile.go:1199-1220 — MaxBucketsN 检查
 if sopt.MaxBucketsN > 0 && !stmt.IsRawQuery && c.TimeRange.MinTimeNano() > influxql.MinTime {
-    interval, _ := stmt.GroupByInterval()
+    interval, err := stmt.GroupByInterval()
+    if err != nil {
+        shards.Close()
+        return nil, err
+    }
     if interval > 0 {
         first, _ := opt.Window(opt.StartTime)
         last, _ := opt.Window(opt.EndTime - 1)
         buckets := (last - first + int64(interval)) / int64(interval)
         if int(buckets) > sopt.MaxBucketsN {
+            shards.Close()   // 注意: 报错前必须释放已映射的 shard
             return nil, fmt.Errorf("max-select-buckets limit exceeded: (%d/%d)", buckets, sopt.MaxBucketsN)
         }
     }
 }
 ```
 
-防止 `GROUP BY time(1s)` 在大时间范围内产生过多桶导致 OOM。
+防止 `GROUP BY time(1s)` 在大时间范围内产生过多桶导致 OOM。注意
+`shards.Close()`：`MapShards` 已经持有 shard 引用，任何错误返回前都要释放，
+否则会造成 shard 引用泄漏。
 
 ### 9.6 MaxPointN 监控 (select.go:128)
 
@@ -2490,11 +3051,13 @@ type subqueryBuilder struct {
 }
 ```
 
-**子查询编译** (compile.go:1100):
+**子查询编译** (`compile.go:1075-1115`):
 - 创建独立的编译器
 - 时间范围取交集: `subquery.TimeRange = subquery.TimeRange.Intersect(c.TimeRange)` (单次 Intersect 调用，同时 clamp 起止时间)
 - 如果子查询没有 `GROUP BY time()`，继承父查询的 Interval
-- 如果子查询使用 `FILL(null)` 且 `!subquery.Interval.IsZero() && subquery.FillOption == influxql.NullFill`，切换为 `FILL(none)` (基于 interval 判断，而非"非原始查询")
+- `FILL(null)` 降级规则分两处：`compile.go:1103-1106` 要求内层 `Interval` 非零；
+  `iterator.go:757-767` 要求内层 `!stmt.IsRawQuery`。本示例的内层是 **raw 查询 +
+  默认 NoFill**，两条规则都不触发，不会切换为 `FILL(none)`
 
 **示例**: `SELECT mean(*) FROM (SELECT value FROM cpu WHERE time > now() - 1h) GROUP BY time(5m)`
 
@@ -2528,10 +3091,10 @@ type subqueryBuilder struct {
 >   - 创建独立编译器
 >   - 时间范围: [10:00, 10:02)
 >   - 无 GROUP BY → 返回原始点
->   - 无 FILL → 切换为 FILL(none)
+>   - 默认 FILL(none)；raw 查询不触发 `FILL(null)→none` 降级
 >
 > 步骤 2: 内层查询执行
->   - buildAuxIterator() → 创建 FloatIterator
+>   - subqueryBuilder.buildVarRefIterator / buildAuxIterator → buildCursor → NewIteratorMapper
 >   - 返回 12 个原始点
 >
 > 步骤 3: 外层查询编译
@@ -2676,21 +3239,31 @@ type floatMergeIterator struct {
 ### 13.3 条件求值在热路径上
 
 ```go
-// query/iterator.gen.go:2541 — floatFilterIterator.Next
+// query/iterator.gen.go:2543 — floatFilterIterator.Next
 func (itr *floatFilterIterator) Next() (*FloatPoint, error) {
     for {
         p, err := itr.input.Next()
-        // 构建 map[string]interface{}
-        // 求值条件表达式
-        if !influxql.EvalBool(itr.cond, itr.m) {
-            continue  // 不满足条件，继续
+        if err != nil || p == nil {
+            return nil, err
+        }
+        for i, ref := range itr.opt.Aux {   // 复用 itr.m, 不新建 map
+            itr.m[ref.Val] = p.Aux[i]
+        }
+        for k, v := range p.Tags.KeyValues() {
+            itr.m[k] = v
+        }
+        if !influxql.EvalBool(itr.cond, itr.m) { // iterator.gen.go:2557
+            continue
         }
         return p, nil
     }
 }
 ```
 
-每次 `Next()` 都要构建 map 并求值条件表达式。对于高选择性的查询（大部分点被过滤），这是 CPU 瓶颈。
+这里的求值器是 **`influxql.EvalBool`**（查询层，`iterator.gen.go:2557`），
+不是 `storage/reads` 的 `reads.EvalBool`（`storage/reads/influxql_eval.go:281`）。
+每次 `Next()` 都要刷新 map 并求值条件表达式；对于高选择性的查询
+（大部分点被过滤），这是 CPU 瓶颈。若示例涉及存储读谓词，请注明「仅谓词路径」。
 
 ### 13.4 LIMIT 是 per-series 而非全局
 
@@ -2706,12 +3279,11 @@ NULL 值被跳过，不计入 count。这与 SQL 的 `COUNT(*)` 不同（SQL 中
 
 ### 13.6 除零返回 0 而非错误
 
-```go
-if rhs.(float64) == 0 { return float64(0) }
-```
-
-`SELECT value / 0 FROM cpu` 返回 0 而不是错误。整数 `/ 0` 分支同样返回
-`float64(0)`，这可能不符合用户对整数表达式类型的预期。
+查询结果表达式使用 `influxql.ValuerEval{IntegerFloatDivision: true}`
+（`query/cursor.go:178`）：`/` 的除零分支返回 `float64(0)`，`%` 的除零分支返回
+`int64(0)`（`influxql@v1.4.1/ast.go:4617-4630`）。整数除法本身也一律返回 float64，
+因此不存在「除零分支破坏整数除法类型」的问题；真正需要注意的是列声明类型由
+`TypeValuerEval` 推断（Integer），与运行时 float64 不一致。
 
 ### 13.7 MovingAverage 的预热期
 

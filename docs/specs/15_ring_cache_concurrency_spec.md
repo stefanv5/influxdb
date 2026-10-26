@@ -159,7 +159,7 @@ func newring(n int) (*ring, error) {
 ### 2.3 getPartition — xxhash 路由
 
 ```go
-// tsdb/engine/tsm1/ring.go:86 — getPartition
+// tsdb/engine/tsm1/ring.go:79 — getPartition
 func (r *ring) getPartition(key []byte) *partition {
     return r.partitions[int(xxhash.Sum64(key)%uint64(len(r.partitions)))]
 }
@@ -193,7 +193,7 @@ func (r *ring) write(key string, values Values) (bool, error) {
 ### 2.5 ring.apply — 并行遍历
 
 ```go
-// tsdb/engine/tsm1/ring.go:145 — apply
+// tsdb/engine/tsm1/ring.go:137 — apply
 func (r *ring) apply(f func([]byte, *entry) error) error {
     var (
         wg  sync.WaitGroup
@@ -328,11 +328,13 @@ sequenceDiagram
 
 **快速路径 vs 慢速路径**:
 
-| 路径 | 锁类型 | 操作 | 性能 |
-|------|--------|------|------|
-| 快速路径 (entry 已存在) | RLock → RUnlock | 查找 map + entry.add(values) | ~100ns |
-| 慢速路径 (新 key) | Lock → Unlock | 创建 entry + 插入 map | ~500ns |
-| 双重检查命中 | Lock → Unlock | 查找 map + entry.add(values) | ~200ns |
+| 路径 | 锁类型 | 操作 | 相对成本 |
+|------|--------|------|----------|
+| 快速路径 (entry 已存在) | RLock → RUnlock | 一次分区 map 查找 + `entry.add(values)`（还要竞争 `entry.mu`） | 最低：一次分区 RLock + 一次 map 查找 |
+| 慢速路径 (新 key) | Lock → Unlock | 双重检查 + `newEntryValues` + 插入 map | 最高：一次分区写锁 + 双重检查 + 创建 entry |
+| 双重检查命中 | Lock → Unlock | 写锁下再查一次 map + `entry.add(values)` | 介于两者之间：写锁的排他成本 |
+
+> 上表是**数量级描述**，不是 benchmark 数据。原稿的 `~100ns/~500ns/~200ns` 没有测量来源，已删除；实际耗时取决于 key 长度、CPU 与锁竞争程度。临界区代码见 `ring.go:227-252` 与 `cache.go:87-97`。
 
 > **小白解释**: 双重检查锁就像去银行办业务：
 > 1. 先在门口问一下（RLock）："我要办的业务已经办过了吗？"
@@ -353,7 +355,7 @@ type entry struct {
 }
 ```
 
-**vtype 的两阶段语义**: `vtype == 0` 不是一个已经定型的值类型，而是空 entry/未初始化状态。空 entry 后续第一次写入非空 values 时，会在 `entry.mu` 写锁内设置 `vtype = valueType(values[0])`；从非空开始，它才可视为只读类型标签，后续写入只做同类型追加。
+**vtype 的两阶段语义**: `vtype == 0` 不是一个已经定型的值类型，而是空 entry/未初始化状态。空 entry 后续第一次写入非空 values 时，会在 `entry.mu` 写锁内设置 `vtype = valueType(values[0])`；对 Float/Integer/String/Boolean 而言，从非空开始它才可视为只读类型标签，后续写入只做同类型追加；**Unsigned 是例外**（见 §4.2 末尾的已知边界）。
 
 ### 4.2 entry.add — 追加值
 
@@ -396,6 +398,8 @@ func (e *entry) add(values []Value) error {
 2. 随后 `entry.add([FloatValue{...}])` 进入写锁分支，因为 `len(e.values)==0`，直接设置 `e.values = values` 且 `e.vtype = valueType(values[0])`。
 3. 再往后这个 entry 才进入稳定状态：`vtype != 0`，类型标签只读，混入其他类型会返回 field type conflict。
 
+**已知边界（代码缺陷，不是设计保证）**：`valueType` 没有覆盖 `UnsignedValue`（`cache.go:798-812` 的 `default: return 0`），所以 unsigned entry 的 `vtype` 始终是 0，`entry.add` 里 `if e.vtype != 0` 的守卫被整体跳过。触发链：`fields.idx` 打开失败只 Warn 后继续（`engine.go:779-787`）→ WAL 重放 unsigned 值后 `vtype` 停在 0 → 再写同 field 的 float 不会被拦截 → snapshot 时 `encodeUnsignedBlockUsing` 的 `v.(UnsignedValue)` 断言 panic（`encoding.go:740-752`）。正常路径由 Shard 的字段元数据校验兜住，所以这是元数据损坏场景下的缺陷。
+
 ### 4.3 entry 的其他方法
 
 | 方法 | 锁 | 用途 |
@@ -410,7 +414,7 @@ func (e *entry) add(values []Value) error {
 ### 5.1 Cache 结构体
 
 ```go
-// tsdb/engine/tsm1/cache.go:180 — Cache
+// tsdb/engine/tsm1/cache.go:179 — Cache
 type Cache struct {
     size         uint64      // 原子操作: live cache 大小 (必须是第一个字段, 32 位对齐)
     snapshotSize uint64      // 原子操作: snapshot 大小
@@ -460,7 +464,7 @@ type storer interface {
 ### 5.3 emptyStore — 懒初始化
 
 ```go
-// tsdb/engine/tsm1/cache.go:821 — emptyStore
+// tsdb/engine/tsm1/cache.go:820 — emptyStore
 type emptyStore struct{}
 
 func (e emptyStore) entry(key []byte) *entry                          { return nil }
@@ -479,7 +483,7 @@ func (e emptyStore) count() int                                       { return 0
 ### 5.4 Cache.init() — 懒初始化
 
 ```go
-// tsdb/engine/tsm1/cache.go:262 — init
+// tsdb/engine/tsm1/cache.go:261 — init
 func (c *Cache) init() {
     // CAS: 只有第一个 goroutine 能从 0 变为 1
     if !atomic.CompareAndSwapUint32(&c.initializedCount, 0, 1) {
@@ -499,7 +503,7 @@ func (c *Cache) init() {
 ### 5.5 Cache.WriteMulti — 批量写入
 
 ```go
-// tsdb/engine/tsm1/cache.go:320 — WriteMulti
+// tsdb/engine/tsm1/cache.go:319 — WriteMulti
 func (c *Cache) WriteMulti(values map[string][]Value) error {
     c.init()
     var addedSize uint64
@@ -562,12 +566,12 @@ func (c *Cache) WriteMulti(values map[string][]Value) error {
 ### 5.6 increaseSize / decreaseSize — 原子大小操作
 
 ```go
-// tsdb/engine/tsm1/cache.go:477 — increaseSize
+// tsdb/engine/tsm1/cache.go:476 — increaseSize
 func (c *Cache) increaseSize(delta uint64) {
     atomic.AddUint64(&c.size, delta)
 }
 
-// tsdb/engine/tsm1/cache.go:482 — decreaseSize
+// tsdb/engine/tsm1/cache.go:481 — decreaseSize
 func (c *Cache) decreaseSize(delta uint64) {
     // 位翻转技巧: 等价于原子减法
     // ^(delta - 1) = -delta (二进制补码)
@@ -584,7 +588,7 @@ func (c *Cache) decreaseSize(delta uint64) {
 ### 6.1 Cache.Snapshot — O(1) 指针交换
 
 ```go
-// tsdb/engine/tsm1/cache.go:376 — Snapshot
+// tsdb/engine/tsm1/cache.go:375 — Snapshot
 func (c *Cache) Snapshot() (*Cache, error) {
     c.init()
 
@@ -674,7 +678,7 @@ sequenceDiagram
 ### 6.2 Cache.ClearSnapshot — 清理 snapshot
 
 ```go
-// tsdb/engine/tsm1/cache.go:440 — ClearSnapshot
+// tsdb/engine/tsm1/cache.go:439 — ClearSnapshot
 func (c *Cache) ClearSnapshot(success bool) {
     c.init()
 
@@ -708,7 +712,7 @@ func (c *Cache) ClearSnapshot(success bool) {
 ### 6.3 Cache.Values — 读取合并
 
 ```go
-// tsdb/engine/tsm1/cache.go:555 — Values
+// tsdb/engine/tsm1/cache.go:554 — Values
 func (c *Cache) Values(key []byte) Values {
     var snapshotEntries *entry
 
@@ -771,13 +775,13 @@ func (c *Cache) Values(key []byte) Values {
 ### 6.4 Size 追踪
 
 ```go
-// tsdb/engine/tsm1/cache.go:472 — Size
+// tsdb/engine/tsm1/cache.go:471 — Size
 func (c *Cache) Size() uint64 {
     return atomic.LoadUint64(&c.size) + atomic.LoadUint64(&c.snapshotSize)
 }
 ```
 
-**Size = live + snapshot**: 这意味着 Snapshot 期间内存会短暂翻倍（live + snapshot 同时存在）。
+**Size = live + snapshot**: Snapshot 期间旧数据仍计入 `Size()`，总量继续受 `maxSize` 约束；默认 `maxSize` 1GB、快照阈值 25MB（`tsdb/config.go:25,29`）。
 
 ```mermaid
 flowchart TD
@@ -789,7 +793,7 @@ flowchart TD
     F --> G["size += addedSize (原子)"]
 
     H["Size() = size + snapshotSize"]
-    Note["Snapshot 期间: snapshotSize = 旧数据大小<br>size = 新数据大小<br>总内存 ≈ 2x"]
+    Note["Snapshot 期间: snapshotSize = 旧数据大小<br>size = 新数据大小<br>两者都计入 Size()，总量仍受 maxSize 约束"]
 
     I["ClearSnapshot(success)"]
     I --> J["snapshotSize = 0 (原子)"]
@@ -841,8 +845,20 @@ func (r *ring) split(n int) []storer {
 ```go
 // tsdb/engine/tsm1/compact.go:888 — WriteSnapshot (关键片段)
 func (c *Compactor) WriteSnapshot(cache *Cache, logger *zap.Logger) ([]string, error) {
-    // ...
+    // 入口先检查 snapshots 是否被禁用 (compact.go:888-897)
+    c.mu.RLock()
+    enabled := c.snapshotsEnabled
+    intC := c.snapshotsInterrupt
+    c.mu.RUnlock()
+    if !enabled {
+        return nil, errSnapshotsDisabled
+    }
+
+    start := time.Now()
     card := cache.Count()
+
+    // 低基数或快照写得快时启用限流
+    throttle := card < 3e6 && c.snapshotLatencies.avg() < 15*time.Second
 
     // 自适应并发: 基数越高并发越大
     concurrency := card / 2e6
@@ -880,7 +896,15 @@ func (c *Compactor) WriteSnapshot(cache *Cache, logger *zap.Logger) ([]string, e
         }
         files = append(files, result.files...)
     }
-    // ...
+    // 写完后再次检查 enabled: 期间可能被 DisableSnapshots() (compact.go:945-955)
+    c.mu.Lock()
+    enabled = c.snapshotsEnabled
+    c.snapshotLatencies.add(time.Since(start))
+    c.mu.Unlock()
+    if !enabled {
+        return nil, errSnapshotsDisabled
+    }
+
     return files, errors.Join(errs...)
 }
 ```
@@ -920,38 +944,37 @@ sequenceDiagram
     Comp-->>Comp: 返回所有 files
 ```
 
-**案例 (card=4e6 → concurrency=2)**:
+**并发度模型（整数除法，2/3 不可达）**：
+
+| card | concurrency | throttle | Split 行为 | 输出 |
+|------|-------------|----------|------------|------|
+| 2.5e6 | 1 | true（若快照平均耗时 < 15s） | `Split(1)` 直接返回 `[]*Cache{c}`，不新建 ring | 1 个 goroutine 顺序写 |
+| 3e6（边界） | 4 | false | `Split(4)`：4 个子 ring，每个 4 个槽位有数据 | 4 个 goroutine 并发写 |
+| 4e6 | 4 | false | 同上 | 同上 |
+
+> `concurrency := card / 2e6` 是整数除法；`card < 3e6` 时最大只能得 **1**，`card >= 3e6` 被强制改成 **4**。因此 **2 和 3 永远不可达**；若未来调整 2e6 分母，必须同步改本节与 §6.6 的案例。
+
+**可达案例（card=4e6 → concurrency=4）**：
 
 ```
-card = 4,000,000
-concurrency = 4e6 / 2e6 = 2          (card >= 3e6 分支会覆盖为 4? 否: 4e6 >= 3e6 → concurrency=4, throttle=false)
+原 ring 16 分区: [p0, p1, ..., p15]
+split(4):
+  子ring0: partitions[0]=p0, [4]=p4, [8]=p8,  [12]=p12
+  子ring1: partitions[1]=p1, [5]=p5, [9]=p9,  [13]=p13
+  子ring2: partitions[2]=p2, [6]=p6, [10]=p10,[14]=p14
+  子ring3: partitions[3]=p3, [7]=p7, [11]=p11,[15]=p15
+其余槽位由 newring(16) 创建为空 partition（非 nil，store 为空 map）
+每个 goroutine 只从自己那 4 个槽位读到 key，写出的 TSM 文件互不重叠
 ```
 
-> 注意: `card >= 3e6` 的特例分支会把 concurrency 强制设为 4 并关闭 throttle。所以 `card=4e6` 实际走的是 `concurrency=4`。
-> 取一个不触发特例的例子: `card=2,500,000` → `concurrency = 2.5e6/2e6 = 1` (整除向下取整为 1)。
-> 取 `card=5,500,000`: 仍 >= 3e6 → concurrency=4。
-> 真正落到 `concurrency=2` 需要触发不到特例且整除得 2, 例如 `card=4,000,000` 在旧版本 (无 3e6 特例) 时为 2; 当前源码下 4e6 命中特例为 4。下面以概念性 concurrency=2 说明 split 行为:
-
-```
-原 ring 16 分区: [p0, p1, p2, ..., p15]
-split(2):
-  子ring₀: partitions[0]=p0, [2]=p2, [4]=p4, ..., [14]=p14  (偶数槽)
-           其余槽位 (1,3,...,15) 为 newring 创建的空 partition
-  子ring₁: partitions[1]=p1, [3]=p3, [5]=p5, ..., [15]=p15  (奇数槽)
-           其余槽位 (0,2,...,14) 为空 partition
-
-goroutine 0 遍历 子ring₀: 只会从 p0,p2,...,p14 读到 key (奇数槽空 map 贡献 0 key)
-goroutine 1 遍历 子ring₁: 只会从 p1,p3,...,p15 读到 key
-
-结果: 两个 goroutine 分别写各自的 TSM 文件, 互不重叠, 并发度 = 2
-```
+**card=2.5e6 的最常见路径**：`Split(1)` 返回原 Cache 本身（`cache.go:507-510`），不发生任何 ring 搬移；1 个 goroutine 顺序编码，`throttle` 取决于 `snapshotLatencies.avg() < 15s`。
 
 ### 6.6 WriteMulti 错误路径的乐观 size 回滚
 
 `Cache.WriteMulti` (cache.go:319) 采用**乐观策略**: 在调用 `store.write` 之前就先用 `c.increaseSize(addedSize)` 原子地占位总 size，避免在写入循环中持锁计算精确大小。如果某个 key 的 `store.write` 失败（例如 `entry.add` 返回 `ErrFieldTypeConflict`），就在原地用 `c.decreaseSize(...)` 把那一份的大小减回去，同时从本地 `addedSize` 累加器里扣掉，保证最后 `updateMemSize(addedSize)` 统计正确。
 
 ```go
-// tsdb/engine/tsm1/cache.go:339 — WriteMulti 乐观 size + 回滚
+// tsdb/engine/tsm1/cache.go:319 — WriteMulti 乐观 size + 回滚
     // We'll optimistially set size here, and then decrement it for write errors.
     c.increaseSize(addedSize)                    // ① 先占位 (原子加)
     for k, v := range values {
@@ -1011,37 +1034,41 @@ sequenceDiagram
 
 > **注意**: 即使有 key 失败 (`werr != nil`)，`WriteOK` 仍然 `+1`——这条统计的是"本次 WriteMulti 调用本身完成"，而 `WriteDropped`/`WriteErr` 才标记失败。返回值是 `werr`，调用方据此判断是否有部分丢弃。
 
-**案例 (write 失败 → size 回滚)**:
+**案例 (同一 key 先 Float 后 Integer → size 回滚)**:
 
 ```
 初始: c.size = 10MB, maxSize = 50MB
+
+第一批:
 WriteMulti({
-  "cpu,host=a#!~#value": [FloatValue(t=1), FloatValue(t=2)],   // Size() = 40B
-  "cpu,host=b#!~#value": [IntegerValue(t=1)],                   // Size() = 16B
+  "cpu,host=a#!~#value": [FloatValue(t=1), FloatValue(t=2)],   // Size() = 2 × 16B = 32B
 })
+addedSize = 32B
+Size() + addedSize = 10MB + 32B < 50MB → 通过限制检查
+① increaseSize(32) → size = 10MB + 32B
+  write("cpu,host=a#!~#value", [Float...]) → (newKey=true, nil)
+  ④ increaseSize(len(k)=19) → size += 19，entry.vtype = valueType(FloatValue) = 1
 
-addedSize = 40 + 16 = 56B
-Size() + addedSize = 10MB + 56B < 50MB → 通过限制检查
-
-① increaseSize(56) → size = 10MB + 56B
-
-循环:
-  write("cpu,host=a", [FloatValue...]) → (newKey=true, nil)
-    ④ increaseSize(len("cpu,host=a#!~#value")=20) → size += 20
-  write("cpu,host=b", [IntegerValue...])
-    → entry.add 检测到 vtype 冲突 (已有 FloatValue, 来了 IntegerValue)
-    → 返回 ErrFieldTypeConflict
-    ② addedSize -= 16 → addedSize = 40
-    ③ decreaseSize(16) → size -= 16 (回滚)
+第二批 (同一个 composite key，改成 Integer):
+WriteMulti({
+  "cpu,host=a#!~#value": [IntegerValue(t=3)],                   // Size() = 16B
+})
+① increaseSize(16) → size += 16
+  partition 命中已有 entry → entry.add 检查 e.vtype=1
+  valueType(IntegerValue)=2 ≠ 1 → 返回 ErrFieldTypeConflict
+  ② addedSize -= 16 → addedSize = 0
+  ③ decreaseSize(16) → size -= 16 (回滚)
 
 werr = ErrFieldTypeConflict
 ⑤ WriteDropped++, WriteErr++
-⑥ updateMemSize(40)   // 净增量 = 40B (成功的那批)
+⑥ updateMemSize(0)        // 本批净增量 = 0
 WriteOK++
 
-返回: ErrFieldTypeConflict (调用方知悉 "cpu,host=b" 被丢弃, "cpu,host=a" 已写入)
-最终 size = 10MB + 56B + 20B - 16B = 10MB + 60B  (与实际写入一致)
+返回: ErrFieldTypeConflict (调用方知悉这条 Integer 被丢弃, 之前写入的 Float 保留)
+最终 size = 10MB + 32B + 19B = 10MB + 51B (与实际写入一致)
 ```
+
+> key 长度 `19 = len("cpu,host=a") + len("#!~#") + len("value") = 10 + 4 + 5`；`WriteMulti` 的 map key 就是完整 composite key，`store.write(k, v)` 直接接收它，不再二次拼接。
 
 ### 6.7 ClearSnapshot 的 store 复用细节
 
@@ -1148,7 +1175,7 @@ sequenceDiagram
 ### 7.1 CacheLoader 结构体
 
 ```go
-// tsdb/engine/tsm1/cache.go:686 — CacheLoader
+// tsdb/engine/tsm1/cache.go:685 — CacheLoader
 type CacheLoader struct {
     files  []string    // WAL segment 文件列表 (已排序)
     Logger *zap.Logger
@@ -1158,7 +1185,7 @@ type CacheLoader struct {
 ### 7.2 CacheLoader.Load — 从 WAL 恢复 Cache
 
 ```go
-// tsdb/engine/tsm1/cache.go:704 — Load
+// tsdb/engine/tsm1/cache.go:703 — Load
 func (cl *CacheLoader) Load(cache *Cache) error {
     var r *WALSegmentReader
     for _, fn := range cl.files {
@@ -1305,7 +1332,7 @@ flowchart TD
 | partition.mu | RWMutex | store map | 分区级 |
 | partition.write | 双重检查锁 | 新 entry 创建 | 分区级 |
 | entry.mu | RWMutex | values 切片 | entry 级 |
-| entry.vtype | byte | `0` 表示空 entry；非空后为只读类型标签 | entry 级 |
+| entry.vtype | byte | `0` 表示空 entry；对 Float/Integer/String/Boolean 非空后为只读类型标签，**Unsigned 是例外（恒为 0）** | entry 级 |
 
 ## 9. 具体案例
 
@@ -1329,33 +1356,39 @@ goroutine 100: key="mem,host=web99#!~#value" → xxhash%16=12 → 分区 12
 
 ### 9.2 Snapshot 期间写入不中断案例
 
-> **场景**: Cache 达到 25MB，触发 Snapshot
+> **场景**: Cache 超过 25MB 快照阈值，在某个 1s tick 上被 `ShouldCompactCache` 发现
 
 ```
-t=0ms    Cache.Size() = 25MB, 触发 ShouldCompactCache()
-t=1ms    Snapshot():
-           - mu.Lock()
+某次 1s tick（compactCache 的 time.NewTicker(time.Second)，engine.go:2089-2091）
+  Cache.Size() > 25MB（CacheFlushMemorySizeThreshold 默认 25MB，config.go:29）
+  → ShouldCompactCache(time.Now()) 返回 true（engine.go:2121-2136）
+
+t=0（同一次 tick 内）  WriteSnapshot():
+           - e.mu.Lock() → WAL.CloseSegment() + ClosedSegments() → Cache.Snapshot()（engine.go:1976-1994）
            - 交换 live.store ↔ snapshot.store (O(1))
            - snapshotSize = 25MB
            - size = 0
            - store.reset()
-           - mu.Unlock()
-t=1ms    Snapshot 返回，写入不中断
+           - e.mu.Unlock()
+  → Snapshot 返回，写入不中断
 
-t=2ms    新写入到达:
+t≈0  新写入到达:
            - increaseSize(1KB) → size = 1KB
            - store.write(key, values) → 写入新的空 live store
            - 正常返回
 
-t=100ms  Compactor 开始处理 snapshot:
-           - 读取 snapshot 的 ring (25MB 数据)
-           - 写入 TSM 文件
+t≈0  snapshot.Deduplicate() 与 Compactor.WriteSnapshot() 开始（锁外执行）
 
-t=500ms  Compactor 完成:
+（Compactor 完成时间取决于数据量与磁盘，不在固定的 100ms/500ms 上）
+
+Compactor 完成:
            - ClearSnapshot(success=true)
            - snapshotSize = 0
            - 总内存: Size() = size (新数据)
 ```
+
+> **触发粒度**：`compactCache` 只在 `time.NewTicker(time.Second)` 的 tick 上检查（`engine.go:2089-2111`），所以实际触发点最多比"刚超过 25MB"晚约 1 秒，不存在"达到 25MB 的瞬间立即快照"。
+> **另一条触发条件**：写入冷时长，默认 **10 分钟**（`DefaultCacheSnapshotWriteColdDuration`，`tsdb/config.go:34`），且仅在 `Size()` 未超过 25MB 阈值时才会生效（`ShouldCompactCache` 先判断 `sz > CacheFlushMemorySizeThreshold`）。
 
 ## 10. 架构设计意图
 
@@ -1411,19 +1444,15 @@ flowchart LR
 
 ## 11. 潜在隐患与瓶颈
 
-### 11.1 Snapshot 期间内存翻倍
+### 11.1 Snapshot 期间的内存账本
 
-```
-Snapshot 期间:
-  live store: 0 (刚清空)
-  snapshot store: 25MB (旧数据)
-  新写入: 逐渐增长
+默认值：`maxSize = 1GB`（`DefaultCacheMaxMemorySize`，`tsdb/config.go:25`，由 `engine.go:248` 传入 `NewCache`）；快照阈值 `25MB`（`DefaultCacheSnapshotMemorySize`，`tsdb/config.go:29` → `engine.go:281` 的 `CacheFlushMemorySizeThreshold`）。**两者不是同一个值。**
 
-  Size() = snapshotSize + size = 25MB + 新数据大小
-  如果新数据也写到 25MB，总内存 = 50MB
-```
-
-**影响**: 如果 maxSize=25MB，Snapshot 期间实际可用内存是 50MB。在内存受限的环境中可能导致 OOM。
+- `Size() = size + snapshotSize`（`cache.go:471-474`），而写入上限判定是 `Size() + addedSize > maxSize`（`cache.go:328-332`）。因此 snapshotSize 会占用写入预算，而不是"额外赠送一份内存"。
+- t0：`size = 25MB` 触发快照 → `size = 0`、`snapshotSize = 25MB`；此时 `Size() = 25MB`，距离 1GB 上限还有约 1023MB 可写。
+- t1：新写入 1MB → `Size() = 26MB`，允许；可继续写到约 1GB。
+- **反例**：若把 `cache-max-memory-size` 配成 25MB，则 t0 之后 `Size()` 已经是 25MB，t1 的第一次写入就返回 `ErrCacheMemorySizeLimitExceeded`。"50MB 峰值"在当前代码里不会出现。
+- **失败重试会持续占用预算**：`ClearSnapshot(false)` 只把 `snapshotting` 置 false，不清 `snapshotSize`（`cache.go:449-468`）；下一轮 `Snapshot()` 命中 `Size() > 0` 直接返回旧 snapshot（`cache.go:400-404`）。因此"快照连续失败 → snapshotSize 一直占着 maxSize 预算 → 写入持续被拒"是真实可发生的失败模式。
 
 ### 11.2 Cache.Write 的 []byte → string 分配
 

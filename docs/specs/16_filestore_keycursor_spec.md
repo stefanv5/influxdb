@@ -190,14 +190,16 @@ type TSMFile interface {
 ### 2.3 FileStat — 文件元数据
 
 ```go
-// tsdb/engine/tsm1/file_store.go:199 — FileStat
+// tsdb/engine/tsm1/file_store.go:237 — FileStat
 type FileStat struct {
-    Path         string
-    HasTombstone bool
-    Size         uint32
-    LastModified int64
+    Path             string
+    HasTombstone     bool
+    Size             uint32
+    LastModified     int64
     MinTime, MaxTime int64
     MinKey, MaxKey   []byte
+    Generation       int
+    Sequence         int
 }
 ```
 
@@ -213,10 +215,10 @@ sequenceDiagram
     Engine->>FS: Open()
 
     FS->>Dir: 读取目录, 查找 *.tsm 文件
-    Dir-->>FS: [000001-01.tsm, 000002-01.tsm, ...]
+    Dir-->>FS: [000000001-000000001.tsm, 000000002-000000001.tsm, ...]
 
     loop 每个 TSM 文件 (并行, 限制 GOMAXPROCS)
-        FS->>FS: parseFileName() → generation, sequence
+        FS->>FS: ParseFileName() → generation, sequence
         FS->>TSMR: NewTSMReader(file, f.readerOptions...)
         Note over TSMR: mmap 整个文件<br>解析 Index → indirectIndex<br>加载 Tombstone
 
@@ -244,7 +246,7 @@ func (f *FileStore) Open() error {
     files, _ := filepath.Glob(filepath.Join(f.dir, fmt.Sprintf("*.%s", TSMFileExtension)))
 
     // 2. 并行打开文件 (限制并发数 = GOMAXPROCS)
-    readerC := make(chan *res, len(files))
+    readerC := make(chan *res)   // 无缓冲：主循环遇到首个错误立即返回，其余 goroutine 会阻塞在发送上
     for _, fn := range files {
         go func(fn string) {
             f.openLimiter.Take()  // 获取并发令牌
@@ -274,7 +276,7 @@ func (f *FileStore) Open() error {
     // 3. 收集结果
     for range files {
         res := <-readerC
-        if res.err != nil { return res.err }
+        if res.err != nil { return res.err }   // 首个错误立即返回
         f.files = append(f.files, res.r)
     }
 
@@ -283,6 +285,10 @@ func (f *FileStore) Open() error {
     // ... 累加 DiskBytes, 跟踪 lastModified
 }
 ```
+
+> **无缓冲 channel 的后果**: `readerC` 没有缓冲。主循环一遇到 `res.err != nil` 就 `return`，
+> 之后不再接收；其余尚未发送的 goroutine 会永久阻塞在 `readerC <- ...` 上
+> （`file_store.go:613,631-670`）。进程不会因此崩溃，但这些 goroutine 会泄漏到 `Open` 重新调用为止。
 
 ### 2.5 FileStore.Close — 关闭所有文件
 
@@ -308,74 +314,111 @@ func (f *FileStore) Close() error {
 ### 2.6 FileStore.Replace — 原子替换文件
 
 ```go
-// tsdb/engine/tsm1/file_store.go:733 — replace
+// tsdb/engine/tsm1/file_store.go:896 — replace
 func (f *FileStore) replace(oldFiles, newFiles []string, updatedFn func(r []TSMFile)) error {
-    if len(oldFiles) == 0 && len(newFiles) == 0 {
-        return nil
-    }
+    if len(oldFiles) == 0 && len(newFiles) == 0 { return nil }
 
+    f.mu.RLock(); maxTime := f.lastModified; f.mu.RUnlock()
     updated := make([]TSMFile, 0, len(newFiles))
+    tsmTmpExt := fmt.Sprintf("%s.%s", TSMFileExtension, TmpTSMFileExtension)
 
-    // 步骤 1: 处理新文件
     for _, file := range newFiles {
-        // Observer 回调: FileFinishing
-        f.obs.FileFinishing(file)
+        if !strings.HasSuffix(file, tsmTmpExt) && !strings.HasSuffix(file, TSMFileExtension) {
+            continue // 非 .tsm/.tsm.tmp 直接跳过
+        }
+        if err := f.obs.FileFinishing(file); err != nil { return err }
 
-        // 重命名 .tsm.tmp → .tsm
-        newName := file
-        if strings.HasSuffix(file, ".tsm.tmp") {
+        oldName, newName := file, file
+        if strings.HasSuffix(oldName, tsmTmpExt) {
             newName = file[:len(file)-4]
-            os.Rename(file, newName)
+            if err := os.Rename(oldName, newName); err != nil {
+                return fmt.Errorf("failed renaming %s to %s: %w", oldName, newName, err)
+            }
         }
 
-        // 打开新文件
-        fd, _ := os.Open(newName)
-        tsm, _ := NewTSMReader(fd, f.readerOptions...)
+        // 失败时把已 rename 的新文件改名回 .tsm.tmp，交给调用方删除
+        fd, err := os.Open(newName)
+        if err != nil {
+            err = fmt.Errorf("failed opening %s: %w", newName, err)
+            if newName != oldName {
+                if err1 := os.Rename(newName, oldName); err1 != nil {
+                    return errors.Join(err, fmt.Errorf("failed renaming %s to %s: %w", oldName, newName, err1))
+                }
+            }
+            return err
+        }
+
+        if stat, err := fd.Stat(); err == nil {
+            if maxTime.IsZero() || stat.ModTime().UTC().After(maxTime) {
+                maxTime = stat.ModTime().UTC()
+            }
+        }
+
+        tsm, err := NewTSMReader(fd, f.readerOptions...)
+        if err != nil {
+            err = fmt.Errorf("failed creating TSMReader for %s: %w", newName, err)
+            if newName != oldName {
+                if err1 := os.Rename(newName, oldName); err1 != nil {
+                    return errors.Join(err, fmt.Errorf("failed renaming %s to %s: %w", oldName, newName, err1))
+                }
+            }
+            return err
+        }
         tsm.WithObserver(f.obs)
         updated = append(updated, tsm)
     }
 
-    // 步骤 2: 替换文件列表 (持有写锁)
+    if updatedFn != nil { updatedFn(updated) }
+
     f.mu.Lock()
     defer f.mu.Unlock()
-
     updated = append(updated, f.files...)
+
     var active, inuse []TSMFile
     for _, file := range updated {
         keep := true
         for _, remove := range oldFiles {
-            if remove == file.Path() {
-                keep = false
-
-                // Observer 回调: FileUnlinking
-                f.obs.FileUnlinking(file.Path())
-
-                // 处理正在被查询使用的文件
-                if file.InUse() {
-                    // 重命名为临时路径, 延迟清理
-                    file.Rename(file.Path() + ".tmp")
-                    inuse = append(inuse, file)
-                    continue
-                }
-
-                file.Close()
-                file.Remove()
-                break
+            if remove != file.Path() { continue }
+            keep = false
+            if err := f.obs.FileUnlinking(file.Path()); err != nil { return err }
+            if ts := file.TombstoneStats(); ts.TombstoneExists {
+                if err := f.obs.FileUnlinking(ts.Path); err != nil { return err }
             }
+            if file.InUse() {
+                // 先把该 TSM 关联的 tombstone 文件路径收集起来
+                var deletes []string
+                if ts := file.TombstoneStats(); ts.TombstoneExists {
+                    deletes = append(deletes, ts.Path)
+                }
+                tempPath := fmt.Sprintf("%s.%s", file.Path(), TmpTSMFileExtension)
+                if err := file.Rename(tempPath); err != nil { return err }
+                for _, d := range deletes {
+                    if err := os.Remove(d); err != nil { return err }
+                }
+                inuse = append(inuse, file)
+                continue
+            }
+            if err := file.Close(); err != nil { return err }
+            if err := file.Remove(); err != nil { return err }
+            break
         }
-        if keep {
-            active = append(active, file)
-        }
+        if keep { active = append(active, file) }
     }
 
-    // 步骤 3: 延迟清理 in-use 文件
+    if err := file.SyncDir(f.dir); err != nil { return err }
     f.purger.add(inuse)
 
-    // 步骤 4: 更新状态
-    f.lastFileStats = nil  // 清除缓存
+    // 时间戳至少 +1ns，保证 lastModified 变化
+    if maxTime.Equal(f.lastModified) || maxTime.Before(f.lastModified) {
+        maxTime = f.lastModified.UTC().Add(1)
+    }
+    f.lastModified = maxTime.UTC()
+    f.lastFileStats = nil
     f.files = active
     sort.Sort(tsmReaders(f.files))
-    // 重新计算 DiskBytes
+    atomic.StoreInt64(&f.stats.FileCount, int64(len(f.files)))
+    // 重算 DiskBytes
+    return nil
 }
 ```
 
@@ -417,9 +460,15 @@ sequenceDiagram
 ```
 
 **关键设计**:
-- **InUse 保护**: 如果旧文件正在被查询使用（`Ref() > 0`），不会立即删除，而是重命名为 `.tmp` 并交给 `purger` 延迟清理
-- **Observer 回调**: `FileFinishing` 和 `FileUnlinking` 是 Enterprise 复制的钩子，OSS 版本是 no-op
-- **原子性**: 整个替换过程在写锁内完成，查询侧看到的要么是旧文件列表，要么是新文件列表
+- **InUse 保护**: 如果旧文件正在被查询使用（`Ref() > 0`），不会立即删除，而是重命名为 `.tsm.tmp`（`TmpTSMFileExtension`）并连同其 tombstone 一起交给 `purger` 延迟清理
+- **Observer 回调**: `FileFinishing` 和 `FileUnlinking` 是 Enterprise 复制的钩子，OSS 版本是 no-op；`FileFinishing`/`FileUnlinking` 的错误会直接返回
+- **原子性**: 新文件的 rename/open 在**锁外**完成；只有“替换文件列表”在写锁内完成。锁内失败会返回错误，旧列表保持不变，并不是整个 `replace` 都在写锁内。
+
+**失败语义**:
+- 旧文件保持不变：锁内循环在真正 `f.files = active` 之前就返回错误。
+- 失败的新文件被 rename 回 `.tsm.tmp`，由调用方删除；**已经打开的先前 reader 不会被关闭**（源码如此），调用方需按返回值处理。
+- `InUse()` 的文件 rename 成 `.tsm.tmp` 后由 purger 在查询结束后删除；对应的 tombstone 文件在锁内立即 `os.Remove`。
+- `SyncDir` 失败会让 `replace` 返回错误，此时 `f.files = active` **尚未执行**，内存中的文件列表保持旧值；但循环里已经 `Close/Remove`（或 rename 成 `.tsm.tmp`）的旧文件不会回滚，磁盘状态与内存列表可能短暂不一致，调用方应按失败处理。
 
 ### 2.7 purger — 延迟清理器
 
@@ -516,7 +565,7 @@ func (f *FileStore) Stats() []ExtFileStat {
     for _, fd := range f.files {
         stats, err := fd.ExtStats()
         if err != nil {
-            f.logger.Warn("error during fd.ExtStats", zap.Error(err))
+            f.logger.Warn("error during fd.Stats", zap.Error(err))
         }
         f.lastFileStats = append(f.lastFileStats, stats)
     }
@@ -525,6 +574,117 @@ func (f *FileStore) Stats() []ExtFileStat {
 ```
 
 **缓存失效**: 当文件被添加、删除或替换时，`lastFileStats` 被设为 `nil`，强制下次调用重新计算。
+
+### 2.9 FileStore 并发生命周期
+
+**引用计数状态机**:
+
+- `SetNewReadersBlocked(true)` 在 `f.mu.Lock` 下 `newReaderBlockCount++`；传 `false` 时 `--`，
+  减到负数会报错；`newReadersBlocked() = count > 0`（`file_store.go:795-820`）。
+- `InUse()` 必须在 `SetNewReadersBlocked(true)` 之后调用，否则返回
+  `InUse called without a new reader block`（`file_store.go:824-836`）。
+  这是“先冻结新 reader，再判断是否有人在用”的竞态规避：冻结后不会再有新的 `Ref` 进来。
+
+**入口在 blocked 时的行为**:
+
+| 入口 | blocked 时行为 | 代码 |
+|---|---|---|
+| `WalkKeys` | 返回 `ErrNewReadersBlocked` | `file_store.go:422-448` |
+| `Apply` | 返回 `ErrNewReadersBlocked` | `file_store.go:485-515` |
+| `TSMReader` | 返回 `ErrNewReadersBlocked` | `file_store.go:770-790` |
+| `CreateSnapshot` | 返回 `ErrNewReadersBlocked` | `file_store.go:1297-1320` |
+| `KeyCursor` | **返回空游标（不报错）** | `file_store.go:839-856` |
+
+**关键代码路径**:
+
+```go
+// tsdb/engine/tsm1/file_store.go:795-820 — SetNewReadersBlocked
+func (f *FileStore) SetNewReadersBlocked(block bool) error {
+    f.mu.Lock()
+    defer f.mu.Unlock()
+    if block {
+        f.newReaderBlockCount++      // 冻结新 reader
+    } else {
+        f.newReaderBlockCount--      // 解冻（<=0 时报错）
+    }
+    return nil
+}
+
+// tsdb/engine/tsm1/file_store.go:824-836 — InUse
+func (f *FileStore) InUse() (bool, error) {
+    f.mu.RLock()
+    defer f.mu.RUnlock()
+    if !f.newReadersBlocked() {      // 必须先 SetNewReadersBlocked(true)
+        return false, fmt.Errorf("InUse called without a new reader block for %q", f.dir)
+    }
+    for _, r := range f.files {
+        if r.InUse() { return true, nil }
+    }
+    return false, nil
+}
+
+// tsdb/engine/tsm1/file_store.go:839-856 — KeyCursor 在 blocked 时返回空游标
+if f.newReadersBlocked() {
+    return &KeyCursor{key: key, seeks: nil, ctx: ctx, ascending: ascending}
+}
+
+// tsdb/engine/tsm1/reader.go:409-426 — Ref / Unref / InUse
+func (t *TSMReader) Ref()        { atomic.AddInt64(&t.refs, 1); t.refsWG.Add(1) }
+func (t *TSMReader) Unref()      { atomic.AddInt64(&t.refs, -1); t.refsWG.Done() }
+func (t *TSMReader) InUse() bool { return atomic.LoadInt64(&t.refs) > 0 }
+```
+
+逐步顺序:
+1. `SetNewReadersBlocked(true)` 先冻结（写锁），此后不会再有新的 `Ref` 进入。
+2. `InUse()` 必须在冻结之后调用，否则返回错误。
+3. `Replace`/删除在写锁内逐文件处理：在用时 `Rename(.tsm.tmp)`，不在用时 `Close + Remove`。
+4. 查询结束 `Unref` → `refs==0`；`TSMReader.Close` 的 `refsWG.Wait()` 才放行 munmap。
+5. purger 每秒轮询，`refs` 归零后删除 `.tsm.tmp`。
+6. `SetNewReadersBlocked(false)` 解冻。
+
+**生命周期**:
+
+```
+Open → 正常
+  → SetNewReadersBlocked(+1)
+  → InUse / Replace
+       ├─ InUse=true  → Rename(.tsm.tmp) + purger
+       └─ InUse=false → Close + Remove
+  → Unref
+  → purger 每秒轮询，refs==0 后 Remove
+  → SetNewReadersBlocked(-1)
+  → Free
+```
+
+**引用计数**: `TSMReader.Ref` 原子 +1、`refsWG.Add(1)`；`Unref` 原子 -1、`refsWG.Done()`；
+`Close` 先 `refsWG.Wait()` 再 munmap/关索引（`reader.go:393-420`）。`Ref` 保护的是
+mmap 生命周期，不是 slice 拷贝。
+
+**删除进行中的查询案例**:
+
+```
+DeleteShard → SetShardNewReadersBlocked(true)
+  → FileStore.InUse()（必须先 block，否则报错）
+  → Replace(Rename .tsm.tmp)
+  → 查询侧 KeyCursor 拿到空游标（seeks=nil，Read*Block 返回 nil）
+  → 查询 Close/Unref → refs 归零
+  → purger 下一次轮询 Remove
+  → SetNewReadersBlocked(false)
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> Open
+    Open --> Normal
+    Normal --> Blocked: SetNewReadersBlocked(true)<br/>f.mu.Lock
+    Blocked --> InUseCheck: InUse() / Replace<br/>f.mu.RLock / f.mu.Lock
+    InUseCheck --> Renamed: refs > 0<br/>Rename(.tsm.tmp)
+    InUseCheck --> Removed: refs == 0<br/>Close + Remove
+    Renamed --> Removed: purger 轮询 refs==0
+    Removed --> Blocked: Unref 完成
+    Blocked --> Free: SetNewReadersBlocked(false)<br/>f.mu.Lock
+    Free --> [*]
+```
 
 ## 3. KeyCursor — 多文件键游标
 
@@ -659,7 +819,26 @@ flowchart TD
     K --> L["添加到 locations"]
 ```
 
-### 3.4 newKeyCursor — 创建游标
+### 3.4 FileStore.KeyCursor → newKeyCursor — 创建游标
+
+入口先检查 `newReadersBlocked()`：删除进行中时**返回空游标而不是错误**，因为查询调用方
+通常不处理 nil 游标（`file_store.go:839-856`）：
+
+```go
+// tsdb/engine/tsm1/file_store.go:839 — FileStore.KeyCursor
+func (f *FileStore) KeyCursor(ctx context.Context, key []byte, t int64, ascending bool) *KeyCursor {
+    f.mu.RLock()
+    defer f.mu.RUnlock()
+    if f.newReadersBlocked() {
+        // 删除进行中：返回空游标，seeks=nil
+        return &KeyCursor{
+            key: key, seeks: nil, ctx: ctx,
+            col: metrics.GroupFromContext(ctx), ascending: ascending,
+        }
+    }
+    return newKeyCursor(ctx, f, key, t, ascending)
+}
+```
 
 ```go
 // tsdb/engine/tsm1/file_store.go:1448 — newKeyCursor
@@ -697,6 +876,11 @@ func newKeyCursor(ctx context.Context, fs *FileStore, key []byte, t int64, ascen
 ```go
 // tsdb/engine/tsm1/file_store.go:1485 — seek
 func (c *KeyCursor) seek(t int64) {
+    if len(c.seeks) == 0 {
+        return                 // 空游标（blocked 或 key 不存在）直接早退
+    }
+    c.current = nil            // 每次 seek 前清空候选，避免残留上一轮 location
+
     if c.ascending {
         c.seekAscending(t)
     } else {
@@ -708,7 +892,7 @@ func (c *KeyCursor) seek(t int64) {
 func (c *KeyCursor) seekAscending(t int64) {
     // 找到所有包含或晚于 seekTime 的候选 block。
     // pos 只记录第一个候选；current 会收集后续候选，供 Read*Block 去重归并。
-    // 注意: c.current 已由 seek() 在调用前清空 (c.current = nil)。
+    // c.current 已由 seek() 在调用前清空 (c.current = nil)；seeks 为空时 seek() 直接早退。
     for i, e := range c.seeks {
         if t < e.entry.MinTime || e.entry.Contains(t) {
             // 首个匹配 block 记录其 pos (first-match-wins via len(c.current)==0)
@@ -855,71 +1039,66 @@ func (c *KeyCursor) nextDescending() {
 
 ```mermaid
 sequenceDiagram
-    participant Q as Query (descending, t=500)
+    participant Q as Query 降序查询 t=500
     participant KC as KeyCursor
-    participant S as seeks (descLocations 排序, MaxTime 降序)
+    participant S as seeks 数组
 
-    Note over S: 假设 seeks = [L3(500-700), L2(400-600), L1(100-300)]<br/>(descLocations 按 MaxTime 降序)
+    Note over S: f.files 按路径升序为 [TSM3 最旧, TSM2, TSM1 最新]<br/>descLocations 在不重叠时按 MaxTime 升序，排序结果 [L3 300, L2 600, L1 700]
 
     Q->>KC: seekDescending(500)
-    loop i = 2 → 0 (反向)
-        KC->>S: i=2: L3.MaxTime=700, 500 > 700? 否; Contains(500)? 是 → 候选, pos=2
-        KC->>S: i=1: L2.MaxTime=600, 500 > 600? 否; Contains(500)? 是 → 候选
-        KC->>S: i=0: L1.MaxTime=300, 500 > 300? 是 → 候选 (t > MaxTime 表示 block 完全在 seek 之后, 降序要包含)
+    loop i = 2 → 0 反向遍历
+        KC->>S: i=2 L1 的范围 [500-700]，Contains(500) 是 → pos=2，current=[L1]
+        KC->>S: i=1 L2 的范围 [400-600]，Contains(500) 是 → current=[L1, L2]
+        KC->>S: i=0 L3 的范围 [100-300]，500 > 300 是 → current=[L1, L2, L3]
     end
-    Note over KC: current = [L3, L2, L1], pos = 2
+    Note over KC: current = [L1, L2, L3]，pos = 2
 
-    Q->>KC: ReadFloatBlock (descending 分支)
-    Note over KC: first = L3, 向右扩展 maxT, 首个 overlap 扩展 minT
-    KC->>KC: 归并 L2, L1 中与窗口重叠的未读值
+    Q->>KC: ReadFloatBlock 降序分支
+    Note over KC: first=L1，向更早方向扩展窗口并归并 L2/L3
     KC-->>Q: 返回降序合并值
 
     Q->>KC: Next()
-    KC->>KC: current[0].read()? 否 (还有未读) → 直接返回, 不推进
-    Note over KC: 直到 current[0] 完全读完, 才 nextDescending
-
-    Q->>KC: Next() (current[0] 已读完)
-    KC->>KC: nextDescending()
-    KC->>KC: pos-- (从 2 → 1 → 0, 跳过已读)
-    Note over KC: current = [L_next], 候选循环从 i=c.pos 起向下收集
+    KC->>KC: current[0].read() 为 false 时直接返回，不推进
+    Note over KC: current[0] 完全读完后才调用 nextDescending
+    Q->>KC: Next() 再次调用
+    KC->>KC: nextDescending 中 pos--，跳过已读 location
 ```
 
-**案例 (查询 t=500 降序, 收集哪些 locations)**:
+**配套文字案例**:
 
 ```
-文件状态 (3 个 TSM, 同一 key):
-  TSM1 (Level 2, 最新): block [500-700]
-  TSM2 (Level 1):       block [400-600]
-  TSM3 (Level 0, 最旧): block [100-300]
+文件状态（f.files 顺序 = Path 升序 = 最旧→最新）:
+  TSM3 (gen1, 最旧): block [100-300]
+  TSM2 (gen2):       block [400-600]
+  TSM1 (gen3, 最新): block [500-700]
 
-locations(key, t=500, ascending=false):
-  TSM1: minTime=500, maxTime=700; 降序 minTime>500? 否 → 不跳过文件
-        entries: [500-700]; 降序 ie.MinTime>500? 500>500 否 → 不跳过
-        → location L1 = {TSM1, [500-700], readMin=501, readMax=MaxInt64}
-  TSM2: minTime=400, maxTime=600; 降序 minTime>500? 否 → 不跳过
-        entries: [400-600]; 降序 ie.MinTime=400>500? 否 → 不跳过
-        → location L2 = {TSM2, [400-600], readMin=501, readMax=MaxInt64}
-  TSM3: minTime=100, maxTime=300; 降序 minTime=100>500? 否 → 不跳过
-        entries: [100-300]; 降序 ie.MinTime=100>500? 否 → 不跳过
-        → location L3 = {TSM3, [100-300], readMin=501, readMax=MaxInt64}
+descLocations.Less（不重叠按 MaxTime 升序；重叠按 Path 升序）:
+  [TSM3(300), TSM2(600), TSM1(700)]
+  → 别名 [L3, L2, L1]
 
-排序 (descLocations by MaxTime 降序):
-  L1: [500-700] (MaxTime=700)
-  L2: [400-600] (MaxTime=600)
-  L3: [100-300] (MaxTime=300)
-
-seekDescending(500):
-  i=0 (L1): 500 > 700? 否; Contains(500)? 500∈[500,700] 是 → 候选, pos=0, current=[L1]
-  i=1 (L2): 500 > 600? 否; Contains(500)? 500∈[400,600] 是 → 候选, current=[L1,L2]
-  i=2 (L3): 500 > 300? 是 → 候选 (t>MaxTime: block 完全在 seek 之前, 降序仍需读)
-            current=[L1,L2,L3]
-
-收集到的 locations: [L1, L2, L3] (current 全部)
-后续 ReadFloatBlock(descending) 会从 L1 (MaxTime 最大) 开始, 向更早扩展窗口,
-归并 L2/L3 中与窗口重叠的值, 同时间戳取更高 generation (L1 > L2 > L3) 的值。
+seekDescending(500): 从 i=2 反向
+  i=2 L1 [500-700]: 500 > 700 否，Contains(500) 是 → pos=2，current=[L1]
+  i=1 L2 [400-600]: Contains(500) 是 → current=[L1,L2]
+  i=0 L3 [100-300]: 500 > 300 是 → current=[L1,L2,L3]
+最终: pos=2，current=[L1,L2,L3]（即 [TSM1,TSM2,TSM3]）
 ```
+
+> 若不想依赖 `OverlapsTimeRange→Path` 的 tie-breaker，可用一组互不重叠的 block 作为补充示例：
+> file1 [100-300]、file2 [400-600]、file3 [700-900]，`seekDescending(500)` 在文件级跳过
+> file3，`pos=1, current=[L2,L1]`。
 
 ### 3.8 ReadFloatBlock — 解码 + Tombstone 过滤 + 重叠归并
+
+**生成方法总览**（`file_store.gen.go` / `file_store_array.gen.go` 由 `*.gen.go.tmpl` 生成；
+Integer/Unsigned/Boolean/String 的控制流与 Float 完全一致）:
+
+| 类型 | 单值方法（`[]XxxValue`） | 数组方法（`*tsdb.XxxArray`） | 文件 |
+|---|---|---|---|
+| Float | `ReadFloatBlock` | `ReadFloatArrayBlock` | `file_store.gen.go:10` / `file_store_array.gen.go:12` |
+| Integer | `ReadIntegerBlock` | `ReadIntegerArrayBlock` | 同上（生成代码） |
+| Unsigned | `ReadUnsignedBlock` | `ReadUnsignedArrayBlock` | 同上（生成代码） |
+| Boolean | `ReadBooleanBlock` | `ReadBooleanArrayBlock` | 同上（生成代码） |
+| String | `ReadStringBlock` | `ReadStringArrayBlock` | 同上（生成代码） |
 
 ```go
 // tsdb/engine/tsm1/file_store.gen.go:10 — ReadFloatBlock (关键算法)
@@ -1079,6 +1258,63 @@ flowchart TD
     U --> N
     N --> V["first.markRead(minT,maxT)"]
     V --> W["返回合并后的值"]
+```
+
+#### 3.8.1 一次可手工推演的完整升序读取循环
+
+数据（`f.files` 按 Path 升序 = 最旧→最新）:
+
+```
+file1 gen1 最旧: block [100-450] 值 (100,1)(200,2)(300,3)(400,4)(450,45)
+file2 gen2:      block [400-600] 值 (400,40)(500,50)(600,60)
+file3 gen3 最新: block [700-900] 值 (700,700)(800,800)(900,900)
+查询 key，seekTime=350，ascending=true
+```
+
+| 步骤 | 操作 | 结果 |
+|---|---|---|
+| 1 | `locations` | 3 个 location，`readMin=MinInt64, readMax=349`；file1 MaxTime=450 ≥ 350，文件级不跳过 |
+| 2 | `sort.Sort(ascLocations)` | `[L1(100), L2(400), L3(700)]`（无重叠，MinTime 升序） |
+| 3 | `seekAscending(350)` | i=0 L1 `Contains(350)=true` → `pos=0, current=[L1]`；i=1 L2 `350<400` → append；i=2 L3 `350<700` → append；`current=[L1,L2,L3]` |
+| 4 | `ReadFloatBlock` 第一次 | first=L1 解码 5 点 → `Exclude(-inf,349)` → `(400,4)(450,45)`；minT,maxT=400,450 |
+| 5 | 升序扩 minT | L2.Min=400 不 <400；L3.Min=700 不 <400 |
+| 6 | 首个 overlap 扩 maxT | L2 [400-600] 与 [400,450] 重叠 → maxT=600；`Include(400,600)` |
+| 7 | 归并 L2 | 解码 `(400,40)(500,50)(600,60)` → `Exclude(-inf,349)` 全保留 → `Include(400,600)` 全保留 → `Merge` 同时间戳取 b → 400→40，追加 500/600；`markRead(400,600)` |
+| 8 | L3 | `[700-900]` 与 `[400,600]` 不重叠 → `markRead(400,600)`，不解码 |
+| 9 | `first.markRead` | L1 `markRead(400,600)` |
+| 10 | 返回 | `(400,40)(450,45)(500,50)(600,60)` |
+| 11 | `Next()` | `current[0]=L1 read()=true` → `nextAscending`：pos++→1 L2 `read()=true`；pos++→2 L3 `read()=false` → `current=[L3]` |
+| 12 | `ReadFloatBlock` 第二次 | first=L3，`Exclude(readMin=MinInt64, readMax=600)` 对 700+ 无影响（`readMin` 由 `locations()` 初始化为 `MinInt64`，`markRead(400,600)` 只扩 `readMax`）；`len(current)==1` → `markRead(700,900)` → 返回 `(700,700)(800,800)(900,900)` |
+| 13 | `Next()` | L3 `read()=true` → pos=3 越界 → `current` 空 |
+| 14 | `ReadFloatBlock` 第三次 | `current` 空 → `(nil,nil)` |
+
+最终输出（跨三次 Read）:
+
+```
+(400,40)(450,45)(500,50)(600,60) + (700,700)(800,800)(900,900)
+= (400,40)(450,45)(500,50)(600,60)(700,700)(800,800)(900,900)
+```
+
+（100/200/300 因 seekTime=350 被裁掉；400 被 L2 的 40 覆盖。）
+
+**前提**: “同时间戳后者覆盖前者”依赖 `current` 顺序：`ascLocations` 主要按 MinTime、
+仅重叠时按 Path；不是显式按 generation 排序。正常零填充命名下 Path 序 = generation 序，
+所以“新值胜出”成立；backfill 出更早 MinTime 的新 generation 时，覆盖顺序可能不符合直觉。
+
+```mermaid
+flowchart LR
+    A["ReadFloatBlock"] --> B["first.ReadFloatBlockAt"]
+    B --> C["Exclude(readMin, readMax)"]
+    C --> D["升序扩 minT"]
+    D --> E["首个 overlap 扩 maxT + Include"]
+    E --> F{"候选循环"}
+    F --> G["decode → Exclude → Include → Merge → markRead"]
+    G --> F
+    F --> H["first.markRead(minT, maxT)"]
+    H --> I["return values"]
+    J["Next()"] --> K{"current[0].read()?"}
+    K -->|false| L["return（不推进）"]
+    K -->|true| M["nextAscending(pos++)"]
 ```
 
 ### 3.9 ReadFloatArrayBlock — 数组格式的同一套归并逻辑
@@ -1298,7 +1534,10 @@ func (a ascLocations) Less(i, j int) bool {
 }
 ```
 
-### 4.2 descLocations — 降序排序
+### 4.2 descLocations — 按 MaxTime 升序存储，供 seekDescending 反向遍历
+
+`Less` 在不重叠时按 **MaxTime 升序**；重叠时按 `Path()` 升序。降序语义来自
+`seekDescending/nextDescending` 从数组尾部向头部遍历，而不是由 `Less` 实现。
 
 ```go
 // tsdb/engine/tsm1/file_store.go:1422 — descLocations
@@ -1329,19 +1568,35 @@ type mergeKeyIterator struct {
 
 ### 5.2 使用场景
 
-`FileStore.WalkKeys()` 使用 `mergeKeyIterator` 遍历所有文件中的所有唯一 key（按字典序排序）。这在以下场景中使用：
-- `FileStore.Keys()` — 获取所有 key
-- Compaction — 需要按 key 顺序合并多个文件
+`mergeKeyIterator` 用于跨 TSM 文件的唯一 key 遍历（按字典序排序）：
+- `FileStore.Keys()` / `FileStore.WalkKeys()` — 获取所有 key；
+- TSM 索引重建（`engine.go:1217`）；
+- Digest 生成（`digest.go:72` 的 `newMergeKeyIterator(tsmFiles, nil)`）。
+
+> **注意**: compaction **不用** `mergeKeyIterator`，而是用
+> `NewTSMBatchKeyIterator`（`compact.go:1041`）——后者按 key 收集 block 并做合并/重编码。
 
 ```go
-// tsdb/engine/tsm1/file_store.go:346 — WalkKeys
+// tsdb/engine/tsm1/file_store.go:422 — WalkKeys
 func (f *FileStore) WalkKeys(seek []byte, fn func(key []byte, typ byte) error) error {
     f.mu.RLock()
-    files := make([]TSMFile, len(f.files))
-    copy(files, f.files)
-    f.mu.RUnlock()
+    if len(f.files) == 0 {
+        f.mu.RUnlock()
+        return nil                       // 空 store 直接返回
+    }
+    if f.newReadersBlocked() {
+        f.mu.RUnlock()
+        return fmt.Errorf("WalkKeys: %q: %w", f.dir, ErrNewReadersBlocked)
+    }
 
-    ki := newMergeKeyIterator(files, seek)
+    // Ref 每个 reader，保护 mmap 生命周期；不是 slice 拷贝
+    for _, r := range f.files {
+        r.Ref()
+        defer r.Unref()
+    }
+
+    ki := newMergeKeyIterator(f.files, seek)
+    f.mu.RUnlock()                       // 遍历在锁外进行
     for ki.Next() {
         key, typ := ki.Read()
         if err := fn(key, typ); err != nil {
@@ -1499,56 +1754,30 @@ TSM2 keys (有序): ["a", "c", "y"]
 TSM3 keys (有序): ["a", "d", "x"]
 
 newMergeKeyIterator → heap.Init:
-  堆状态 (按 key 最小堆):
-    itrs[0] = F1 (key="a")  ← 堆顶
-    itrs[1] = F2 (key="a")
-    itrs[2] = F3 (key="a")
-  (三者 key 相同, Less 用 bytes.Compare == -1 为 false, 堆顺序由 heap.Init 决定)
+  heap 内部数组: [F1(a), F2(a), F3(a)]（相等 key 时 heap.Init 不交换）
 
-Next() 调用序列:
+Next() 调用序列（每步先取堆顶 key，再推进该迭代器并 heap.Fix / heap.Pop）:
 
-1. Next():
-   堆顶 F1.key="a", F1.next() → F1.key="b", heap.Fix(0)
-   key="a", m.key="" → 不重复
-   m.key="a", return true → Read() = ("a", Float)
+1. Next(): 顶 F1.key="a" → F1.next()→"b"；key="a" != m.key="" → 返回 ("a", Float)
+           堆: [F2(a), F1(b), F3(a)]
+2. Next(): 顶 F2.key="a" → F2.next()→"c"；key="a" == m.key="a" → 重复, RETRY
+           堆: [F3(a), F1(b), F2(c)]；顶 F3.key="a" → F3.next()→"d"
+           key="a" == "a" → 仍然重复, 第二次 RETRY
+           堆: [F1(b), F3(d), F2(c)]；顶 F1.key="b" → F1.next()→"z"
+           key="b" != "a" → 返回 ("b", Float)
+           堆: [F2(c), F3(d), F1(z)]
+3. Next(): 顶 F2.key="c" → F2.next()→"y"；key="c" != "b" → 返回 ("c", Float)
+           堆: [F3(d), F2(y), F1(z)]
+4. Next(): 顶 F3.key="d" → F3.next()→"x"；key="d" != "c" → 返回 ("d", Float)
+           堆: [F3(x), F2(y), F1(z)]
+5. Next(): 顶 F3.key="x" → F3.next() 耗尽, heap.Pop；key="x" != "d" → 返回 ("x", Float)
+           堆: [F2(y), F1(z)]
+6. Next(): 顶 F2.key="y" → F2.next() 耗尽, heap.Pop；key="y" != "x" → 返回 ("y", Float)
+           堆: [F1(z)]
+7. Next(): 顶 F1.key="z" → F1.next() 耗尽, itrs=nil；key="z" != "y" → 返回 ("z", Float)
+8. Next(): itrs 为空 → return false
 
-2. Next():
-   堆顶 F2.key="a", F2.next() → F2.key="c", heap.Fix(0)
-   key="a" == m.key="a" → 重复! RETRY
-   堆顶 F3.key="a", F3.next() → F3.key="d", heap.Fix(0)
-   key="a" == m.key="a" → 重复! RETRY
-   堆顶 F1.key="b", F1.next() → F1.key="z", heap.Fix(0)
-   key="b" != m.key="a" → 不重复
-   m.key="b", return true → Read() = ("b", Float)
-
-3. Next():
-   堆顶 F3.key="d", F3.next() → F3.key="x", heap.Fix(0)
-   key="d" != m.key="b" → 不重复
-   m.key="d", return true → Read() = ("d", Float)
-
-4. Next():
-   堆顶 F3.key="x", F3.next() → F3 耗尽, heap.Pop (移除 F3)
-   key="x" != m.key="d" → 不重复
-   m.key="x", return true → Read() = ("x", Float)
-
-5. Next():
-   堆顶 F2.key="c" (重新堆化后), F2.next() → F2.key="y", heap.Fix(0)
-   key="c" != m.key="x" → 不重复
-   m.key="c", return true → Read() = ("c", Float)
-
-6. Next():
-   堆顶 F2.key="y", F2.next() → F2 耗尽, heap.Pop
-   key="y" != m.key="c" → 不重复
-   m.key="y", return true → Read() = ("y", Float)
-
-7. Next():
-   堆顶 F1.key="z", F1.next() → F1 耗尽, itrs=nil (最后一个)
-   key="z" != m.key="y" → 不重复
-   m.key="z", return true → Read() = ("z", Float)
-
-8. Next(): itrs=nil → return false
-
-最终 WalkKeys 回调顺序: a, b, d, x, c, y, z
+最终 WalkKeys 回调顺序: a, b, c, d, x, y, z
 关键性质: "a" 只回调一次 (3 文件去重); 其余 key 各文件唯一, 按堆顶最小逐步输出。
 每个唯一 key 恰好回调一次, 即使它在 N 个文件中都存在。
 ```
@@ -1558,7 +1787,7 @@ Next() 调用序列:
 ### 6.1 FileStoreObserver 接口
 
 ```go
-// tsdb/engine.go:218 — FileStoreObserver
+// tsdb/engine.go:222 — FileStoreObserver
 type FileStoreObserver interface {
     FileFinishing(path string) error   // 文件即将完成 (rename 前)
     FileUnlinking(path string) error   // 文件即将删除 (remove 前)
@@ -1568,7 +1797,7 @@ type FileStoreObserver interface {
 ### 6.2 noFileStoreObserver — 默认实现
 
 ```go
-// tsdb/engine/tsm1/file_store_observer.go:1 — noFileStoreObserver
+// tsdb/engine/tsm1/file_store_observer.go:3 — noFileStoreObserver
 type noFileStoreObserver struct{}
 
 func (noFileStoreObserver) FileFinishing(path string) error { return nil }
@@ -1581,48 +1810,43 @@ func (noFileStoreObserver) FileUnlinking(path string) error { return nil }
 
 ### 7.1 多文件查询归并案例
 
-> **场景**: 查询 `cpu,host=web#!~#value` 的数据，seekTime=500，ascending=true
->
-> TSM 文件状态:
-> - 文件 1 (最新, Level 2): block [100, 300], [400, 600]
-> - 文件 2 (较旧, Level 1): block [200, 500]
-> - 文件 3 (最旧, Level 0): block [100, 200]
+> **场景**: 查询 `cpu,host=web#!~#value`，seekTime=350，ascending=true。
+> 这里使用 3 个 block（仅 L1/L2 在 400-450 重叠）；排序结果由 MinTime/Path 明确给出，不依赖重叠 comparator 的整体传递性。
 
 ```
-locations() 结果:
-  L1: {file1, entry[100-300], readMin=MinInt64, readMax=499}
-  L2: {file1, entry[400-600], readMin=MinInt64, readMax=499}
-  L3: {file2, entry[200-500], readMin=MinInt64, readMax=499}
-  L4: {file3, entry[100-200], readMin=MinInt64, readMax=499}
-
-排序 (ascLocations by MinTime):
-  L4: [100-200] (file3)
-  L1: [100-300] (file1)
-  L3: [200-500] (file2)
-  L2: [400-600] (file1)
-
-seek(500):
-  pos=0: L4.MinTime=100 < 500, L4.MaxTime=200 < 500 → 跳过
-  pos=1: L1.MinTime=100 < 500, L1.MaxTime=300 < 500 → 跳过
-  pos=2: L3.MinTime=200 < 500, L3.Contains(500)? 200 <= 500 && 500 <= 500 → 包含!
-          pos = 2，并从这里开始把未读候选 location 加入 current
-  pos=3: L2.MinTime=400 < 500, L2.Contains(500)? 400 <= 500 && 500 <= 600 → 包含!
-          同样加入 current
-
-nextAscending():
-  pos=2, current 包含 [L3, L2] 等候选
-  nextAscending 本身不做最终 overlap 裁剪；生成代码 ReadFloatBlock 会根据 first block
-  扩张/收缩窗口、解码候选 block、排除已读范围并归并。
-
-ReadFloatBlock(current):
-  L3 values = [200:20, 500:50]
-  L2 values = [400:40, 500:55, 600:60]
-  Exclude(readMin=MinInt64, readMax=499) → 保留 >=500 的点
-  excludeTombstones → 无 tombstone → 继续归并候选 block
-  markRead(minT, maxT)
-
-返回: 根据归并和同时间戳覆盖规则得到的窗口结果
+f.files 按 Path 升序 = 最旧→最新:
+  file1 gen1 (最旧, Level 1): block [100-450] 值 (100,1)(200,2)(300,3)(400,4)(450,45)
+  file2 gen2 (Level 1):       block [400-600] 值 (400,40)(500,50)(600,60)
+  file3 gen3 (最新, Level 1): block [700-900] 值 (700,700)(800,800)(900,900)
 ```
+
+逐步推演与 §3.8.1 相同：
+
+```
+1. locations: 3 个 location, readMin=MinInt64, readMax=349
+2. ascLocations: [L1(100), L2(400), L3(700)]   （MinTime 升序）
+3. seekAscending(350):
+     i=0 L1 Contains(350) → pos=0, current=[L1]
+     i=1 L2 350 < 400     → current=[L1,L2]
+     i=2 L3 350 < 700     → current=[L1,L2,L3]
+4. ReadFloatBlock #1: first=L1
+     Exclude(-inf,349) → (400,4)(450,45)
+     L2 重叠 → maxT=600; Include(400,600); Merge → 400 被 40 覆盖
+     返回 (400,40)(450,45)(500,50)(600,60)
+5. Next(): L1/L2 已读 → current=[L3]
+6. ReadFloatBlock #2: first=L3
+     Exclude(MinInt64,600) 不影响 700+ → 返回 (700,700)(800,800)(900,900)
+7. Next(): current 空
+8. ReadFloatBlock #3: (nil,nil)
+```
+
+最终输出:
+
+```
+(400,40)(450,45)(500,50)(600,60)(700,700)(800,800)(900,900)
+```
+
+（100/200/300 因 seekTime=350 被裁掉；400 被 gen2 的 40 覆盖。）
 
 ### 7.2 Tombstone 过滤案例
 
@@ -1649,7 +1873,7 @@ ReadFloatBlock():
 `locations()` (file_store.go:1136) 中的 tombstone 跳过条件是 `t.Min <= ie.MinTime && t.Max >= ie.MaxTime`——**只有当 tombstone 区间完全覆盖整个 block 的时间范围 `[ie.MinTime, ie.MaxTime]` 时才 `continue LOOP` 跳过**。如果 tombstone 只覆盖 block 的一部分（例如覆盖了 `MinTime` 但没覆盖 `MaxTime`），block **不会被跳过**，会被正常创建为 `location` 加入 `seeks`。这些部分覆盖的 block 后续在 `ReadFloatBlock` / `ReadFloatArrayBlock` 里通过 `excludeTombstonesFloatValues` / `excludeTombstonesFloatArray` 做点级删除。
 
 ```go
-// tsdb/engine/tsm1/file_store.go:1156 — locations 的 tombstone 跳过 (仅完全覆盖)
+// tsdb/engine/tsm1/file_store.go:1136 — locations 的 tombstone 跳过 (仅完全覆盖)
     LOOP:
         for i := 0; i < len(entries); i++ {
             ie := entries[i]
@@ -1752,15 +1976,25 @@ t=0ms    查询: KeyCursor 创建, A.Ref() → A.refs = 1
 t=1ms    查询: ReadFloatBlock(A, entry) → 正在解码...
 t=2ms    Compaction: FileStore.Replace([A], [B])
            - A.InUse()? A.refs = 1 → true
-           - A.Rename(A.tmp)
+           - A.Rename(A.tmp)  ← 实际是 munmap → Close → os.Rename → Open → mmap
            - purger.add([A])
-t=3ms    查询: ReadFloatBlock(A, entry) → 继续解码... (文件仍在, 只是改了名)
+t=3ms    查询: 若此前已持有 block slice，**必须重新 readBytes**
+           （旧 mmap 已 munmap，旧切片不能跨 Rename 使用）
 t=100ms  查询: KeyCursor.Close() → A.Unref() → A.refs = 0
-t=101ms  purger: A.InUse()? A.refs = 0 → false
+t≤1s后   purger 下一次轮询 (每 1s，故最坏约 1s):
+           - A.InUse()? A.refs = 0 → false
            - A.Close()
            - A.Remove()
            - 文件 A 真正被删除
 ```
+
+**Rename 的真实语义**: `mmapAccessor.rename(path)`（`reader.go:1577-1611`）依次执行
+`munmap(m.b) → m.f.Close() → file.RenameFile(old, new) → os.Open(new) → mmap(new)`。
+它**不是**只改个名：旧映射被解除，新映射在相同偏移重新建立。因此：
+
+- `readBytes` 返回的是 mmap 子切片；解锁后仍指向旧映射。
+- 已持有的 block slice **不能跨 Rename 使用**，必须在 Rename 完成后重新 `readBytes`。
+- `Ref` 只保证文件不被删除，不保证旧映射有效。
 
 ## 8. 架构设计意图
 

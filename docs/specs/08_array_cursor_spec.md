@@ -1,6 +1,6 @@
 # Module 8: Array Cursor 抽象层 (批量读取路径 + 类型化数组 + Cache/TSM 归并) - 深度审计报告
 
-> **小白导读**: Array Cursor 是查询引擎从 TSM 文件读取数据的"高速公路"。
+> **小白导读**: Array Cursor 是 storage/reads（Flux）路径从 TSM 文件批量读取数据的"高速公路"。
 >
 > 旧的 Iterator 模型（模块 3）是逐点读取——每次 `Next()` 返回一个点。
 > Array Cursor 是批量读取——每次 `Next()` 返回最多 1000 个点的数组。
@@ -108,11 +108,10 @@ type TimestampArray struct {
 ```
 
 > **源码校准**: `TimestampArray` (tsdb/cursors/arrayvalues.gen.go:1014) 带有
-> `FindRange` / `Exclude` / `Contains` 等时间范围方法，但本模块描述的
-> `tsdb/engine/tsm1` array cursor 读取管线**并不使用** `TimestampArray`——
-> engine 侧的 array cursor 使用 `FloatArray` / `IntegerArray` / `UnsignedArray` /
-> `StringArray` / `BooleanArray` 这些带值列的类型化数组。`TimestampArray` 定义在
-> `tsdb/cursors` 包中，服务于其他读取路径 (如索引/元数据相关的时间范围查找)。
+> `FindRange` / `Exclude` / `Contains` 等时间范围方法，但除定义与
+> `arrayvalues.gen_test.go` 的单元测试外，全仓库**没有任何使用点**；
+> `tsdb/engine/tsm1` array cursor 读取管线使用的是 `FloatArray` / `IntegerArray` /
+> `UnsignedArray` / `StringArray` / `BooleanArray` 这些带值列的类型化数组。
 
 **Size() 方法** — 计算内存占用:
 
@@ -149,7 +148,7 @@ type CursorRequest struct {
 }
 ```
 
-`CursorRequest` 的时间范围是闭区间：`StartTime` 和 `EndTime` 都包含在查询结果内。升序游标会裁掉 `> EndTime` 的点，降序游标会裁掉 `< EndTime` 的点。
+`CursorRequest` 的时间范围是闭区间：`StartTime` 和 `EndTime` 都包含在查询结果内。升序游标会裁掉 `> EndTime` 的点；降序游标会裁掉 `< StartTime` 的点（`reset` 的 `end` 参数在降序时是 `StopTime() == StartTime`，`array_cursor_iterator.gen.go:36`、`iterator.go:790-808`、`array_cursor.gen.go:288-294`）。
 
 ### 1.4 CursorIterator — 工厂接口
 
@@ -192,7 +191,7 @@ func (s *CursorStats) Add(other CursorStats) {
 
 ```mermaid
 sequenceDiagram
-    participant Query as 查询引擎
+    participant Query as Storage Read Service
     participant ACI as arrayCursorIterator
     participant Engine as TSM1 Engine
     participant Cache as Cache (内存)
@@ -226,7 +225,7 @@ sequenceDiagram
 
     loop 每次 Next() 调用
         Cursor-->>Query: 9 *FloatArray (最多 1000 个时间戳+值)
-        Note over Query: 批量处理: 函数调用次数减少 1000x
+        Note over Query: 批量处理: 函数调用次数最多减少约 1000×
     end
 ```
 
@@ -300,13 +299,66 @@ func (q *arrayCursorIterator) seriesFieldKeyBytes(name []byte, tags models.Tags,
 > **关键设计**: `arrayCursorIterator` 复用 `q.key` 缓冲区，避免每次调用都分配新的字节切片。
 > 这是一个常见的零分配优化。
 
+### 2.3 buildFloatArrayCursor — 工厂与所有权
+
+`arrayCursorIterator.Next` 按 field 类型分发到 5 个 `build*ArrayCursor`；以 float 为例：
+
+```go
+// tsdb/engine/tsm1/array_cursor_iterator.gen.go:18-44 — buildFloatArrayCursor
+func (q *arrayCursorIterator) buildFloatArrayCursor(ctx context.Context, name []byte, tags models.Tags, field string, opt query.IteratorOptions) (tsdb.FloatArrayCursor, error) {
+    var err error
+    key := q.seriesFieldKeyBytes(name, tags, field)                  // ① 复用 q.key
+    cacheValues := q.e.Cache.Values(key)                            // ② 快照 Cache
+    keyCursor := q.e.KeyCursor(ctx, key, opt.SeekTime(), opt.Ascending) // ③ 建 KeyCursor (Ref 所有 TSM 文件)
+    if opt.Ascending {
+        if q.asc.Float == nil {
+            q.asc.Float = newFloatArrayAscendingCursor()            // ④ 惰性创建/复用
+        }
+        err = q.asc.Float.reset(opt.SeekTime(), opt.StopTime(), cacheValues, keyCursor) // ⑤ 读首块并覆盖状态
+        if err != nil {
+            return nil, err
+        }
+        return q.asc.Float, nil
+    }
+    // 降序分支结构相同, 复用 q.desc.Float
+}
+```
+
+1. **cursor 复用**: 同一个 `arrayCursorIterator` 对 (类型, 方向) 各缓存一个 cursor
+   （`q.asc.Float` / `q.desc.Float` 等 10 个槽）。下一次 `Next` 对**同一对象**调用
+   `reset` 并覆盖 `cache.values`、`tsm.values`、`tsm.keyCursor` 与两个 `pos`。
+   因此调用方必须在下一次 `Next` 之前消费完返回的数组。
+2. **`q.key` 别名**: `seriesFieldKeyBytes` 复用 `q.key[:0]`（`array_cursor_iterator.go:79-84`）；
+   `newKeyCursor` 直接把该切片存进 `KeyCursor.key` 而不拷贝
+   （`file_store.go:1448-1459`）。下一次 `seriesFieldKeyBytes` 会覆盖同一底层数组，
+   所以 `KeyCursor` 的生存期必须限制在本次 `Next` 之内。
+3. **所有权表**:
+
+| 对象 | 创建者 | 持有者 | 释放者 | 提前失效的后果 |
+|---|---|---|---|---|
+| `KeyCursor` | `q.e.KeyCursor`（builder） | `q.asc/q.desc.<T>.tsm.keyCursor` | `cursor.Close()` → `KeyCursor.Close()`（`Unref` 所有 TSM 文件） | TSM 文件引用泄漏，purger 无法删除旧文件 |
+| `q.key` | `arrayCursorIterator` | iterator 自身 | 下次 `seriesFieldKeyBytes` 覆盖 | `KeyCursor.key` 指向被改写的内容，tombstone 查错 key |
+| `cacheValues` | `Cache.Values`（新切片） | cursor 的 `cache.values` | GC | 无（独立切片） |
+| `res` / `tsm.buf` | 构造函数 `NewFloatArrayLen(1000)` | cursor | GC | 下次 `Next` 覆盖，调用方数据被改写 |
+
+4. **错误路径风险**: `reset` 失败时 builder 直接 `return nil, err`，但此时
+   `newKeyCursor` 已经对每个相关 TSM 文件执行了 `Ref()`（`file_store.go:1465`）。
+   由于 cursor 没有被 `Close()`，下一次 `reset` 会用新的 `keyCursor` 覆盖
+   `c.tsm.keyCursor`，旧 `KeyCursor` 的引用永久泄漏。这是现有实现的**窄窗口引用泄漏风险**
+   （仅在首块解码/I/O 失败时触发），完整生命周期分析见 16 号文档 §3.10。
+5. **正确调用序列**: `Next()` → 在返回数组被覆盖前消费完 → 再次 `Next()`；
+   查询结束时由上层调用 `cur.Close()`（`storage/flux/reader.go:174` 的 defer 链）。
+6. **`Stats()`**: `arrayCursorIterator.Stats()` 返回空 `tsdb.CursorStats{}`
+   （`array_cursor_iterator.go:35`），各类型 array cursor 的 `Stats()` 同样返回空值，
+   所以 storage/reads 的扫描统计不来自这里。
+
 ## 3. Array Cursor 实现
 
 ### 3.1 升序游标 — floatArrayAscendingCursor
 
 ```mermaid
 flowchart TD
-    A["Next() 被调用"] --> B["res 扩展到 cap<br/>pos = 0"]
+    A["Next() 被调用"] --> B["res 截到 len=cap=1000<br/>pos = 0"]
     B --> C{"Cache 和 TSM<br/>当前都有剩余?"}
     C -->|"是"| D["比较 ckey 与 tkey"]
     D --> E{"ckey == tkey?"}
@@ -332,7 +384,7 @@ flowchart TD
 `Next()` 本身负责把 Cache 与当前 TSM block 做双指针归并；只有 TSM block 耗尽时，才通过 `nextTSM()` 推进到下一块。
 
 ```go
-// tsdb/engine/tsm1/array_cursor.gen.go:16 — floatArrayAscendingCursor
+// tsdb/engine/tsm1/array_cursor.gen.go:17 — floatArrayAscendingCursor
 type floatArrayAscendingCursor struct {
     cache struct {
         values Values
@@ -354,8 +406,12 @@ type floatArrayAscendingCursor struct {
 **结构体设计说明**: 使用嵌套匿名结构体将 Cache 和 TSM 两个数据源的状态明确分离。
 - `cache` 组: 存储 Cache 中的值和当前读取位置
 - `tsm` 组: 存储 TSM 文件的解码缓冲区 (`buf`)、当前值 (`values`)、读取位置和 KeyCursor
-- `res`: 预分配的结果数组，每次 `Next()` 复用，避免堆分配
+缓存结果数组，每次 `Next()` 复用，避免堆分配
 - `end`: 查询结束时间，用于边界检查
+
+> **注意**: `tsdb.NewFloatArrayLen(1000)` 构造出的数组 `len == cap == 1000`；
+> `Next()` 开头的 `c.res.Timestamps[:cap(...)]` 只是把上一轮截断后的长度重新拉满，
+> 不是"扩容"；返回前再截到实际写出的 `pos`。
 
 ```go
 // 构造函数 — 预分配缓冲区
@@ -484,7 +540,7 @@ func (c *floatArrayAscendingCursor) nextTSM() *tsdb.FloatArray {
 #### 3.2.1 结构体定义
 
 ```go
-// tsdb/engine/tsm1/array_cursor.gen.go:158 — floatArrayDescendingCursor
+// tsdb/engine/tsm1/array_cursor.gen.go:165 — floatArrayDescendingCursor
 type floatArrayDescendingCursor struct {
     cache struct {
         values Values
@@ -507,7 +563,7 @@ type floatArrayDescendingCursor struct {
 
 ```mermaid
 sequenceDiagram
-    participant Query as 查询引擎
+    participant Query as Storage Read Service
     participant KC as KeyCursor (ascending=false)
     participant FS as FileStore
     participant TSM1 as TSM 文件 1 (最新)
@@ -522,7 +578,7 @@ sequenceDiagram
     Note over FS: descLocations: 最新 block 在最后
 
     KC->>KC: seekDescending: 从末尾向前扫描
-    Note over KC: 收集 MaxTime >= seekTime 的 block<br/>pos 指向最后匹配的 block
+    Note over KC: 收集 MaxTime < seek（seek 之后无数据）<br/>或 Contains(seek) 的 block，pos 指向最后匹配的 block
 
     loop 降序遍历
         KC->>TSM1: ReadFloatArrayBlock(entries[pos])
@@ -539,7 +595,7 @@ sequenceDiagram
 ```go
 // file_store.go:1511 — seekDescending
 func (c *KeyCursor) seekDescending(t int64) {
-    // 从末尾向前扫描, 收集包含或早于 seekTime 的 block
+    // 从末尾向前扫描, 收集 MaxTime < seek（seek 之后无数据）或 Contains(seek) 的 block
     for i := len(c.seeks) - 1; i >= 0; i-- {
         e := c.seeks[i]
         if t > e.entry.MaxTime || e.entry.Contains(t) {
@@ -551,6 +607,25 @@ func (c *KeyCursor) seekDescending(t int64) {
     }
 }
 
+// file_store.go:1526 — KeyCursor.Next
+func (c *KeyCursor) Next() {
+    if len(c.current) == 0 {
+        return
+    }
+    // 当前 block 还有未读值: 留在原地
+    if !c.current[0].read() {
+        return
+    }
+    // 关键: 复用 current 切片前先清空, 否则 nextDescending 的 append
+    // 会把新区块追加在旧内容之后。
+    c.current = c.current[:0]
+    if c.ascending {
+        c.nextAscending()
+    } else {
+        c.nextDescending()
+    }
+}
+
 // file_store.go:1570 — nextDescending
 func (c *KeyCursor) nextDescending() {
     // pos-- 推进到更早的 block
@@ -559,7 +634,15 @@ func (c *KeyCursor) nextDescending() {
         if c.pos < 0 { return }
         if !c.seeks[c.pos].read() { break }
     }
-    // 收集重叠 block 用于去重
+    // 第一个匹配块: 空切片先 make 1 个槽, 否则截断到 1 个槽
+    if len(c.current) == 0 {
+        c.current = make([]*location, 1)
+    } else {
+        c.current = c.current[:1]
+    }
+    c.current[0] = c.seeks[c.pos]
+
+    // 收集重叠 block 用于去重 (从当前 pos 开始, 含自身)
     for i := c.pos; i >= 0; i-- {
         if c.seeks[i].read() { continue }
         c.current = append(c.current, c.seeks[i])
@@ -593,6 +676,10 @@ func (c *floatArrayDescendingCursor) reset(seek, end int64, cacheValues Values, 
     return nil
 }
 ```
+
+> **参数来源**: `reset(seek, end, ...)` 的两个时间参数就是
+> `opt.SeekTime()` 与 `opt.StopTime()`；它们随升/降序互换，完整定义见
+> 03 号文档 §1.2 步骤 3b（`query/iterator.go:790-808`）。
 
 `reset()` 会返回 `error`。原因是初始化阶段需要读取第一块 TSM array block，`ReadFloatArrayBlock` / `ReadIntegerArrayBlock` 等可能返回解码或 I/O 错误；builder 会检查这个错误并向上返回，而不是静默忽略。
 
@@ -628,7 +715,7 @@ func (c *floatArrayDescendingCursor) Next() *tsdb.FloatArray {
     cvals := c.cache.values
     tvals := c.tsm.values
 
-    // 扩展结果缓冲区到容量上限
+    // res 由 NewFloatArrayLen(1000) 构造, len=cap=1000; 这里截到 cap 以便复用
     c.res.Timestamps = c.res.Timestamps[:cap(c.res.Timestamps)]
     c.res.Values = c.res.Values[:cap(c.res.Values)]
 
@@ -658,7 +745,7 @@ func (c *floatArrayDescendingCursor) Next() *tsdb.FloatArray {
 
         // TSM 当前 block 耗尽, 加载下一个 (更早的) block
         if c.tsm.pos < 0 {
-            c.nextTSM()  // pos = len(...) - 1 (从末尾开始)
+            tvals = c.nextTSM()  // 必须回写 tvals, 否则续读仍用旧 block
         }
     }
 
@@ -796,14 +883,17 @@ if pos > 0 && c.res.Timestamps[pos-1] < c.end {
 | copy 优化 | 有 (`pos==0 && c.tsm.pos==0` 时批量复制) | **无** |
 | 边界裁剪方向 | 从尾部向前裁剪 | 从尾部向前裁剪 (相同) |
 | TSM 文件扫描方向 | 从最早 block 到最新 | 从最新 block 到最早 |
-| mmap 预读优化 | MADV_SEQUENTIAL 有效 | MADV_SEQUENTIAL **无效** |
+| mmap 预读优化 | `MADV_WILLNEED`（`mmapWillNeed` 开启时） | 同样只有 `MADV_WILLNEED`；逆序访问命中率低 |
 | KeyCursor 排序 | `ascLocations` (MinTime 升序) | `descLocations` (MaxTime 升序) |
 | 重叠 block 去重 | `nextAscending` 收集 | `nextDescending` 收集 |
 
-> **性能差异**: 降序查询通常比升序查询慢 10-30%，主要原因：
-> 1. 缺少 copy 优化（升序可以在无 Cache 重叠时直接 `copy()` 整个 block）
-> 2. mmap 预读策略对逆序访问无效（OS 预读是向前的）
-> 3. `reset()` 的后退调整增加了分支，并且初始化阶段需要传播首块 TSM 读取错误；后续 `nextTSM()` 错误不会通过 `Err()` 暴露
+> **性能差异**: 与升序相比，降序的结构性差异有：
+> 1. 缺少整块 `copy()` 优化（升序在 `pos==0 && c.tsm.pos==0` 且整块放得下时可直接复制）；
+> 2. `nextTSM()` 从 block 末尾开始，逆序访问对 OS 预读不友好；但源码只定义了
+>    `MADV_WILLNEED`（`mmap_unix.go:30-33`），源码没有其它顺序预读提示，
+>    也没有仓库内 benchmark 证明具体慢多少（旧文档的「10–30%」无源码依据，已删除）。
+> 3. `reset()` 的后退调整增加了分支，并且初始化阶段需要传播首块 TSM 读取错误；后续
+>    `nextTSM()` 错误不会通过 `Err()` 暴露。
 
 #### 3.2.6 降序查询案例
 
@@ -931,12 +1021,14 @@ func FloatArrayDecodeAll(b []byte, buf []float64) ([]float64, error) {
     // 来优化 CPU 分支预测。以下展示简化的控制流逻辑, 完整实现在 batch_float.go:352-508。
     //
     // 控制位编码 (Gorilla XOR):
-    //   bit 0 == 0: 值与前一个相同, 直接复用 (0 bit 控制)
-    //   bit 0 == 1, bit 1 == 1: 复用前一个的 leading/trailing, 只读有意义位
-    //   bit 0 == 1, bit 1 == 0: 新的 leading(5 bits) + meaningful(6 bits)
+    //   bit 0 == 0: 值与前一个完全相同, 直接复用 val (不读后续位)
+    //   bit 0 == 1, bit 1 == 0: 沿用上一次的 leading/trailing, 只读 meaningful 位
+    //   bit 0 == 1, bit 1 == 1: 新的 leading(5 bits) + meaningful(6 bits)
     //
     // 实际代码使用 goto READ0 / goto READ1 标签跳转, 避免在热路径上做多余的
-    // 分支判断, benchmark 中从 260 MB/s 提升到 340 MB/s。
+    // 分支判断。源码注释记录了两组独立数据: unsafe.Pointer 转换把吞吐从
+    // 320 MB/s 提升到 340 MB/s (batch_float.go:306); 而把 Refill 代码内联到
+    // 分支里会让吞吐从 318 MB/s 降到 260 MB/s (batch_float.go:362)。
     for {
         if brValidBits == 0 {
             goto REFILL  // Refill brCachedVal from b
@@ -950,11 +1042,11 @@ func FloatArrayDecodeAll(b []byte, buf []float64) ([]float64, error) {
         READ1:
             // read control bit 1
             if brCachedVal&1 > 0 {
-                // 复用前一个的 leading/trailing
-                // 只读取 meaningfulN 位有效数据
-            } else {
                 // 新的 leading(5 bits) + meaningful(6 bits)
                 // 读取 11 位控制信息 + meaningfulN 位有效数据
+            } else {
+                // 沿用上一次的 leading/trailing
+                // 只读取 meaningfulN 位有效数据
             }
             val ^= sBits << (trailingN & 0x3f)
             if val == uvnan {
@@ -979,28 +1071,63 @@ func FloatArrayDecodeAll(b []byte, buf []float64) ([]float64, error) {
 
 ## 5. Cache + TSM 归并
 
+### 5.0 Cache 侧数据形态与归并前提
+
+Array Cursor 的归并不是"两个同构数组简单合并"，两侧的数据表示不同：
+
+| 维度 | Cache 侧 | TSM 侧 |
+|---|---|---|
+| 类型 | `tsm1.Values = []Value`（接口切片，`encoding.gen.go:17`） | `*tsdb.FloatArray`（`[]int64` + `[]float64`） |
+| 读取 | `Cache.Values(key)` 返回快照切片 | `KeyCursor.ReadFloatArrayBlock(buf)` 解码 |
+| 取值 | 逐点 `.(FloatValue).value` 拆箱（`tsdb/engine/tsm1/array_cursor.gen.go:91/96/136` 升序、`242/247/280` 降序） | 连续数组下标访问 |
+| 有序性 | 由 `Values.Deduplicate()` 保证时间升序且无重复 | 由 block 内有序 + `Exclude/Include/Merge` 保证 |
+
+**`Cache.Values` 的 5 步**（`cache.go:554-606`）:
+
+1. `c.mu.RLock()`，同时取 live entry（`c.store.entry(key)`）与 snapshot entry；
+2. 解锁后对 live entry 调 `e.deduplicate()`（snapshot entry 也去重）；
+3. 按 snapshot → live 的顺序收集 entry，累计 `sz`；
+4. `values := make(Values, sz)`，逐个 entry 在 `e.mu.RLock()` 下 `copy`；
+5. 整体 `values.Deduplicate()`，返回时间升序、时间戳唯一的切片。
+
+**归并前提**: 两侧都必须按时间升序且同时间戳唯一，双指针算法才成立。
+Cache 侧靠 `Deduplicate`，TSM 侧靠 block 内有序加 `ReadFloatArrayBlock` 的
+`Exclude/Merge`。反例：若 Cache 未去重，降序 `Next` 的 `ckey == tkey` 分支只会输出
+一个点，而升序分支同样只输出一个，但 `reset` 的二分定位会落在重复点的任意一个上，
+结果不稳定。
+
+**成本**: N 个 Cache 点意味着 N 次接口拆箱；TSM 侧是连续数组扫描。Cache 很大时，
+array cursor 相对逐点 iterator 的收益会下降。内存上，每个 cursor 除 `res` 和
+`tsm.buf`（各 1000 槽）外，还持有整份 `cacheValues`。
+
 ### 5.1 归并策略
 
 ```mermaid
 sequenceDiagram
+    participant Builder as arrayCursorIterator
     participant Cursor as ArrayAscendingCursor
     participant Cache as Cache (内存)
+    participant KC as KeyCursor
     participant TSM as TSM 文件 (mmap)
 
-    Note over Cursor: 初始化: 确定数据源
+    Note over Builder: 初始化: 取 Cache 与 KeyCursor
 
-    Cursor->>Cache: Cache.Values(key)
-    Cache-->>Cursor: [t1:10, t2:20, t3:30] (最新数据)
+    Builder->>Cache: Cache.Values(key)
+    Cache-->>Builder: [t1:10, t2:20, t3:30] (最新数据)
+    Builder->>KC: Engine.KeyCursor(key, seek, ascending)
+    Builder->>Cursor: reset(seek, stop, cacheValues, keyCursor)
 
-    Cursor->>TSM: KeyCursor.ReadFloatArrayBlock(buf)
-    TSM-->>Cursor: [t0:5, t1:8, t2:15] (历史数据)
+    Cursor->>KC: ReadFloatArrayBlock(buf)
+    KC->>TSM: ReadFloatArrayBlockAt(entry, buf)
+    TSM-->>KC: 解码后的 block
+    KC-->>Cursor: [t0:5, t1:8, t2:15] (历史数据)
 
     Note over Cursor: 归并规则:<br>1. Cache 数据优先 (相同时间戳取 Cache)<br>2. 时间戳排序<br>3. 批量返回
 
     Cursor->>Cursor: 归并结果: [t0:5, t1:10, t2:20, t3:30]
     Note over Cursor: t1 取 Cache 的 10 而非 TSM 的 8
 
-    Cursor-->>Query: *FloatArray{[t0,t1,t2,t3], [5,10,20,30]}
+    Cursor-->>Builder: *FloatArray{[t0,t1,t2,t3], [5,10,20,30]}
 ```
 
 这里的图按真实调用名表达：Cache 侧是 `q.e.Cache.Values(key)`，TSM 侧是游标持有的
@@ -1013,7 +1140,7 @@ sequenceDiagram
 
 1. Cache 和当前 TSM block 都有数据时，用两个位置指针比较时间戳；相同时间戳取 Cache，并同时推进 Cache/TSM 指针。
 2. 一侧耗尽后 drain 另一侧；升序且 `pos==0 && c.tsm.pos==0` 时可以整块 `copy()` 当前 TSM block。
-3. 按闭区间边界裁剪结果：升序裁掉 `> EndTime` 的尾部点，降序裁掉 `< EndTime` 的尾部点。
+3. 按闭区间边界裁剪结果：升序裁掉 `> EndTime` 的尾部点，降序裁掉 `< StartTime` 的尾部点（降序 `reset` 收到的 `end` 是 `StopTime() == StartTime`）。
 
 **为什么 Cache 优先？** Cache 包含最新写入但尚未持久化到 TSM 文件的数据。相同时间戳的值，Cache 中的一定比 TSM 中的更新。
 
@@ -1086,6 +1213,52 @@ c.res.Values     = [5,  8,  15, 30]
 >
 > 结果: `[t0:5, t1:8, t2:20, t3:30]`，无相等时间戳，纯交错归并。
 
+### 5.4 TSM 侧读取：KeyCursor.ReadFloatArrayBlock（摘要）
+
+完整的 seek/tombstone/重叠归并算法以 **16 号文档 §3.8/§3.9** 为准；本节只写
+array 变体的调用形状与和逐点版本的差异。
+
+```mermaid
+sequenceDiagram
+    participant AC as ArrayCursor
+    participant KC as KeyCursor
+    participant FS as FileStore/TSMFile
+
+    AC->>KC: nextTSM() → Next() + ReadFloatArrayBlock(values)
+    KC->>KC: first := c.current[0]（首块 + 重叠候选块列表）
+    KC->>FS: first.r.ReadFloatArrayBlockAt(&first.entry, values)
+    FS-->>KC: 解码后的 FloatArray
+    KC->>KC: values.Exclude(first.readMin, first.readMax)
+    KC->>FS: first.r.TombstoneRange(c.key)
+    FS-->>KC: []TombstoneRange
+    KC->>KC: excludeTombstonesFloatArray(tombstones, values)
+    alt values 全空且还有候选块
+        KC->>KC: c.current = c.current[1:] 后 goto LOOP
+    else 只有单块
+        KC->>KC: markRead(MinTime, MaxTime)，直接返回
+    else 多块
+        KC->>FS: 对重叠未读块 ReadFloatArrayBlockAt → Exclude → Include(minT,maxT)
+        KC->>KC: values.Merge(v) + markRead
+        KC-->>AC: *FloatArray
+    end
+```
+
+**必知事实**:
+
+1. `file_store_array.gen.go:12-208`：`c.current` 是"当前块 + 重叠候选块"的列表，
+   `first := c.current[0]`，`ReadFloatArrayBlockAt` 负责解码单个 block。
+2. `values.Exclude(first.readMin, first.readMax)` 去掉已读区间；
+   `first.r.TombstoneRange(c.key)` + `excludeTombstonesFloatArray` 剔除删除点。
+   若结果为空且还有候选块，`c.current = c.current[1:]` 后 `goto LOOP` 重试。
+3. 单块快速路径：`len(c.current) == 1` 时 `markRead(values.MinTime(), values.MaxTime())`
+   并直接返回。
+4. 多块：升序先向后扩展 `minT`，再对重叠未读块 `ReadFloatArrayBlockAt` → `Exclude`
+   → `Include(minT, maxT)` → `values.Merge(v)`；降序逻辑镜像。
+5. `FileStore.locations` 在建游标时已跳过**整块被 tombstone 完全覆盖**的 block
+   （16 §3.3）；部分覆盖留到本函数处理。
+6. `nextTSM()` 忽略本函数的错误（`tsdb/engine/tsm1/array_cursor.gen.go:298-303`），
+   只有 `reset()` 会传播首个 block 的错误。
+
 ## 6. 旧 Iterator 模型 vs Array Cursor
 
 | 维度 | Iterator 模型 (模块 3) | Array Cursor (本模块) |
@@ -1100,7 +1273,7 @@ c.res.Values     = [5,  8,  15, 30]
 ```mermaid
 flowchart LR
     subgraph "Iterator 模型 (旧)"
-        A1["Storage Iterator"] --> A2["Merge Iterator"]
+        A1["InfluxQL 逐点 Iterator"] --> A2["Merge Iterator"]
         A2 --> A3["Call Iterator"]
         A3 --> A4["Interval Iterator"]
         A4 --> A5["Fill Iterator"]
@@ -1127,6 +1300,7 @@ flowchart LR
 | `tsdb/engine/tsm1/array_cursor_iterator.go` | 84 | 工厂: 根据 field 类型分发到对应 cursor |
 | `tsdb/engine/tsm1/array_encoding.go` | 112 | 批量解码: Decode*ArrayBlock (5 种类型) |
 | `tsdb/engine/tsm1/array_cursor.gen.go` | 1475 | 生成代码: 5 种类型的升序/降序 cursor 实现 |
+| `tsdb/engine/tsm1/file_store_array.gen.go` | 1034 | `ReadFloatArrayBlock` 等 5 种 `KeyCursor.Read*ArrayBlock` 的真实实现（tombstone/重叠归并） |
 | `tsdb/engine/tsm1/array_cursor_iterator.gen.go` | 150 | 生成代码: build*ArrayCursor 方法 |
 | `tsdb/engine/tsm1/batch_float.go` | 514 | Float 批量编解码: FloatArrayEncodeAll/DecodeAll |
 | `tsdb/engine/tsm1/batch_integer.go` | 290 | Integer 批量编解码 |
@@ -1186,4 +1360,23 @@ Cache 中的值需要先解码为 `[]Value`，然后与 TSM 的值归并。对�
 
 ### 9.3 降序查询的性能
 
-降序查询需要从 TSM 文件末尾开始往前读取，mmap 的预读优化 (MADV_SEQUENTIAL) 不适用，可能产生更多 page fault。
+降序查询需要从 TSM 文件末尾开始往前读取。源码只提供 `MADV_WILLNEED` 提示
+（`mmap_unix.go:30-33`），且仅在 `mmapWillNeed` 开启时生效；仓库中没有量化数据
+证明降序会多多少 page fault。
+
+### 9.4 cursor 复用与 reset 失败的引用所有权
+
+`arrayCursorIterator` 为了省掉每次查询的分配，对每种 (类型, 方向) 只保留一个 cursor，
+并用 `reset` 复用（见 §2.3）。这带来两个隐含契约：
+
+1. **返回数组只在本次 `Next` 内有效**。`c.res` 与 `c.tsm.buf` 是 cursor 持有的同一份
+   缓冲区；上层若缓存了 `*FloatArray` 指针而没有立即拷贝，下一次 `Next` 会覆盖它。
+2. **`KeyCursor` 的释放责任在 cursor**。`reset` 成功时旧 `keyCursor` 已被覆盖，
+   但旧对象在 `arrayCursorIterator` 里没有单独的 `Close` 调用点；
+   `floatArrayAscendingCursor.Close()` 只关闭当前的 `c.tsm.keyCursor`。
+   因此 `reset` 返回错误的路径会留下已 `Ref()` 但永不 `Unref()` 的 TSM 文件引用
+   （`file_store.go:1465/1476`），使 purger 无法回收这些文件。
+
+> **注意**: 这不是数据正确性问题，而是资源生命周期问题；触发条件是首块解码/I/O 失败。
+> 修复方向是在 `reset` 失败时显式 `keyCursor.Close()`，或在 builder 层把
+> "创建 keyCursor + reset" 包成一个可回滚的步骤。
