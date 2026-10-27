@@ -1820,7 +1820,10 @@ func (h *Handler) serveFluxQuery(w http.ResponseWriter, r *http.Request, user me
 
 **容易漏掉的五个分支**:
 1. `FluxEnabled=false` 时路由 handler 在 `AddRoutes` 前被换成 `serveFluxQueryDisabled`
-   （`handler.go:377`），直接 403 `"Flux query service disabled..."`（`handler.go:2263-2266`），
+   （`handler.go:377`）。它是 3 参签名 `func(w,r,user)`，会被 `authenticate` 包装
+   （`handler.go:514-526`）：认证开启且已存在管理员、请求未带有效凭据时返回 **401**；
+   认证关闭（`auth-enabled=false`）或引导模式（`AdminUserExists()==false`）下认证被跳过，
+   才返回 **403** `"Flux query service disabled..."`（`handler.go:2263-2266`）。
    本节函数根本不会执行。
 2. `decodeQueryRequest` 失败 → 400（`handler.go:2186-2189`）。
 3. `Controller.Query` 失败 → 500（`handler.go:2216-2220`）。
