@@ -721,7 +721,7 @@ func ReadSeriesEntry(data []byte) (flag uint8, id uint64, key []byte, sz int64) 
     id, data = binary.BigEndian.Uint64(data), data[8:]
     switch flag {
     case SeriesEntryInsertFlag:
-        key, _ = ReadSeriesKey(data)
+        key = ReadSeriesKey(data)
     }
     return flag, id, key, int64(SeriesEntryHeaderSize + len(key))
 }

@@ -221,7 +221,7 @@ flowchart TB
 | retention 孤儿 shard / 挂起 | 旧版删除失败/未完成也会 prune：14 天后只要 `DeletedAt` 过期就删组，不检查 shard 是否删净，留下孤儿文件；旧版还可能卡在 `Shard.Close`。新版 `PruneShardGroups` 要求无 shard 且已过 `DeletedAt`，并用 `SetShardNewReadersBlocked`/`ShardInUse` 跳过 in-use shard | `7bd3f89d18`、`b4bd607eef` | [05](05_meta_background_diff.md) |
 | TSI MANIFEST 与部分打开清理 | 旧版 `ioutil.WriteFile` 直接覆盖 MANIFEST；新版临时文件 + `os.Rename` 原子替换。旧版部分打开失败可能泄漏引用；新版补齐清理与 iterator close | `061cf55f2a`、`d3db48e93d`、`a428043f84` | [02](02_index_series_diff.md) |
 | 非法 series key 越界 panic | 旧版对非法 series key 可能 index out of range；新版在 `series_file.go`、`series_cursor.go`、`log_file.go`、`tsdb/index.go`、`tsdb/series_partition.go` 增加边界检查 | `6af0be9234` | [02](02_index_series_diff.md) |
-| 删除 series 的锁 | 旧版 `deleteSeriesRange`/`Store.DeleteSeries` 存在 RLock 泄漏与锁顺序问题；新版修正锁获取/释放 | `81b42fd344`、`21ab48416e` | [02](02_index_series_diff.md)、[05](05_meta_background_diff.md) |
+| 删除 series 的锁 | 区间内 `1bc0eb4795` 引入 `seriesKeysLock` 时漏了一条 `RUnlock`，`81b42fd344` 修复；`21ab48416e` 另修 `Store.DeleteSeries` 的读锁泄漏。v1.8.10 本身没有该锁，不存在“旧版泄漏” | `1bc0eb4795`、`81b42fd344`、`21ab48416e` | [02](02_index_series_diff.md)、[05](05_meta_background_diff.md) |
 | GROUP BY 跨 DST 边界 | 旧版先把 `end` 做时区换算、再加 offset，秋季回拨时丢行；新版把 `end += Offset` 移到时区计算之前 | `d60741b506` | [03](03_query_engine_diff.md) |
 | array cursor 优化重复数据 | 旧版只判断 `pos == 0`，在 cache 与 TSM 混合的第二个 `Next()` 里可能重复拷贝 TSM 点；新版增加 `c.tsm.pos == 0` | `31cb61f556` | [03](03_query_engine_diff.md) |
 
