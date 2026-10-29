@@ -88,8 +88,8 @@ flowchart TB
     subgraph IQ["InfluxQL 点式迭代器路径（未重构）"]
         I1["Executor.executeQuery"] --> I2["ExecutionContext.send / Send"]
         I2 --> I3["StatementExecutor.ExecuteStatement"]
-        I3 --> I4["query.Prepare"]
-        I4 --> I5["query.Select"]
+        I3 --> I4["query.Select"]
+        I4 --> I5["query.Prepare"]
         I5 --> I6["buildCursor"]
         I6 --> I7["buildExprIterator / buildCallIterator"]
         I7 --> I8["NewCallIterator → ReduceIterator / StreamIterator"]
@@ -102,7 +102,7 @@ flowchart TB
         F1["query/control.Controller.query"] --> F2["createQuery / compileQuery / enqueueQuery"]
         F2 --> F3["executeQuery → Query.pump"]
         F3 --> F4["storageflux.storeReader.ReadFilter / ReadGroup / ReadWindowAggregate"]
-        F4 --> F5["services/storage.Store.WindowAggregateLimit"]
+        F4 --> F5["services/storage.Store.WindowAggregate → WindowAggregateLimit"]
         F5 --> F6["reads.NewWindowAggregateResultSet"]
         F6 --> F7["NewWindowAggregateArrayCursor"]
         F7 --> F8["newFloatWindowMeanArrayCursor 等"]
@@ -113,7 +113,7 @@ flowchart TB
     H1 --> I1
     H2 --> F1
     I7 -. "tsdb.Shard.CreateIterator（点迭代器）" .-> T1["tsdb/engine/tsm1 point iterators"]
-    F8 -. "tsdb.CreateCursorIterators（数组游标）" .-> T2["tsdb/engine/tsm1 arrayCursorIterator"]
+    F5 -. "tsdb.CreateCursorIterators（数组游标）" .-> T2["tsdb/engine/tsm1 arrayCursorIterator"]
     T1 --> T3["Cache + TSM KeyCursor"]
     T2 --> T3
 ```
@@ -136,13 +136,14 @@ sequenceDiagram
     participant H as httpd.serveFluxQuery
     participant C as control.Controller
     participant Q as control.Query
+    participant K as flux.Compiler
     participant P as flux.Program
-    participant S as storageflux.storeReader
 
     H->>C: Query(ctx, compiler)
     C->>Q: createQuery (context.WithCancel)
     C->>Q: tryCompile → Compiling
-    C->>P: compiler.Compile(ctx, runtime.Default)
+    C->>K: Compile(ctx, runtime.Default)
+    K-->>C: Program
     C->>Q: tryQueue → Queueing
     C->>Q: enqueueQuery (queryQueue 或直接起 goroutine)
     C->>Q: tryExec → Executing
@@ -181,6 +182,7 @@ classDiagram
         Cursor()
         Keys()
         PartitionKeyVals()
+        Err()
         Aggregate()
     }
     class ResultSet {
@@ -260,10 +262,10 @@ func (c *Controller) query(ctx context.Context, compiler flux.Compiler, deps *de
 | 单查询内存 | `memory.Allocator{}` | `queryMemoryManager`：初始配额 + 硬上限 + 全局池 CAS 申请 | `query/control/memory.go:73`-`:116` |
 | 全局内存池 | 无 | `unusedMemoryBytes`，`MaxMemoryBytes - ConcurrencyQuota*Initial` | `controller.go:191`-`:199`、`memory.go:31`-`:45` |
 | 取消 | 只依赖调用方 ctx | `context.WithCancel` + `Query.Cancel` + `pump` 在 ctx.Done 时 `exec.Cancel()` | `controller.go:292`、`:631`、`:896`-`:930` |
-| 关闭 | 无 | `Shutdown(ctx)` 取消全部查询，`abort` 兜底 | `controller.go:516`-`:562` |
+| 关闭 | 无 | `Shutdown(ctx)` 取消全部查询，`abort` 兜底 | `controller.go:516`-`:554` |
 | panic | 无 recover | `compileQuery` / `executeQuery` defer recover 并打栈 | `:345`-`:365`、`:439`-`:460` |
 | 错误映射 | 原样返回 | `handleFluxError`：`codes.NotFound→ENotFound` 等 | `:1063`-`:1108` |
-| 指标 | 无 | `qc_requests_total`、`qc_functions_total`、`qc_all_active`、`qc_compiling_active`、`qc_queueing_active`、`qc_executing_active`、`qc_memory_unused_bytes`、4 个 duration 直方图 | `query/control/metrics.go:34`-`:64` |
+| 指标 | 无 | `qc_requests_total`、`qc_functions_total`、`qc_all_active`、`qc_compiling_active`、`qc_queueing_active`、`qc_executing_active`、`qc_memory_unused_bytes`、4 个 duration 直方图 | `query/control/metrics.go:34`-`:90` |
 
 **内存管理器的工作方式**（`query/control/memory.go`）：
 
@@ -272,15 +274,22 @@ func (c *Controller) query(ctx context.Context, compiler flux.Compiler, deps *de
 if q.limit+want > q.m.memoryBytesQuotaPerQuery {
 	return 0, errors.New("query hit hard limit")   // 单查询硬上限
 }
-...
-unused = q.m.getUnusedMemoryBytes()
-if unused < want {
-	return 0, errors.New("not enough capacity")    // 全局池不够
+for {
+	unused := int64(math.MaxInt64)
+	if !q.m.unlimited {                             // 默认 unlimited：不读全局池
+		unused = q.m.getUnusedMemoryBytes()
+		if unused < want {
+			return 0, errors.New("not enough capacity")    // 全局池不够
+		}
+	}
+	given := q.giveMemory(want, unused)                 // 尽量翻倍给，减少反复申请
+	if !q.m.unlimited {
+		if !q.m.trySetUnusedMemoryBytes(unused, unused-given) { continue }  // CAS 重试
+	}
+	q.limit += given
+	q.given += given
+	return given, nil
 }
-given := q.giveMemory(want, unused)                 // 尽量翻倍给，减少反复申请
-if !q.m.trySetUnusedMemoryBytes(unused, unused-given) { continue }  // CAS 重试
-q.limit += given
-q.given += given
 ```
 
 `FreeMemory` 是空实现（`memory.go:143`-`:147`）：内存只在 `Release()`（查询 `Done()`）时
@@ -291,7 +300,7 @@ q.given += given
 1. 默认行为仍然“不限制”：`control.NewConfig()` 返回零值，`Config.complete()` 把
    `MemoryBytesQuotaPerQuery==0` 解释为 `math.MaxInt64`、`InitialMemoryBytesQuotaPerQuery==0`
    继承前者；`ConcurrencyQuota==0` 时 `queryQueue=nil`，来一个查询起一个 goroutine
-   （`controller.go:117`-`:131`、`:219`-`:231`、`:394`-`:415`）。所以**不配置就不会变慢/变严**。
+   （`controller.go:117`-`:131`、`:201`-`:203`、`:394`-`:415`）。所以**不配置就不会变慢/变严**。
 2. 一旦配置了 `query-concurrency > 0`，`QueueSize` 必须为正，否则 `Config.validate` 直接报错
    （`controller.go:134`-`:150`）；服务起不来，而不是运行期降级。
 3. 取消语义变强：客户端断开后，`pump` 会显式 `exec.Cancel()` 并继续排空结果，
@@ -522,12 +531,17 @@ return &influxql.ShowTagValuesStatement{
 
 ```go
 // v1.12.3:coordinator/statement_executor.go:1129 — 收集 RP
+rps := make([]string, 0, len(di.RetentionPolicies))
 for _, m := range q.Sources.Measurements() {
 	if len(m.RetentionPolicy) > 0 { rps = append(rps, m.RetentionPolicy) }
 }
 ...
-if rp != rps[0] {
-	return fmt.Errorf("only one retention policy allowed in SHOW TAG VALUES query: \"%s\", \"%s\"", rp, rps[0])
+} else {
+	for _, rp := range rps {
+		if rp != rps[0] {
+			return fmt.Errorf("only one retention policy allowed in SHOW TAG VALUES query: \"%s\", \"%s\"", rp, rps[0])
+		}
+	}
 }
 ```
 
@@ -718,7 +732,7 @@ func (c *groupByCursor) Cursor() cursors.Cursor { return c.cursor }
 ```
 
 原因：`newAggregateArrayCursor` 现在会返回错误（例如对 String 做 mean），
-必须在 `Next()` 里把错误暴露出来，不能等到 `Cursor()`。
+必须在 `Next()` 里把错误转成 `Next()==false`（错误本身仍被 `groupByCursor.Err()` 吞掉，见 §7.1），不能等到 `Cursor()`。
 
 **新增 `windowAggregateResultSet`**（`storage/reads/aggregate_resultset.go`，旧版无此文件）：
 
@@ -760,12 +774,13 @@ func (c *groupByCursor) Cursor() cursors.Cursor { return c.cursor }
 ```go
 // v1.12.3:storage/flux/table.go:139 — colReader
 type colReader struct {
+	refCount int64            // allocateBuffer 据此判断能否复用
 	key     flux.GroupKey
 	colMeta []flux.ColMeta
 	cols    []array.Array
 	l       int
 }
-func (cr *colReader) Floats(j int) *array.Float { ... }   // 直接类型断言，零拷贝
+func (cr *colReader) Floats(j int) *array.Float { ... }   // CheckColType + 类型断言，不复制底层数组
 ```
 
 - `table.allocateBuffer(l)` 复用上一次的 `colReader`：如果引用计数已归零就重置，
@@ -1006,6 +1021,7 @@ func (c *floatArrayDescendingCursor) reset(seek, end int64, cacheValues Values, 
 // v1.12.3:storage/reads/array_cursor.gen.go:2146
 var sum int64
 ...
+// :2167
 c.res.Values0[pos] = float64(sum) / float64(count)
 ```
 
@@ -1275,7 +1291,7 @@ func (r *resultSet) Err() error { return nil }
 ```go
 // v1.12.3:storage/reads/array_cursor.gen.go:158
 panic(fmt.Sprintf("unsupported for aggregate min: %T", cur))
-// :175 同样是 max；而 sum/mean 返回 error（:138、:191）
+// :175 同样是 max；而 sum/mean 返回 error（:138、:192）
 ```
 
 下推规则 `canPushWindowedAggregate` 只检查聚合列是 `_value`
@@ -1384,7 +1400,7 @@ func (q *Query) ProfilerResults() (flux.ResultIterator, error) {
 | 控制器接线 | `cmd/influxd/run/server.go:299` | `cmd/influxd/run/server.go:327`-`:347` | `b9ee9e5b44` |
 | 每用户查询字节 | 无 | `services/httpd/config.go:68`、`handler.go:484`-`:511`、`:821`/`:913`/`:2094`/`:2259` | `4dcc8776c1` #27188 |
 | 查询结果 StatementID | `query/execution_context.go:93` 覆盖 | `query/execution_context.go:93` 不覆盖；`query/executor.go:432` | `0090c5b111` #22273 |
-| TaskManager user/超时日志 | `query/task_manager.go:34`、`:281` | `query/task_manager.go:34`、`:76`、`:144`、`:329` | `32d8b002d8` #26981、`88d2760bc8` #23978、`2b7164440f` #27196 |
+| TaskManager user/超时日志 | `query/task_manager.go:148`、`:281` | `query/task_manager.go:34`、`:76`、`:144`、`:329` | `32d8b002d8` #26981、`88d2760bc8` #23978、`2b7164440f` #27196 |
 | 编译 panic 恢复 | 无 | `query/compile.go:106`、`:117`-`:128` | `98361e2073` #21792 |
 | 多子查询 panic | `query/select.go:588`-`:594` 强制 `*VarRef` | `query/select.go:588`-`:594` 传 `expr.Args[0]` | `9e00f0de98` #26143 |
 | DST offset | `query/iterator.go:864` | `query/iterator.go:856`-`:866` | `d60741b506` #25082 |

@@ -26,7 +26,7 @@
 | 5 | RP 写入窗口字段 | 无 | `FutureWriteLimit=5/7`、`PastWriteLimit=6/8` | 新 SQL 语法、meta.db 新增字段、写路径丢点判定 | `v1.8.10:services/meta/internal/meta.proto:43` / `v1.12.3:services/meta/internal/meta.proto:47` |
 | 6 | `CreateShardGroup` 边界 | 直接 `Truncate`，允许重叠 | 与已有 shard group 求差集，保证不重叠 | 同时间戳可能落到不同起止时间的组 | `v1.8.10:services/meta/data.go:358` / `v1.12.3:services/meta/data.go:382` |
 | 7 | `DropShard` 的 `DeletedAt` | 每次都覆盖为 `time.Now()` | 保留首次删除时间 | 14 天修剪窗口计时更准 | `v1.8.10:services/meta/data.go:278` / `v1.12.3:services/meta/data.go:299` |
-| 8 | `PruneShardGroups` | 14 天后**无条件**删组 | 仅当 `len(Shards)==0` 才删组 | 修复孤儿文件（#24530） | `v1.8.10:services/meta/client.go:682` / `v1.12.3:services/meta/client.go:680` |
+| 8 | `PruneShardGroups` | 14 天后**无条件**删组 | 仅当 `len(Shards)==0` 才删组 | 修复孤儿文件（#24530） | `v1.8.10:services/meta/client.go:682` / `v1.12.3:services/meta/client.go:680` + `services/meta/data.go:482` |
 | 9 | `DeleteShard` 不存在时 | 返回 `nil` | 返回 `ErrShardNotFound` | retention 可识别 phantom shard | `v1.8.10:tsdb/store.go:698` / `v1.12.3:tsdb/store.go:978` |
 | 10 | `DeleteShard` 索引类型清理 | `defer` 里无条件清（失败也清） | 仅在磁盘删除成功后清 | 统计更准；但见第 7 节风险 | `v1.8.10:tsdb/store.go:733` / `v1.12.3:tsdb/store.go:1139` |
 | 11 | 删 series 的 fsync | 每条一次 `segment.Flush()` | `NoFlush` 批处理 + 每分区一次 `FlushSegments` | 大 shard 删除大幅加速（#27114） | `v1.8.10:tsdb/series_partition.go:317` / `v1.12.3:tsdb/series_file.go:211` |
@@ -49,6 +49,7 @@ flowchart TB
         MD["meta.Data"]
         SNAP["snapshot(path, data)"]
         PB["internal.Data protobuf"]
+        DISK["磁盘 meta.db / meta.dbtmp"]
         CH["changed chan struct{}"]
     end
     subgraph RET["services/retention"]
@@ -56,7 +57,8 @@ flowchart TB
         DSM["DropShardMetaRef"]
     end
     subgraph TSDB["tsdb"]
-        ST["Store.DeleteShard"]
+        ST["tsdb.Store"]
+        CS["CreateShard / loadShards / ReopenShard"]
         SF["SeriesFile.DeleteSeriesID / FlushSegments"]
         SH["Shard.SetNewReadersBlocked / InUse"]
         FS["tsm1.FileStore"]
@@ -69,19 +71,22 @@ flowchart TB
     HW["httpd.serveExpvar"]
 
     MC -->|"commit"| SNAP
-    SNAP -->|"MarshalBinary"| PB
-    SNAP -->|"RenameFile"| MD
+    SNAP -->|"data.MarshalBinary"| MD
+    MD -->|"proto.Marshal"| PB
+    SNAP -->|"rename(2) 原子替换"| DISK
     MC -->|"close changed"| CH
-    CH -->|"WaitForDataChanged"| SUB
+    SUB -->|"WaitForDataChanged()"| MC
+    CH -->|"close 唤醒"| SUB
     DC -->|"DeleteShardGroup / PruneShardGroups"| MC
-    DC -->|"SetShardNewReadersBlocked / ShardInUse"| SH
+    DC -->|"SetShardNewReadersBlocked / ShardInUse"| ST
+    ST -->|"转发为 Shard.SetNewReadersBlocked / InUse"| SH
     DC -->|"DeleteShard"| ST
     DC -->|"DropShardMetaRef"| DSM
     DSM -->|"DropShard"| MC
     ST -->|"DeleteSeriesID NoFlush"| SF
     ST -->|"sh.Close"| FS
     FS -->|"purger.add"| PG
-    ST -->|"registerShard 失败"| BS
+    CS -->|"registerShard 失败"| BS
     WR -->|"Subscriber.Send"| SUB
     CQ -->|"Statistics"| HW
 ```
@@ -106,14 +111,21 @@ sequenceDiagram
             Note over R: 本轮跳过，下轮重试
         else 无读者
             R->>S: DeleteShard(id)
-            S->>F: DeleteSeriesID(NoFlush)
-            S->>F: FlushSegments(partitionIDs)
-            R->>M: DropShardMetaRef(id)
-            M->>M: DropShard 保留首次 DeletedAt
+            alt 返回 ErrShardNotFound（phantom）
+                Note over S,F: 不碰 series file（无 DeleteSeriesID / FlushSegments）
+            else 删除成功
+                S->>F: DeleteSeriesID(NoFlush)
+                S->>F: FlushSegments(partitionIDs)
+            end
+            R->>M: DropShardMetaRef(id) → DropShard
+            M->>M: DropShard 保留首次 DeletedAt + commit
         end
     end
+    Note over R,M: phantom 自愈：meta 里有、ShardIDs() 里没有的 shard
+    R->>M: DropShardMetaRef(id)（仅 isOSS() 或 owners 含本节点）
+    M->>M: DropShard + commit
     R->>M: PruneShardGroups
-    Note over M: 仅当 DeletedAt 早于 now-14d 且 Shards 为空
+    Note over M: 仅当 DeletedAt 早于 now-14d 且 Shards 为空；有变更才 commit
 ```
 
 ## 3. 逐项差异
@@ -147,11 +159,17 @@ func (c *Client) commit(data *Data) error {
 ```go
 // v1.8.10:services/meta/client.go:997 — snapshot
 // v1.12.3:services/meta/client.go:981 — snapshot
-f, err := os.Create(tmpFile)      // meta.db.tmp
-if _, err := f.Write(d); err != nil { ... }
-if err = f.Sync(); err != nil { ... }        // fsync 数据
-if err = f.Close(); err != nil { ... }       // 先关句柄以兼容 Windows
-return file.RenameFile(tmpFile, filename)    // 原子替换
+filename := filepath.Join(path, metaFile)   // metaFile = "meta.db"
+tmpFile := filename + "tmp"                 // <meta>/meta.dbtmp（中间无点）
+f, err := os.Create(tmpFile)
+if err != nil { return err }
+defer f.Close()
+d, err := data.MarshalBinary()              // proto.Marshal(data.marshal())
+if err != nil { return err }
+if _, err := f.Write(d); err != nil { return err }
+if err = f.Sync(); err != nil { return err }        // fsync 数据
+if err = f.Close(); err != nil { return err }       // 先关句柄以兼容 Windows
+return file.RenameFile(tmpFile, filename)           // 原子替换
 ```
 
 要点：
@@ -180,7 +198,11 @@ diffstat：`services/meta/internal/meta.pb.go` **+3397 / −1968**（`meta.proto
 // v1.8.10:services/meta/internal/meta.pb.go:1
 // Code generated by protoc-gen-gogo. DO NOT EDIT.
 // source: internal/meta.proto
-import proto "github.com/gogo/protobuf/proto"
+import (
+	fmt "fmt"
+	proto "github.com/gogo/protobuf/proto"
+	math "math"
+)
 
 // v1.12.3:services/meta/internal/meta.pb.go:1
 // Code generated by protoc-gen-go. DO NOT EDIT.
@@ -190,6 +212,8 @@ import proto "github.com/gogo/protobuf/proto"
 import (
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
+	reflect "reflect"
+	sync "sync"
 )
 ```
 
@@ -307,6 +331,9 @@ ALTER RETENTION POLICY <rp> ON <db> [DURATION <d>] [REPLICATION <n>]
 // v1.12.3:services/meta/data.go:382 — CreateShardGroup
 	startTime := timestamp.Truncate(rpi.ShardGroupDuration).UTC()
 	endTime := startTime.Add(rpi.ShardGroupDuration).UTC()
+	if endTime.After(time.Unix(0, models.MaxNanoTime)) {
+		endTime = time.Unix(0, models.MaxNanoTime+1)   // [start,end) 上界钳位，与旧版相同
+	}
 	for i := range rpi.ShardGroups {
 		if rpi.ShardGroups[i].Deleted() { continue }
 		startI := rpi.ShardGroups[i].StartTime
@@ -640,7 +667,10 @@ func (p *purger) add(files []TSMFile) {
 }
 
 func (p *purger) purge() {
-	...
+	p.mu.Lock()                       // 进入 goroutine 前先占锁置位
+	if p.running { p.mu.Unlock(); return }
+	p.running = true
+	p.mu.Unlock()
 	go func() {
 		for {
 			p.mu.Lock()                       // 整个扫描 + Close + Remove 都在写锁内
@@ -677,7 +707,12 @@ type purger struct {
 
 func (p *purger) add(files []TSMFile) {
 	if len(files) == 0 { return }             // #26762：空批直接返回
-	for _, f := range files { p.files.Store(f.Path(), f) }
+	var fileNames []string
+	for _, f := range files {
+		fileName := f.Path()
+		fileNames = append(fileNames, fileName)
+		p.files.Store(fileName, f)
+	}
 	p.purge(fileNames)
 }
 
@@ -793,7 +828,7 @@ func (f *SeriesFile) FlushSegments(partitionIDs map[int]struct{}) error {
 }
 ```
 
-**(3) 三处调用方全部改成"先 NoFlush、最后统一 FlushSegments"**
+**(3) 两处生产调用方改成"先 NoFlush、最后统一 FlushSegments"，另有一处测试调用**
 
 - `Store.DeleteShard`：`v1.12.3:tsdb/store.go:1083` + `:1108`
 - `Engine.deleteSeriesRange`（DELETE / DROP SERIES）：`v1.12.3:tsdb/engine/tsm1/engine.go:1858` + `:1878`
@@ -876,8 +911,11 @@ func (e *StatementExecutor) executeShowContinuousQueriesStatement(stmt *influxql
 
 // v1.12.3:coordinator/statement_executor.go:654
 func (e *StatementExecutor) executeShowContinuousQueriesStatement(ctx *query.ExecutionContext, stmt *influxql.ShowContinuousQueriesStatement) (models.Rows, error) {
+	dis := e.MetaClient.Databases()
 	a := ctx.ExecutionOptions.CoarseAuthorizer
-	if a.AuthorizeDatabase(influxql.ReadPrivilege, di.Name) || a.AuthorizeDatabase(influxql.WritePrivilege, di.Name) { ... }
+	for _, di := range dis {
+		if a.AuthorizeDatabase(influxql.ReadPrivilege, di.Name) || a.AuthorizeDatabase(influxql.WritePrivilege, di.Name) { ... }
+	}
 ```
 
 非管理员用户升级后会**看不到**自己无权限的库里的 CQ —— 这是有意的安全修复，但会改变既有脚本的输出。
@@ -890,7 +928,7 @@ func (e *StatementExecutor) executeShowContinuousQueriesStatement(ctx *query.Exe
 
 - **IDMap 握手未变**：`respondIDMap` 仍是 `[BackupMagicHeader(8) + npairs(8)]` 头部，再写 `(from,to)` 对（`v1.8.10:services/snapshotter/service.go:249` / `v1.12.3:services/snapshotter/service.go:249`，行号与实现均未动）。
 - **备份路径未变**：`writeMetaStore` 仍调用 `MetaClient.MarshalBinary()` 取 `meta.db` 的 protobuf 字节，按 `[BackupMagicHeader(8) | len(metaBlob)(8)] | metaBlob | len(nodeJSON)(8) | nodeJSON` 的顺序写出（`v1.12.3:services/snapshotter/service.go:267-301`，与 v1.8.10 相同）。因为 3.2 的 wire format 兼容，**旧版本备份可以被新版本恢复**。
-- **恢复路径未变**：`updateMetaStore` → `meta.Data.UnmarshalBinary` → `ImportData` → `SetData`。`ImportData`/`importOneDB` 在区间内**没有改动**，因此恢复出来的 RP 会带上备份文件里的写窗口字段（如果有）；但从 v1.8.10 备份恢复到 v1.12.3 时字段为 0（不限制）。
+- **恢复路径未变**：`updateMetaStore` → `meta.Data.UnmarshalBinary` → `ImportData` → `SetData` → `createNewDBShards` → `respondIDMap(IDMap)`（`v1.12.3:services/snapshotter/service.go:181-221`）。失败语义分两类：解码失败、非 OSS 客户端、`ImportData` 失败会**先回一个空 IDMap** 再返回错误（`:185/:193/:203`）；`SetData` 与 `createNewDBShards` 失败则**不发任何响应**、直接返回错误（`:209-217`），客户端只能从连接关闭判错；只有全部成功才回 IDMap。`ImportData`/`importOneDB` 在区间内**没有改动**，因此恢复出来的 RP 会带上备份文件里的写窗口字段（如果有）；但从 v1.8.10 备份恢复到 v1.12.3 时字段为 0（不限制）。
 
 **precreator：零改动。** `git diff v1.8.10 HEAD -- services/precreator` 为空。
 
@@ -977,7 +1015,8 @@ func (e *StatementExecutor) executeShowContinuousQueriesStatement(ctx *query.Exe
 **到期判定**（两版一致，`RetentionPolicyInfo.ExpiredShardGroups`）：
 
 ```go
-// v1.12.3:services/meta/data.go:1275
+// v1.12.3:services/meta/data.go:1275 — ExpiredShardGroups（跳过与条件在 1278-1281）
+if rpi.ShardGroups[i].Deleted() { continue }   // 已软删除的组不再参与到期判定
 if rpi.Duration != 0 && rpi.ShardGroups[i].EndTime.Add(rpi.Duration).Before(t) { ... }
 // 2026-10-02T00:00Z + 7d = 2026-10-09T00:00Z < 2026-10-10T00:30Z → 过期
 ```
@@ -1021,7 +1060,7 @@ CREATE RETENTION POLICY "hot" ON "db0" DURATION 24h REPLICATION 1 FUTURE LIMIT 1
 ```go
 // v1.12.3:coordinator/statement_executor.go:305
 	spec := meta.RetentionPolicySpec{
-		Name: &stmt.Name, Duration: &stmt.Duration, ReplicaN: &stmt.Replication,
+		Name: stmt.Name, Duration: &stmt.Duration, ReplicaN: &stmt.Replication,
 		ShardGroupDuration: stmt.ShardGroupDuration,
 		FutureWriteLimit:   &stmt.FutureWriteLimit,
 		PastWriteLimit:     &stmt.PastWriteLimit,
@@ -1156,7 +1195,7 @@ partial write: dropped 0 points outside retention policy of duration 24h0m0s
 
 ### 7.7 每次 `DropShard` 都是一次完整的 meta 提交
 
-`Client.DropShard`（`v1.12.3:services/meta/client.go:660`）走 `Clone → DropShard → commit`，即**每个 shard 一次 `meta.db` 全量重写 + fsync**。旧版 retention 从不调用它（只在最后 `PruneShardGroups` 里可能提交一次）。一个包含 8 个 shard 的组，新版每轮最多产生 9 次提交。在大 meta（几十万 shard group）场景下，retention 检查会造成明显的写放大。这是"正确性换 IO"的取舍，未被批量化。
+`Client.DropShard`（`v1.12.3:services/meta/client.go:660`）走 `Clone → DropShard → commit`，即**每个 shard 一次 `meta.db` 全量重写 + fsync**。旧版 retention 从不调用它，提交只来自每个到期组的 `DeleteShardGroup` 与末尾可能一次 `PruneShardGroups`；新版在此之上每个 shard 再加一次 `DropShard` 提交（一个 8 shard 的组每轮最多 9 次：1 次 `DeleteShardGroup` + 8 次 `DropShard`，组刚软删除未满 14 天，`PruneShardGroups` 无变更不提交）。在大 meta（几十万 shard group）场景下，retention 检查会造成明显的写放大。这是"正确性换 IO"的取舍，未被批量化。
 
 ### 7.8 protobuf 运行时与降级
 
@@ -1200,7 +1239,7 @@ partial write: dropped 0 points outside retention policy of duration 24h0m0s
 | PruneShardGroups | `services/meta/client.go:682` | `services/meta/client.go:680` + `services/meta/data.go:476` | `7bd3f89d18` #24530 |
 | 14 天常量 | `services/meta/client.go:36` | `services/meta/client.go:35` | — |
 | DropShard 保留 DeletedAt | `services/meta/data.go:295` | `services/meta/data.go:313` | 随 #24530 |
-| CreateShardGroup 去重叠 | `services/meta/data.go:358` | `services/meta/data.go:382`（循环 403-421） | `3c811bcd81` #22601 |
+| CreateShardGroup 去重叠 | `services/meta/data.go:358` | `services/meta/data.go:382`（循环 403-430，收缩条件 422-429） | `3c811bcd81` #22601 |
 | 写窗口字段（proto） | `services/meta/internal/meta.proto:43` | `services/meta/internal/meta.proto:47/58` | `07c261a21a` #25517 |
 | 写窗口校验 | — | `services/meta/data.go:141`、`services/meta/errors.go:73` | `07c261a21a` |
 | protobuf 生成器 | `services/meta/internal/meta.pb.go:1`（gogo，2864 行） | `services/meta/internal/meta.pb.go:1`（protoc-gen-go，4293 行） | `23c3d35aab` #21882、`d4b16dcd98`、`dbbe4611c0` |

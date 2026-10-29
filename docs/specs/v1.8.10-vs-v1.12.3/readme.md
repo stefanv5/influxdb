@@ -51,7 +51,7 @@ git diff --shortstat v1.8.10 f3d5cb68ab
 # 602 files changed, 79310 insertions(+), 45239 deletions(-)
 ```
 
-**与主文档的关系必须说清楚**：`docs/specs/readme.md` 第 5 行明确写着，17 篇主文档以 v1.12.3（commit `f3d5cb68ab`）为基准，不是 v1.8.10。当前工作树在这 4 个 docs 提交之后只改了文档：`git diff --stat f3d5cb68ab HEAD -- '*.go'` 输出为空；`git diff --name-only f3d5cb68ab HEAD` 只有 19 个 docs 路径。因此本组差异文档里所有“新版本行为”都可以直接在当前工作树核对，等价于 `v1.12.3`。
+**与主文档的关系必须说清楚**：`docs/specs/readme.md` 第 5 行明确写着，17 篇主文档以 v1.12.3（commit `f3d5cb68ab`）为基准，不是 v1.8.10。当前工作树在这 6 个 docs 提交之后只改了文档：`git diff --stat f3d5cb68ab HEAD -- '*.go'` 输出为空；`git diff --name-only f3d5cb68ab HEAD` 只有 27 个 docs 路径。因此本组差异文档里所有“新版本行为”都可以直接在当前工作树核对，等价于 `v1.12.3`。
 
 ### 1.2 变化集中在哪里
 
@@ -99,11 +99,11 @@ flowchart TB
         W1["HTTP /write"] --> W2["PointsWriter<br/>WriteContext + StatsTracker<br/>RP WriteWindow"]
         W2 --> W3["Shard.validateSeriesAndFields<br/>time 字段 -> PartialWriteError"]
         W3 --> W4["Engine.WritePoints<br/>Cache + WAL"]
-        W4 --> W5["TSM snapshot"]
+        W4 -.-> W5["TSM snapshot<br/>（后台 compactCache tick 触发）"]
     end
 
     subgraph I["② 索引 / Series"]
-        I1["SeriesFile<br/>DeleteSeriesID flush 参数"]
+        I1["SeriesFile<br/>建/删 series<br/>DeleteSeriesID(flush)"]
         I2["TSI LogFile / IndexFile<br/>MANIFEST 原子写<br/>TagValueIterator 缩短锁"]
         I3["TagValueSeriesIDCache<br/>字符串只转换一次"]
     end
@@ -115,11 +115,11 @@ flowchart TB
     end
 
     subgraph S["④ 存储 / Compaction"]
-        S1["Scheduler<br/>4 队列 -> 5 队列"]
+        S1["Scheduler<br/>4 队列 -> 5 队列<br/>（Engine.compact 设 depth<br/>并管 1h/5m holdoff）"]
         S2["PlanCompactions<br/>L1 到 L5"]
-        S3["compactOptimize<br/>optimizedCompactionLimiter<br/>1h / 5m holdoff"]
+        S3["compactOptimize<br/>optimizedCompactionLimiter<br/>aggressive points-per-block"]
         S4["compact 函数<br/>minSeqByGen 防 level 回退"]
-        S5["FileStore<br/>TSM 文件名缓存<br/>first-block 缓存<br/>purger 并发 map"]
+        S5["FileStore<br/>TSM 文件名缓存<br/>purger 并发 map<br/>（TSMReader first-block 缓存）"]
     end
 
     subgraph M["⑤ 元数据 / 后台"]
@@ -142,11 +142,13 @@ flowchart TB
         B3["CI/打包<br/>build.py + fpm -> cross-builder + packager"]
     end
 
-    W2 --> I1
+    W2 --> M1
+    W3 --> I1
     W3 --> I2
-    W4 --> S5
-    S2 --> S3
-    S2 --> S4
+    W5 --> S5
+    S2 --> S1
+    S1 --> S3
+    S1 --> S4
     S5 --> S2
     Q1 --> I2
     Q3 --> I2
@@ -155,6 +157,7 @@ flowchart TB
     H4 --> M1
     H5 --> Q3
     M2 --> S5
+    M2 --> I1
     M1 --> M2
     B1 -.-> W4
     B1 -.-> H5
@@ -163,7 +166,7 @@ flowchart TB
 
 **怎么读这张图：**
 
-1. 先看 **④ 存储/Compaction**：这是本次区间里行为变化最集中、最容易影响磁盘和 CPU 的块。`S1`→`S2`→`S3`/`S4` 是新的 5 级调度主链。
+1. 先看 **④ 存储/Compaction**：这是本次区间里行为变化最集中、最容易影响磁盘和 CPU 的块。`S2`→`S1`→`S3`/`S4`（规划→调度→执行）是新的 5 级调度主链。
 2. 再看 **① 写入链路** 与 **② 索引/Series**：写入校验、`WriteContext`、TSI 锁与缓存分配都在这条线上，影响写入延迟和错误语义。
 3. 最后看 **③/⑤/⑥/⑦**：查询、后台、HTTP/Flux、构建依赖大多是外围行为或可观测性变化，但 `M2` retention 和 `H1` TLS 会直接影响运维。
 
@@ -204,9 +207,9 @@ flowchart TB
 | 代表项 | 变化要点（旧 → 新） | 代表 commit | 子文档 |
 |---|---|---|---|
 | TSM 文件名解析缓存 | 旧版 `tsmGeneration.level()` 每次都 `parseFileName`；新版在打开/重命名时缓存 generation/sequence | `f0d5c73253` | [04](04_storage_compaction_diff.md) |
-| compaction 规划 CPU 与首 block 缓存 | 旧版规划反复解码 block 统计；新版 `firstBlockCount` 缓存 + `BlockCount`，并移除 `PT_SmartOptimize`/`PT_NoOptimize` 特例 | `2a0353ffd2`、`95e86be3f4` | [04](04_storage_compaction_diff.md) |
+| compaction 规划 CPU 与首 block 缓存 | 旧版规划反复解码 block 统计；`2a0353ffd2` 引入 `firstBlockCount` 缓存与 `PT_SmartOptimize`/`PT_NoOptimize` 特例，`95e86be3f4` 再移除这两个特例（修 #26670） | `2a0353ffd2`、`95e86be3f4` | [04](04_storage_compaction_diff.md) |
 | optimize 频率与并发控制 | 旧版每个 tick 都可能规划 optimize；新版用 `lastWrite`、1 小时启动 holdoff、5 分钟间隔和独立 limiter 控制 | `e984a226f2`、`f738344a81` | [04](04_storage_compaction_diff.md) |
-| TSI series cache 字符串分配 | 旧版每次查 map 都 `string(name/key/value)`；新版一次转换、复用同一 backing string | `f3d5cb68ab` | [02](02_index_series_diff.md) |
+| TSI series cache 字符串分配 | 旧版 `Put` 在 exists/元素/map key 处重复 `string(...)`；新版 `Put` 一次转换、复用同一 backing string（`Get` 未变，仍每次转换 3 次） | `f3d5cb68ab` | [02](02_index_series_diff.md) |
 | TagValueIterator 锁持有时间 | 旧版 `defer RUnlock` 覆盖整个 iterator 构造；新版查到 `logTagKey` 后立即释放 RLock | `e51acc4882` | [02](02_index_series_diff.md) |
 | purger 锁竞争 | 旧版用全局 mutex 管理待删文件；新版 `gensyncmap.Map` + 缩小临界区 | `d5a48e0662` | [04](04_storage_compaction_diff.md) |
 | retention 删除 fsync 策略 | v1.8.10 的 `DeleteSeriesID` 只 `Flush()` 缓冲、不 `file.Sync()`；区间内 `b4e781eff6` 给 `SeriesSegment.Flush` 加上 `file.Sync`；新版 `1420aaf2bc` 改为 `NoFlush` + `FlushSegments` 按 partition 批量 fsync | `b4e781eff6`、`1420aaf2bc` | [05](05_meta_background_diff.md) |
@@ -216,7 +219,8 @@ flowchart TB
 
 | 代表项 | 变化要点（旧 → 新） | 代表 commit | 子文档 |
 |---|---|---|---|
-| 混合/嵌套 level compaction | 旧版输出 sequence 只看 max generation，可能把 L4 降成 L2；新版用 `minSeqByGen` + `maxInputLevel` 保证输出 level 不回退，并处理嵌套低层文件 | `5e9d85c972`、`d1d68d656d` | [04](04_storage_compaction_diff.md) |
+| 混合 level compaction 的 level 回退 | 旧版输出 sequence 只看 max generation，可能把 L4 降成 L2；新版用 `minSeqByGen` + `maxInputLevel` 保证输出 level 不回退 | `5e9d85c972` | [04](04_storage_compaction_diff.md) |
+| 嵌套低层文件的规划（1.12 线回归） | 1.12 线把嵌套处理从「遇低层即停」改为 `Plan` 反向扫描；这是 #26911 的回归修复，不是「v1.8.10 漏压 → v1.12.3 修好」 | `d1d68d656d` | [04](04_storage_compaction_diff.md) |
 | full compaction 未排期（区间内回归） | v1.8.10 用 `PlanLevel`/`Plan`/`PlanOptimize`；1.12.1 引入的 `PT_SmartOptimize`/`PT_NoOptimize` 特例会让文件被 planner 锁住却不排期，表现为磁盘无界增长；1.12.2 移除特例并把 holdoff 移到 `Engine.compact` | `95e86be3f4` | [04](04_storage_compaction_diff.md) |
 | retention 孤儿 shard / 挂起 | 旧版删除失败/未完成也会 prune：14 天后只要 `DeletedAt` 过期就删组，不检查 shard 是否删净，留下孤儿文件；旧版还可能卡在 `Shard.Close`。新版 `PruneShardGroups` 要求无 shard 且已过 `DeletedAt`，并用 `SetShardNewReadersBlocked`/`ShardInUse` 跳过 in-use shard | `7bd3f89d18`、`b4bd607eef` | [05](05_meta_background_diff.md) |
 | TSI MANIFEST 与部分打开清理 | 旧版 `ioutil.WriteFile` 直接覆盖 MANIFEST；新版临时文件 + `os.Rename` 原子替换。旧版部分打开失败可能泄漏引用；新版补齐清理与 iterator close | `061cf55f2a`、`d3db48e93d`、`a428043f84` | [02](02_index_series_diff.md) |
@@ -289,7 +293,7 @@ flowchart TB
 
 **旧**：MANIFEST 直接 `ioutil.WriteFile` 覆盖，写到一半失败会破坏现有清单；部分打开的 TSI 可能泄漏引用；非法 series key 可能 panic；`TagValueSeriesIDCache` 每次查 map 都做 `string(...)`（`v1.8.10:tsdb/index/tsi1/partition.go:1303`、`v1.8.10:tsdb/index/tsi1/cache.go:59-67`、`v1.8.10:tsdb/index/tsi1/log_file.go:414`）。
 **新**：MANIFEST 写临时文件后 `os.Rename` 原子替换；部分打开路径补齐清理和 iterator close；series key 增加边界检查；cache 的 `name/key/value` 只转换一次（`v1.12.3:tsdb/index/tsi1/partition.go:1490-1520`、`v1.12.3:tsdb/index/tsi1/cache.go:98-105`）。
-**影响**：崩溃恢复更稳，TSI 查询分配更少；`.tsl` 现在按大小或年龄（默认 4h）轮转，并有每小时 `runPeriodicCompaction`，`compact-full-write-cold-duration` 同时控制该年龄（`v1.12.3:tsdb/index/tsi1/index.go:44-48`）。但 `TagValueIterator` 在释放 RLock 后再遍历 `tagValues`，并发写入下是否安全需要 race 测试复核（见 §10）。
+**影响**：崩溃恢复更稳，TSI 查询分配更少；`.tsl` 现在按大小或年龄（默认 4h）轮转，并有每小时 `runPeriodicCompaction`，`compact-full-write-cold-duration` 同时控制该年龄、默认 4h（`v1.12.3:tsdb/index/tsi1/index.go:44-48`；每小时 tick 在 `v1.12.3:tsdb/index/tsi1/partition.go:979-1000`）。但 `TagValueIterator` 在释放 RLock 后再遍历 `tagValues`，02 §7.7 已判定为 v1.12.3 的并发回归（可 fatal），建议用 race 复现触发条件（见 §10）。
 
 ### 7. 查询正确性与安全修复
 
@@ -405,7 +409,7 @@ flowchart TB
 
 ```bash
 # 1. 确认两个基线
-git rev-parse v1.8.10 v1.12.3
+git rev-parse 'v1.8.10^{}' v1.12.3
 
 # 2. 看区间规模
 git diff --shortstat v1.8.10 f3d5cb68ab
@@ -438,7 +442,7 @@ git diff --stat f3d5cb68ab HEAD -- '*.go'
 2. 对每个候选提交，至少核对一处旧代码和一处新代码；只根据 commit message 的结论会标“提交说明依据”。
 3. **不做基准测试推断**：本文不写“提升 X%”这类数字，除非 commit/测试里有可复核的数据；没有就只解释机制。
 4. 本文是总览，不追求列全 527 个提交；未列出的提交可能是小重构、日志、测试或依赖微调。七篇子文档才是逐项清单。
-5. 版本边界：NEW 的代码基准是 `f3d5cb68ab`；当前工作树在其上只有 4 个 docs 提交（`e04d9caa93`、`65e6693067`、`750819baf0`、`523c4bd0d9`），`*.go` 无差异。
+5. 版本边界：NEW 的代码基准是 `f3d5cb68ab`；当前工作树在其上只有 6 个 docs 提交（`e04d9caa93`、`65e6693067`、`750819baf0`、`523c4bd0d9`、`6861a080d7`、`1ebfb74c0f`），`*.go` 无差异。
 
 ---
 
@@ -504,7 +508,7 @@ CREATE RETENTION POLICY rp ON db DURATION 24h REPLICATION 1
 > InfluxQL v1.4.1 的 `CREATE RETENTION POLICY` 语法要求 `FUTURE` 在 `PAST` 之前
 > （`parser.go:281-296`）；反过来写会报 `found FUTURE, expected ;`。
 
-**写入**：一个时间戳为 `now - 20m` 的点。以下推演假设库里已有覆盖 `now` 的 shard group；空库时不会进入 retention/write-window 丢弃路径，`RetentionDropped`、`WriteWindowDropped` 均为 0。
+**写入**：一个时间戳为 `now - 20m` 的点，**同一请求里还有一个窗口内的点**（例如 `now`）。关键点是 `MapShards` 的 `list` 只装本次请求里新创建/取回的 shard group，不预载库里已有的组。
 
 **旧版**：`MapShards` 只检查 `p.Time().Before(min)`（`min = now - rp.Duration`）和 shard group 覆盖范围；`now-20m` 在 24h 内，所以会被接受并写入（`v1.8.10:coordinator/points_writer.go:206-210`）。
 
@@ -512,10 +516,13 @@ CREATE RETENTION POLICY rp ON db DURATION 24h REPLICATION 1
 
 1. `NewWriteWindow(rp)` 记录 `before = now - 10m`、`after = now + 15m`（`v1.12.3:coordinator/points_writer.go:211-245`）。
 2. `WithinWindow(now-20m)` 发现 `checkBefore && t.Before(before)`，返回 `false, before, WriteWindowLowerBound`。
-3. `MapShards` 不再为该点创建 shard group；该点进入 `mapping.Dropped`。
-4. `WritePointsPrivileged` 返回 `PartialWriteError`，reason 由 `SummariseDropped()` 生成，形如 `dropped N points outside retention policy of duration ... and M points outside write window (...)`，并带上 database/RP 与 dropped 数（`v1.12.3:coordinator/points_writer.go:516-521`）。
+3. 第一轮 `MapShards` 对 `now-20m` 直接 `continue`、不建组；同请求里的 `now` 建出覆盖该小时的组并 `list.Add`（`v1.12.3:coordinator/points_writer.go:314-321`）。
+4. 第二轮 `list.ShardGroupAt(now-20m)` 命中该组，再判一次 `WithinWindow` 失败 → `AddDropped(p, before, WriteWindowLowerBound)`，`WriteWindowDropped=1`（`:337-350`）。
+5. `WritePointsPrivileged` 返回 `PartialWriteError`，reason 由 `SummariseDropped()` 生成：`dropped 0 points outside retention policy of duration 24h0m0s and 1 points outside write window (-10m0s) - ...`（`v1.12.3:coordinator/points_writer.go:516-521`）。
 
-**影响**：客户端会收到 400/partial write，必须决定重试、丢弃还是修正时间戳；监控上应看 `WriteWindowDropped`。这不是“默认开启”的行为，只有显式设置 `PAST LIMIT` / `FUTURE LIMIT` 才会生效。
+> 反例：库里只有这一个点（或空库）时，第一轮不会建组，第二轮 `sg == nil` → `AddDropped(p, min, RetentionPolicyBound)`，即 `RetentionDropped=1`、`WriteWindowDropped=0`，错误文本是 “outside retention policy”，不是 “outside write window”。
+
+**影响**：客户端会收到 400/partial write，必须决定重试、丢弃还是修正时间戳；监控上应同时看 `RetentionDropped` 与 `WriteWindowDropped`（单点/空库会落到前者）。这不是“默认开启”的行为，只有显式设置 `PAST LIMIT` / `FUTURE LIMIT` 才会生效。
 
 ### 9.3 案例 C：`time` 字段从“静默消失”到“明确报错”
 
@@ -533,8 +540,8 @@ CREATE RETENTION POLICY rp ON db DURATION 24h REPLICATION 1
 |---|---|---|---|
 | L5 optimize 可能被饿死或延迟 | `defaultWeights` 中 L5 权重 `0.01`，启动 holdoff 1h、间隔 5m、shard 冷写 ≥4h（`v1.12.3:tsdb/engine/tsm1/scheduler.go:8`、`tsdb/engine/tsm1/engine.go:2171-2175`、`tsdb/engine/tsm1/compact.go:452`、`tsdb/config.go:38`） | 高负载集群上 optimize 可能长期排不到；重启后磁盘回收慢；热 shard 永远不会 optimize | 观察 `tsmOptimizeCompactionQueue`/`tsmOptimizeCompactionsActive`；必要时提高 `max-concurrent-optimized-compactions`，但不要挤占 level compaction |
 | retention 仍可能被“卡住”的 shard 阻塞 | `ShardInUse` 为 true 时直接返回 `can not delete an in-use shard`（`v1.12.3:services/retention/service.go:246-251`） | 单个长期读者会让该 shard 永远不删；日志会提示，但不会自动恢复 | 监控 retention 错误日志与 shard 目录；排查长查询/泄漏的 reader |
-| `TagValueIterator` 释放 RLock 后遍历 map，存在并发读写疑点 | `v1.12.3:tsdb/index/tsi1/log_file.go:422-437` 在 `RUnlock` 后调用 `tk.TagValueIterator()`；而 `logTagKey.TagValueIterator()` 会 `range tk.tagValues`，`execSeriesEntry` 又在 `f.mu` 写锁下更新同一 map（`:740-749`、`:1406-1411`） | 查询与写入并发时，理论上可能出现 Go map 并发读写；**待核实**，需要用 `-race` 压测确认。注：02 子文档认为这里是“值副本、构造迭代器安全”，但源码仍在 range 共享 map，两者需要对齐 | 在 02 子文档跟进；高并发写入 + TSI 查询场景先做 race 测试 |
-| retention 的 fsync 持久化窗口 | v1.8.10 的 `SeriesSegment.Flush` 只刷缓冲、不 `file.Sync()`（`v1.8.10:tsdb/series_segment.go:210-216`）；区间内 `b4e781eff6` 加上 `file.Sync()`；`1420aaf2bc` 又改为 `DeleteSeriesID(id, NoFlush)` + `FlushSegments(partitionIDs)`，后者失败只记录日志（`v1.12.3:tsdb/series_segment.go:218-227`、`v1.12.3:tsdb/series_file.go:203-220`、`v1.12.3:tsdb/engine/tsm1/engine.go:1852-1885`） | 相对 v1.8.10 是新增持久化保障；相对“每次删除 fsync”的中间版本，批量策略把持久化点后移，崩溃窗口内未 flush 的删除可能不持久 | 升级后关注删除后的 series 是否短暂“复活”；对删除持久性敏感的场景做掉电测试 |
+| `TagValueIterator` 释放 RLock 后遍历共享 map（v1.12.3 并发回归） | `v1.12.3:tsdb/index/tsi1/log_file.go:422-437` 在 `RUnlock` 后调用 `tk.TagValueIterator()`；而 `logTagKey.TagValueIterator()` 会 `range tk.tagValues`，`execSeriesEntry` 又在 `f.mu` 写锁下更新同一 map（`:740-749`、`:1406-1411`） | 查询与写入并发会触发 `fatal error: concurrent map iteration and map write`（runtime 直接退出，`recover` 无效）。02 §3.6/§7.7 已判定这是 v1.12.3 的并发回归并用最小程序复现，本文与 02 结论一致 | 高并发写入 + TSI 查询场景先做 `-race` 回归确认触发条件；等上游把 `range` 移回锁内 |
+| retention 的 fsync 持久化窗口 | v1.8.10 的 `SeriesSegment.Flush` 只刷缓冲、不 `file.Sync()`（`v1.8.10:tsdb/series_segment.go:210-216`）；区间内 `b4e781eff6` 加上 `file.Sync()`；`1420aaf2bc` 又改为 `DeleteSeriesID(id, NoFlush)` + `FlushSegments(partitionIDs)`，后者失败只记录日志（`v1.12.3:tsdb/series_segment.go:218-227`、`v1.12.3:tsdb/series_file.go:203-220`、retention 路径 `v1.12.3:services/retention/service.go:254` → `v1.12.3:tsdb/store.go:1083-1114`；`tsdb/engine/tsm1/engine.go:1852-1885` 是另一条 DELETE series 路径） | 相对 v1.8.10 是新增持久化保障；相对“每次删除 fsync”的中间版本，批量策略把持久化点后移，崩溃窗口内未 flush 的删除可能不持久 | 升级后关注删除后的 series 是否短暂“复活”；对删除持久性敏感的场景做掉电测试 |
 | TSI cache 仍不是零分配 | `Put` 仍然对 `name/key/value` 各做一次 `string(...)`（`v1.12.3:tsdb/index/tsi1/cache.go:98-105`） | 高基数 tag 查询仍有分配压力，只是避免了重复转换 | 不要把它当成“完全消除分配”；高基数场景继续关注 heap |
 | `SHOW TAG VALUES` 的限制只对 TSI 生效 | `SHOW TAG VALUES` 单 RP 限制在 `executeShowTagValues` 中，但 INMEM shard 共享索引（commit `519e23b86a` 说明） | INMEM 用户仍可能看到跨 RP 的 tag value；TSI 用户对多个不同 RP 查询会直接报错 | 升级前确认索引类型；需要跨 RP 并集的脚本改为显式多次查询 |
 | CSV 不再转义可能破坏旧解析器 | `HashKey(false)` 只影响 CSV formatter（`v1.12.3:services/httpd/response_writer.go:228`；commit `2dc3dcb3d1`） | tag 值中含逗号/反斜杠时，CSV 列内容与旧版不同 | 用真实 tag 值做回归；解析器按标准 CSV 处理而不是按旧转义格式 |

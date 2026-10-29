@@ -73,9 +73,9 @@ flowchart TB
         N1["Engine.compact engine.go:2180"] --> N2["PlanCompactions engine.go:2433"]
         N2 --> N3["planCompactionsInner engine.go:2360"]
         N3 --> N4["PlanLevel compact.go:318<br/>groupAdjacentGenerations"]
-        N3 --> N5["Plan compact.go:485<br/>反向找最后一个 L4"]
+        N3 --> N5["Plan compact.go:485<br/>反向找最后一个 L4（:567）"]
         N3 --> N6["PlanOptimize lastWrite compact.go:436"]
-        N3 --> N7["IsGroupOptimized 提升 L4→L5 engine.go:2162"]
+        N3 --> N7["IsGroupOptimized :2162 提升 L4→L5 engine.go:2376"]
         N2 --> N8["Scheduler.nextByQueueDepths scheduler.go:36<br/>权重 0.4/0.3/0.2/0.1/0.01"]
         N8 --> N9["compactHiPriorityLevel / compactLoPriorityLevel / compactFull"]
         N8 --> N10["compactOptimize engine.go:2529<br/>compactionLimiter + optimizedCompactionLimiter"]
@@ -106,16 +106,19 @@ sequenceDiagram
     E->>E: l1..l5 PlannedCompactionGroup
     E->>E: holdoff 内把 l5 depth 置 0
     E->>S: SetDepth 1..5
+    E->>S: next()
     S-->>E: level, runnable
     alt level 5
         E->>L: compactionLimiter.TryTake
         E->>L: optimizedCompactionLimiter.TryTake
         L-->>E: ok 或 ErrOptimizeCompactionLimited
-        E->>C: compactOptimize → CompactFull aggressive ppb
+        E->>E: compactOptimize（ppb = aggressive 或默认 1000）
+        E->>C: s.Apply() → CompactFull
         E->>E: startOptHoldoff 5m
     else level 1-4
         E->>L: compactionLimiter.TryTake
-        E->>C: compactHiPriorityLevel / compactLoPriorityLevel / compactFull
+        E->>E: compactHiPriorityLevel / compactLoPriorityLevel / compactFull
+        E->>C: s.Apply() → CompactFull / CompactFast
     end
     E->>P: ReleaseCompactionPlans 未启动的计划
 ```
@@ -537,7 +540,7 @@ func (c *DefaultPlanner) PlanOptimize(lastWrite time.Time) (compactGroup []Compa
 差异解释（行为影响最大的几处）：
 
 1. **必须冷**：`time.Since(lastWrite) < compactFullWriteColdDuration` 直接返回空。默认 `compactFullWriteColdDuration = 4h`（`v1.8.10:tsdb/config.go:38` 与 `v1.12.3:tsdb/config.go:38` 相同）。旧版 optimize 完全不看写入时间，只靠“`Plan` 为空”间接限制。
-2. **不再要求 4 代**：旧版 `len(group) < 4 && !hasTombstones` 才跳过；新版对 `level==4` 的组**不设数量下限**。但要注意**谁先拿到文件**：冷 shard 上 `Plan` 的 full 分支会先 `acquire` 全部世代（`v1.12.3:.../compact.go:493-548`），`PlanOptimize` 只能在 `Plan` 交不出计划时接手（`planCompactionsInner` 的顺序是 `Plan` 在前，`v1.12.3:.../engine.go:2365-2366`；`groupAdjacentGenerations` 遇 in-use 直接跳过，`:409-412`）。所以正确表述是“**当 `Plan` 为空时**，1–3 个 L4 世代也会被 L5 合并”，而不是无条件。
+2. **不再要求 4 代**：旧版 `len(group) < 4 && !hasTombstones` 才跳过；新版对 `level==4` 的组**不设数量下限**。但要注意**谁先拿到文件**：`planCompactionsInner` 每 tick **无条件**依次调用 `Plan` 与 `PlanOptimize`（`v1.12.3:.../engine.go:2365-2366`），后者只跳过已被 `acquire` 的世代（`groupAdjacentGenerations` 遇 in-use 直接 `continue`，`:409-412`）。`Plan` 的 full 分支并不 `acquire` 全部世代：对 `>2GB + 满块 + 无 tombstone` 的世代直接 `continue`（`compact.go:513`），`genCount<=1` 时整轮返回 nil（`:539`）。因此只要 `Plan` 没接管某些 L4 世代，1–3 个 L4 世代就会在同一 tick 进入 L5 队列，**L4 与 L5 可同时非空**。
 3. **单世代特例**：`len(generations) == 1` 时不再按层级过滤，允许把同一世代的多个文件重整。旧版在 `len(generations) <= 1` 时直接返回 nil，**单世代多文件永远不会被 optimize**。
 4. **不再跳过超大文件**：旧版对 `count>2 && size>2GB && 满 block && 无 tombstone` 的世代 `continue`；新版没有这条，改由 `generationsFullyCompacted` 决定。
 5. **返回值带世代数**：`generationCount == 1` 时引擎对该 L5 组使用 aggressive points/block（`v1.12.3:.../engine.go:2402`）。
@@ -552,7 +555,7 @@ func (c *DefaultPlanner) generationsFullyCompacted(gens tsmGenerations) (bool, s
 	} else if gens.hasTombstones() {
 		return false, "not fully compacted and not idle because of tombstones"
 	} else {
-		// 单世代但多文件：只要还有文件没到 aggressive points/block，就继续压
+		// 单世代但多文件：只要还有文件没超过默认 ppb（1000），就继续压
 		if len(gens) == 1 && len(gens[0].files) > 1 {
 			aggressivePointsPerBlockCount := 0
 			filesUnderMaxTsmSizeCount := 0
@@ -900,7 +903,7 @@ func (t *TSMReader) parseAndCacheFileName(path string) error {
 - `FileStat` 新增 `Generation` / `Sequence`（`v1.12.3:.../file_store.go:237`），`TSMReader.Stats` 填充（`v1.12.3:.../reader.go:679`）。
 - `tsmGeneration` 删掉 `parseFileName` 字段，`level()` 直接读 `t.files[0].Sequence`（`v1.12.3:.../compact.go:219`）。
 - `findGenerations` 用 `f.Generation` 聚合（`v1.12.3:.../compact.go:707`），不再解析文件名。
-- `Compactor.parseFileName` / `WithParseFileNameFunc` 被删除；`compact()` 改为 `c.FileStore.ParseFileName(f)`（`:982`），并对 `FileStore == nil` 返回明确错误。
+- `Compactor` 的 `parseFileName` 字段与 `Compactor.WithParseFileNameFunc` 被删除（reader 级 `tsm1.WithParseFileNameFunc` 保留）；`compact()` 改为 `c.FileStore.ParseFileName(f)`（`:982`），并对 `FileStore == nil` 返回明确错误。
 - `FileStore` 通过 `readerOptions` 把 `WithParseFileNameFunc` 传给每个 `TSMReader`（`v1.12.3:.../file_store.go:329-331`、`:950`）。
 - `NewDefaultPlanner` 增加防御：`SupportsCompactionPlanning()` 为 false 直接 panic（`v1.12.3:.../compact.go:182`），避免“所有文件的 generation/sequence 都是 0”的静默错误。
 
@@ -937,9 +940,22 @@ type blockCountCache struct {
 ```
 
 ```go
-// v1.12.3:tsdb/engine/tsm1/reader.go:635
+// v1.12.3:tsdb/engine/tsm1/reader.go:638
 func (t *TSMReader) firstBlockCount() (int, error) {
-	// 首次读取并缓存，之后直接返回
+	t.mu.RLock()
+	cache := t.firstBlockCountCache
+	t.mu.RUnlock()
+
+	if !cache.valid {
+		count, err := t.BlockCount(1) // 首次读盘
+		t.mu.Lock()
+		if !t.firstBlockCountCache.valid { // 不覆盖他人结果
+			t.firstBlockCountCache = blockCountCache{valid: true, count: count, err: err}
+		}
+		cache = t.firstBlockCountCache
+		t.mu.Unlock()
+	}
+	return cache.count, cache.err
 }
 ```
 
@@ -951,7 +967,7 @@ type ExtFileStat struct {
 }
 ```
 
-`FileStore.Stats()` 改为返回 `[]ExtFileStat` 并调用 `fd.ExtStats()`（`v1.12.3:.../reader.go:687`）；planner 的所有判断都改成 `FirstBlockCount >= tsdb.DefaultMaxPointsPerBlock`，不再触碰磁盘。语义上还从 `==` 改成了 `>=`（能识别 aggressive 文件）。
+`FileStore.Stats()` 改为返回 `[]ExtFileStat` 并调用 `fd.ExtStats()`（`v1.12.3:.../reader.go:687`）；planner 的阈值判断改用 `FirstBlockCount >= tsdb.DefaultMaxPointsPerBlock`（`generationsFullyCompacted` 例外，用严格 `>`，`compact.go:280`，见 §7 第 7 条），不再触碰磁盘。语义上还从 `==` 改成了 `>=`（能识别 aggressive 文件）。
 
 **#26615 FileStore merge 指标**（注意：这是**查询读路径**，不是 compaction 写路径）：
 
@@ -1094,7 +1110,7 @@ for p.hasFiles() {
 
 收益：
 
-- `gensyncmap.Map` 分片存储，`Range` 不需要全局写锁；`p.mu` 只保护 `running`，`add()` 不再被磁盘 I/O 阻塞。
+- `gensyncmap.Map` 是 `sync.Map` 的泛型薄封装（read/dirty 两份，并非分片），`Range` 不需要全局写锁；`p.mu` 只保护 `running`，`add()` 不再被磁盘 I/O 阻塞。
 - `hasFiles()` 在**同一把锁内**完成“检查是否为空 + 设置 running=false”，消除了 `add()` 与 goroutine 退出之间的丢唤醒竞争。
 - 失败条目不再永久重试（避免“每秒一条错误日志”），但代价是失败文件会留在磁盘上（见 §7）。
 
@@ -1300,7 +1316,7 @@ var AdjacentFileProperty = CompactionProperty{
 
 ### 6.1 端到端：旧 4 级 vs 新 5 级的选层与输出
 
-假设 shard 使用默认配置（L1 需要 8 个世代，L2/L3/L4 需要 4 个；`DefaultMaxPointsPerBlock=1000`；aggressive=10000；冷写 4h）。每个 cache snapshot 产生一个新 generation、`seq=1`。
+假设 shard 使用默认配置（L1 需要 8 个世代，L2/L3/L4 需要 4 个；`DefaultMaxPointsPerBlock=1000`；aggressive=10000；冷写 4h）。每个 cache snapshot 产生一个新 generation、`seq=1`。下文文件名中的 generation 省略前导 0（实际格式为 `%09d-%09d`）。
 
 **阶段 A：8 次 snapshot**
 
@@ -1408,7 +1424,7 @@ var AdjacentFileProperty = CompactionProperty{
 
 **#26911 修的是什么。** `d1d68d656d`（cherry-pick `a099cb75a8`，Fixes #26947）把 L4 段探测从“正向扫描、遇 `level<=3` 即停”改成“反向找最后一个 L4”，并删除“组内含低层就整组丢弃”的规则（旧 `v1.8.10:.../compact.go:489-498,551-556`；新 `v1.12.3:.../compact.go:567-575,632-647`）。它针对的是 **1.12 线的回归**：#26211 让 `PlanOptimize` 必须等 4h 冷写，热 shard 失去 v1.8.10 的 optimize 兜底，#26911 把嵌套处理搬进 `Plan`。上游用例（`TestEnginePlanCompactions`，`v1.12.3:tsdb/engine/tsm1/compact_test.go:3139`，随该提交加入）：`nested_4_5_2_4_5`、`nested_4_5_2_2_4_5`、`complex_nested_4_5_2_4_5_2_4`、`complex_nested_4_5_2_2_1_2_4_5`、`mixed_leading_nested_trailing_2_4_5_2_4_5_2`、`leading_low_*`、`trailing_low_*`、`original_problem_case_01_04_through_04_04_with_05_02`。它不是“v1.8.10 漏压 → v1.12.3 修好”。
 
-**可构造性说明。** 对 4–8 个世代的 level 组合穷举后找不到“v1.8.10 无计划、v1.12.3 靠 `Plan` 的 L4 组卷走低层文件”的初始态：旧版 `PlanOptimize` 的孤儿规则 + `len>=4` 会兜住，新版的“低层组提前升级”分支（`:371-381`）会先拿走短低层组。因此本节以 commit 与回归测试为证据，不再构造跨版本推演。
+**可构造性说明。** 我们未能在 4–8 个世代的 level 组合中构造出“v1.8.10 无计划、v1.12.3 靠 `Plan` 的 L4 组卷走低层文件”的初始态：旧版 `PlanOptimize` 的孤儿规则 + `len>=4` 会兜住，新版的“低层组提前升级”分支（`:371-381`）会先拿走短低层组。因此本节以 commit 与回归测试为证据，不再构造跨版本推演。
 
 **升级提示。** 热 shard 的节奏由 `PlanLevel` 提前升级 + `Plan` 的 4 世代窗口 + `start` 尺寸差共同决定，分组边界可能不同（上例新版少压 1 个）；冷写后 L5/full 收尾。
 
@@ -1428,8 +1444,10 @@ sequenceDiagram
     FS->>D: rename new .tsm.tmp → .tsm
     FS->>FS: NewTSMReader 打开新文件
     FS->>FS: 持写锁，遍历 updated
-    FS->>Q: 旧文件 InUse() == true
+    FS->>FS: file.InUse() == true
     FS->>D: old.tsm → old.tsm.tmp
+    FS->>D: 删除旧 .tombstone
+    FS->>D: SyncDir
     FS->>P: add([old.tsm.tmp])
     P->>P: gensyncmap.Store + purge()
     FS->>FS: f.files = active（原子替换）

@@ -88,7 +88,9 @@ flowchart TD
     REC --> LOG["logging"]
     LOG --> RID["requestID"]
     RID --> CORS["cors"]
-    CORS --> HDR["SetHeadersHandler"]
+    CORS --> OPT{"Method == OPTIONS?"}
+    OPT -->|"是"| OPTR["直接 return（仅 CORS 头，隐式 200；serveOptions 不可达）"]
+    OPT -->|"否"| HDR["SetHeadersHandler"]
     HDR --> GZ["gzipFilter（Gzipped=true 时）"]
     GZ --> RW["responseWriter"]
     RW --> TH{"Method==POST 且 Pattern 为 /write 或 /api/v1/prom/write?"}
@@ -129,7 +131,7 @@ flowchart LR
         N11 --> N12["TLSConfigManager.PrepareCertificateLoad"]
         N12 --> N13["TLSCertLoader.PrepareLoad（预校验）"]
         N13 --> N14["apply: SetCertificate（原子替换）"]
-        N14 --> N5
+        N14 --> N16["GetCertificate：下次握手读取新 cl.cert"]
         N3 --> N15["monitorCert：每小时巡检过期"]
     end
 ```
@@ -140,7 +142,7 @@ flowchart LR
 
 ### 3.1 路由表逐条对照
 
-旧版路由集中在 `NewHandler` 的两段 `AddRoutes` 调用中：基础路由
+旧版路由集中在 `NewHandler` 的三段 `AddRoutes` 调用中：基础路由
 `v1.8.10:services/httpd/handler.go:186-243`，pprof 条件路由 `:247-285`，
 Flux 路由 `:287-299`。新版对应 `v1.12.3:services/httpd/handler.go:193-318`、
 `:322-365`、`:367-381`。
@@ -166,7 +168,7 @@ Flux 路由 `:287-299`。新版对应 `v1.12.3:services/httpd/handler.go:193-318
 | POST | `/api/v1/prom/read` | ✅ `servePromRead` | ✅ | 协议类型换成 `prompb` |
 | GET/HEAD | `/ping` | ✅ `servePing` | ✅ | 不变 |
 | GET/HEAD | `/status` | ✅ `serveStatus`（已废弃） | ✅ | 不变 |
-| GET | `/health` | ✅ | ✅ | 路由 Name 由 `ping` 改为 `health`（影响访问日志 route 字段） |
+| GET | `/health` | ✅ | ✅ | 路由 Name 由 `ping` 改为 `health`（仅元数据；`logging`/`recovery` 的 `name` 形参未使用，不进入访问日志） |
 | OPTIONS | `/health` | ❌ | ✅ `serveOptions` | **新增**（`:310-313`） |
 | GET | `/metrics` | ✅ `promhttp` | ✅ | 不变 |
 | POST | `/api/v2/query` | ✅（FluxEnabled 决定 handler） | ✅ | 关闭分支改走认证；新增字节统计 |
@@ -177,7 +179,7 @@ Flux 路由 `:287-299`。新版对应 `v1.12.3:services/httpd/handler.go:193-318
 
 关键点：
 
-- 新增路由全部是**兼容面**，没有删除任何旧路由；因此 v1.8.10 的客户端脚本不需要改。
+- 新增路由全部是**兼容面**，没有删除任何旧路由；因此 v1.8.10 的客户端脚本不需要改。三条新增 OPTIONS 路由虽然注册了 `serveOptions`，但每条路由都被 `cors` 包裹，`cors` 在 `r.Method == "OPTIONS"` 时直接 `return`（`v1.12.3:services/httpd/handler.go:2966-2968`），所以实际响应只有 CORS 头。
 - `/api/v2/buckets*` 用 **pat** 风格参数 `:dbrp`，源码用
   `r.URL.Query().Get(":dbrp")` 读取（`v1.12.3:services/httpd/handler.go:1265-1277`、
   `:1280`、`:1313`、`:1390`），不是 Go 1.22 的 `r.PathValue`。
@@ -203,6 +205,7 @@ if r.Method == http.MethodPost {
     switch r.Pattern {
     case "/write", "/api/v1/prom/write":
         handler = h.writeThrottler.Handler(handler)
+    default:
     }
 }
 handler = h.responseWriter(handler)
@@ -313,8 +316,8 @@ return Config{ ... MaxBodySize: DefaultMaxBodySize, EnqueuedWriteTimeout: Defaul
 
 ### 3.5 用户维度查询字节（#27188）
 
-旧版只统计全局 `QueryRequestBytesTransmitted` 与
-`FluxQueryRequestBytesTransmitted`（后者还是 #25669 才加入），`Statistics` 结构中
+旧版只统计全局 `QueryRequestBytesTransmitted`
+（`FluxQueryRequestBytesTransmitted` 是 #25669 在本区间才加入的），`Statistics` 结构中
 没有任何按用户维度字段（`v1.8.10:services/httpd/handler.go:352-378`）。
 新版新增按用户维度：
 
@@ -715,7 +718,7 @@ CQ 服务为满足 `Monitor` 的诊断接口补了一个空实现
 修掉了 `SetGlobalTag` 与 `Statistics` 并发访问 map 的竞态。
 
 同一区间还修了 `/debug/vars` 的重复键：旧版同名 statistic 会产生重复 JSON key；新版用
-`uniqueKeys` 计数并追加 `:1`、`:2` 后缀（`userquerybytes`、`userquerybytes:1`…；`v1.12.3:services/httpd/handler.go:2501-2506`，`8843a01ebf`）。这与 §3.5 的 per-user
+`uniqueKeys` 计数并追加 `:1`、`:2` 后缀（`userquerybytes`、`userquerybytes:1`…；`v1.12.3:services/httpd/handler.go:2509-2514`，`8843a01ebf`）。这与 §3.5 的 per-user
 `userquerybytes` 直接相关。另外 `[httpd]` 的 `SHOW DIAGNOSTICS` 新增 `flux-enabled`、
 `https-insecure-certificate`（`v1.12.3:services/httpd/config.go:110-118`）。
 
@@ -869,9 +872,15 @@ if err := c.enqueueQuery(q); err != nil { ... }   // 队列满 → flux.Error{Co
 if q.limit+want > q.m.memoryBytesQuotaPerQuery {
     return 0, errors.New("query hit hard limit")
 }
-unused := q.m.getUnusedMemoryBytes()
-if unused < want { return 0, errors.New("not enough capacity") }
-... CAS 扣减 unusedMemoryBytes ...
+unused := int64(math.MaxInt64)              // total-max-memory-bytes=0 → unlimited
+if !q.m.unlimited {
+    unused = q.m.getUnusedMemoryBytes()
+    if unused < want { return 0, errors.New("not enough capacity") }
+}
+given := q.giveMemory(want, unused)         // 尽量多给，减少反复申请
+if !q.m.unlimited {                         // CAS 扣减同样只在非 unlimited 路径执行
+    if !q.m.trySetUnusedMemoryBytes(unused, unused-given) { /* 值变了，重试 */ }
+}
 ```
 
 ```go
@@ -906,7 +915,7 @@ func NewReader(s storage.Store) query.Reader {
 | `ReadFilter` | ✅ | ✅ | `v1.8.10:storage/reads/flux_reader.go:34` / `v1.12.3:storage/flux/reader.go:65` |
 | `ReadGroup` | ✅ | ✅ | `:44` / `:75` |
 | `ReadWindowAggregate` | ❌ | ✅ | `v1.12.3:storage/flux/reader.go:85-93` |
-| `windowAggregateIterator` | ❌ | ✅ | `v1.12.3:storage/flux/reader.go:609-843` |
+| `windowAggregateIterator` | ❌ | ✅ | `v1.12.3:storage/flux/reader.go:609-838` |
 | `ReadTagKeys/Values` | ✅ | ✅ | `:54`、`:74` / `:95`、`:106` |
 | `GroupCursorError`（类型冲突显式报错） | ❌ | ✅ | `v1.12.3:storage/flux/reader.go:23-47` |
 | 列存实现 | `arrow/array` | `flux/array`（`colReader`） | `v1.12.3:storage/flux/table.go:139-192` |
@@ -1064,7 +1073,7 @@ commit `6795ec6c01` 移除了 context-value 反模式。后果：`Statistics()` 
 
 **(b) `serveWriteV1` / `serveWriteV2` 精度错误补 `return`**：
 
-V1 与 V2 的 `default` 分支在旧版都缺 `return`（V1 `v1.8.10:services/httpd/handler.go:862-865`、V2 `:855-858`），新版两处都补上（V1 `:1656-1660`、V2 `:1636-1640`），同一 commit `997698f891` (#21746)。
+V1 与 V2 的 `default` 分支在旧版都缺 `return`（V1 `v1.8.10:services/httpd/handler.go:874-877`、V2 `:855-858`），新版两处都补上（V1 `:1656-1660`、V2 `:1636-1640`），同一 commit `997698f891` (#21746)。
 
 ```go
 // v1.8.10:services/httpd/handler.go:855-858
@@ -1364,8 +1373,7 @@ sequenceDiagram
     TM-->>H: apply
     H-->>S: apply
     S->>S: 全部服务验证通过
-    S->>H: apply()
-    H->>CL: SetCertificate(loadedCert)
+    S->>CL: apply()（闭包捕获 CL）→ SetCertificate(loadedCert)
     CL->>CL: 持锁替换 cert/leaf，checkCurrentCert 打过期告警
     Note over CL: 下一次 TLS 握手<br/>GetCertificate 返回新证书
 ```
@@ -1554,7 +1562,7 @@ sequenceDiagram
 | Flux 内存管理 | 无 | `query/control/memory.go:11-156` |
 | Flux 指标 | 无 | `query/control/metrics.go:6-95` |
 | Flux 读入口 | `storage/reads/flux_reader.go:30-94` | `storage/flux/reader.go:61-117` |
-| WindowAggregate 读 | 无 | `storage/flux/reader.go:85-93`、`:609-843` |
+| WindowAggregate 读 | 无 | `storage/flux/reader.go:85-93`、`:609-838` |
 | Flux 表实现 | `storage/reads/flux_table.go`、`flux_table.gen.go` | `storage/flux/table.go:17-240`、`table.gen.go` |
 | `Store.ReadFilter` | `services/storage/store.go:109-144` | `services/storage/store.go:126-174` |
 | `Store.ReadGroup` | `services/storage/store.go:147-188` | `services/storage/store.go:177-231` |
