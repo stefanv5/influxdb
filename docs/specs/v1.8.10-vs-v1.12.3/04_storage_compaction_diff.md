@@ -4,7 +4,7 @@
 > - OLD：`v1.8.10` = commit `688e697c51`（2021-10-11）
 > - NEW：`v1.12.3` = commit `f3d5cb68ab`（`docs/specs/` 这批文档的代码基准）
 > - 区间：527 commits，602 files，+79,310 / −45,239
-> - NEW 工作树只额外包含 4 个 docs 提交，代码与 `f3d5cb68ab` 相同。
+> - NEW 工作树只额外包含若干 docs 提交（数量随文档演进），代码与 `f3d5cb68ab` 相同。
 >
 > **范围**：`tsdb/engine/tsm1/` 的 `compact.go`、`scheduler.go`、`file_store.go`（含 `purger`）、`writer.go`、`reader.go`、`digest*.go`、`tombstone.go`、`compact.gen.go`，以及 `engine.go` 的 compaction / Open / Close 相关部分。
 >
@@ -43,7 +43,7 @@
 | 14 | 并发限流 | 单一 `compactionLimiter` | `compactionLimiter` + `optimizedCompactionLimiter`（默认 1） | L5 最坏只占 1 个槽，且必须同时拿到两个 | `v1.8.10:tsdb/engine/tsm1/engine.go:193` / `v1.12.3:tsdb/engine/tsm1/engine.go:214` |
 | 15 | optimize holdoff | 无 | 启动后 1h；每次尝试 L5 后 5m | 抑制 L5 频繁重规划 | `v1.12.3:tsdb/engine/tsm1/engine.go:2172` |
 | 16 | 文件名解析 | 每次规划对每个文件 `ParseFileName` | 打开/重命名时缓存 `generation`/`sequence` 到 `TSMReader` | 规划 CPU 降低；`findGenerations` 不再解析 | `v1.8.10:tsdb/engine/tsm1/compact.go:631` / `v1.12.3:tsdb/engine/tsm1/reader.go:450` |
-| 17 | 首 block 计数 | 规划时对文件做 `BlockCount(path,1)`（读盘/解码） | `FirstBlockCount` 缓存在 `ExtFileStat` | 规划 CPU 显著下降（#26432） | `v1.8.10:tsdb/engine/tsm1/compact.go:354` / `v1.12.3:tsdb/engine/tsm1/reader.go:635` |
+| 17 | 首 block 计数 | 规划时对文件做 `BlockCount(path,1)`（读盘/解码） | `FirstBlockCount` 缓存在 `ExtFileStat` | 机制上降低规划开销（未做基准；#26432） | `v1.8.10:tsdb/engine/tsm1/compact.go:354` / `v1.12.3:tsdb/engine/tsm1/reader.go:635` |
 | 18 | FileStore merge 指标 | 无 | 5 种类型 × merge 次数/值数/耗时/`over4` 计数 | 可观测查询期重叠块归并成本 | `v1.12.3:tsdb/engine/tsm1/file_store.go:163` |
 | 19 | purger | `map` + `RWMutex`，扫描期间持写锁，失败 `continue` 永久重试 | `gensyncmap` + 仅 `running` 加锁，失败也删除条目 | 降低替换路径阻塞与泄漏（#27146） | `v1.8.10:tsdb/engine/tsm1/file_store.go:1376` / `v1.12.3:tsdb/engine/tsm1/file_store.go:1599` |
 | 20 | TSM 文件格式 | magic `0x16D116D1`、version 1、28B 索引项、8B footer | **完全相同** | 旧 `.tsm`/`.tombstone` 可直接读 | `v1.8.10:tsdb/engine/tsm1/writer.go:81` / `v1.12.3:tsdb/engine/tsm1/writer.go:82` |
@@ -76,12 +76,14 @@ flowchart TB
         N3 --> N5["Plan compact.go:485<br/>反向找最后一个 L4（:567）"]
         N3 --> N6["PlanOptimize lastWrite compact.go:436"]
         N3 --> N7["IsGroupOptimized :2162 提升 L4→L5 engine.go:2376"]
-        N2 --> N8["Scheduler.nextByQueueDepths scheduler.go:36<br/>权重 0.4/0.3/0.2/0.1/0.01"]
+        N2 --> N2b["holdoff 未到期 → SetDepth(5,0)；否则 SetDepth(1..5)"]
+        N2b --> N8["Scheduler.nextByQueueDepths scheduler.go:36<br/>权重 0.4/0.3/0.2/0.1/0.01"]
         N8 --> N9["compactHiPriorityLevel / compactLoPriorityLevel / compactFull"]
         N8 --> N10["compactOptimize engine.go:2529<br/>compactionLimiter + optimizedCompactionLimiter"]
         N9 --> N11["Compactor.compact compact.go:961<br/>minSeqByGen + maxInputLevel"]
         N10 --> N11
         N11 --> N12["writeNewFiles → FileStore.replace file_store.go:896"]
+        N12 -. "Replace 半途失败：不回滚旧文件，新 .tsm 成孤儿、errorStat++" .-> N12b["sleep 1s → 下 tick 重试"]
         N12 --> N13["purger gensyncmap file_store.go:1599"]
     end
 
@@ -97,30 +99,55 @@ sequenceDiagram
     participant P as DefaultPlanner
     participant S as Scheduler
     participant L as limiters
+    participant G as compaction goroutine
     participant C as Compactor
+    participant FS as FileStore
 
     T->>E: tick
-    E->>E: os.Stat DoNotCompactFile
-    E->>E: PlanCompactions()
-    Note over E: planCompactionsInner：PlanLevel 1/2/3 → Plan → PlanOptimize → IsGroupOptimized
-    E->>E: l1..l5 PlannedCompactionGroup
-    E->>E: holdoff 内把 l5 depth 置 0
-    E->>S: SetDepth 1..5
-    E->>S: next()
-    S-->>E: level, runnable
-    alt level 5
-        E->>L: compactionLimiter.TryTake
-        E->>L: optimizedCompactionLimiter.TryTake
-        L-->>E: ok 或 ErrOptimizeCompactionLimited
-        E->>E: compactOptimize（ppb = aggressive 或默认 1000）
-        E->>C: s.Apply() → CompactFull
-        E->>E: startOptHoldoff 5m
-    else level 1-4
-        E->>L: compactionLimiter.TryTake
-        E->>E: compactHiPriorityLevel / compactLoPriorityLevel / compactFull
-        E->>C: s.Apply() → CompactFull / CompactFast
+    alt DoNotCompactFile 存在
+        E->>E: continue（跳过本 tick）
+    else
+        E->>E: PlanCompactions()
+        E->>P: PlanLevel(1..3) / Plan / PlanOptimize
+        Note over E: planCompactionsInner：PlanLevel 1/2/3 → Plan → PlanOptimize → IsGroupOptimized
+        E->>E: l1..l5 PlannedCompactionGroup
+        E->>E: holdoff 内把 l5 depth 置 0
+        E->>S: SetDepth 1..5
+        E->>S: next()
+        S-->>E: level, runnable
+        alt runnable=false（并发已满或无计划）
+            Note over E: 本 tick 不启动
+        else level 5
+            E->>E: compactOptimize（ppb = aggressive 或默认 1000）
+            E->>L: compactionLimiter.TryTake
+            alt 总 limiter 失败
+                L-->>E: ErrCompactionLimited
+            else
+                E->>L: optimizedCompactionLimiter.TryTake
+                alt optimize limiter 失败
+                    L-->>E: ErrOptimizeCompactionLimited
+                else
+                    E->>G: go s.Apply()（goroutine，内含 Release）
+                    G->>C: CompactFull
+                    G->>FS: Replace(group, files)
+                    G->>E: Release(s.group)
+                end
+            end
+            E->>E: startOptHoldoff 5m（成功/限流/失败都执行，与 goroutine 并行）
+        else level 1-4
+            E->>E: compactHiPriorityLevel / compactLoPriorityLevel / compactFull
+            E->>L: compactionLimiter.TryTake（在 compactXxx 内）
+            alt limiter 失败
+                L-->>E: false（本 tick 不启动）
+            else
+                E->>G: go s.Apply()（goroutine，内含 Release）
+                G->>C: CompactFull / CompactFast
+                G->>FS: Replace(group, files)
+                G->>E: Release(s.group)
+            end
+        end
+        E->>E: ReleaseCompactionPlans 未启动的计划
     end
-    E->>E: ReleaseCompactionPlans 未启动的计划
 ```
 
 ---
@@ -231,7 +258,7 @@ e.scheduler.setDepth(1, ...); ... e.scheduler.setDepth(4, len(level4Groups))
 
 - `PlanOptimize` 与 `Plan` **互斥**：只要 full 有活，optimize 本轮就不看。
 - optimize 与 full 共享 `level4Groups` 和队列深度 4。
-- 每 tick 只启动一个 compaction group（`switch level` 里只处理一个 case），另一个 tick 再继续。
+- 每 tick 只启动一个 compaction group（`switch level` 里只处理一个 case），另一个 tick 再继续；**两版相同**，新版见 `engine.go:2238-2284`。
 
 **新版**：
 
@@ -305,6 +332,11 @@ for i := 0; i < len(generations); i++ {
 	currentGen = tsmGenerations{}
 	currentGen = append(currentGen, cur)
 }
+
+// 循环后 flush 最后一组（v1.8.10:.../compact.go:276-278）
+if len(currentGen) > 0 {
+	groups = append(groups, currentGen)
+}
 ```
 
 ```go
@@ -373,7 +405,7 @@ func (c *DefaultPlanner) findGenerations(skipInUse bool) tsmGenerations {
 	}
 ```
 
-于是同一 `LastModified` 下，先由规划器以 `true` 调用、再由 `FullyCompacted()` 以 `false` 调用时，会拿到被过滤过的列表，可能误判“已完全压缩”。新版彻底删除该缓存（`v1.12.3:.../compact.go:699-724`），每次从 `FileStore.Stats()` 的缓存统计重建（统计本身由 `FileStore.Stats` 缓存，见 3.11）。
+于是同一 `LastModified` 下，先由规划器以 `true` 调用、再由 `FullyCompacted()` 以 `false` 调用时，会拿到被过滤过的列表，可能误判“已完全压缩”。新版彻底删除该缓存（`v1.12.3:.../compact.go:699-724`），每次从 `FileStore.Stats()` 的缓存统计重建（统计本身由 `FileStore.Stats` 缓存，见 §3.14）。
 
 ### 3.6 Plan（L4 / full）：反向扫描与不再丢弃低层组
 
@@ -628,6 +660,14 @@ func (e *Engine) isFileOptimized(f string) (bool, string) {
 - 旧版完全没有这个概念：`fullCompactionStrategy` 的 `optimize` 参数是死的，L4 文件永远是 1000 points/block。
 - 配置来自 `tsdb.Config.AggressivePointsPerBlock`（`v1.12.3:tsdb/config.go:135`，默认 `DefaultAggressiveMaxPointsPerBlock = 1000*10`，`v1.12.3:tsdb/config.go:57`），在 `NewEngine` 里注入 planner（`v1.12.3:tsdb/engine/tsm1/engine.go:256`）。
 
+L5 组最终的 points/block 有三个来源（`v1.12.3:tsdb/engine/tsm1/engine.go:2376-2428`）：
+
+| 来源 | points/block |
+|---|---|
+| `Plan` 的 L4 组被 `IsGroupOptimized` 提升 | aggressive |
+| `PlanOptimize` 且整个计划 `l5GenCount == 1` | aggressive |
+| 其余 `PlanOptimize` 组（逐组 `IsGroupOptimized`） | aggressive / 1000 |
+
 ### 3.9 `compact()`：`maxInputLevel` 防 level 回退（#27233，issue #27230）
 
 **旧版**：
@@ -698,7 +738,7 @@ if maxSequence+1 < maxInputLevel {
 
 关键点：
 
-- 用**每个 generation 的最小 sequence** 计算层级，而不是用“当前最大 generation 的 sequence”。因为一个 generation 可能因 2GB 上限被拆成 `seq=2,3` 两个文件：用 max 会把 L2 误算成 L3，用 min 才是真实层级（`TestCompactor_CompactFull_SplitFilesNoLevelInflation`，`v1.12.3:tsdb/engine/tsm1/compact_test.go:317-360`）。
+- 用**每个 generation 的最小 sequence** 计算层级，而不是用“当前最大 generation 的 sequence”。因为一个 generation 可能因 2GB 上限被拆成 `seq=2,3` 两个文件：用 max 会把 L2 误算成 L3，用 min 才是真实层级（该用例对 min/max 不可区分，见下方回归测试条）。
 - 只做“抬升”，不做“压低”：`maxSequence` 仍保留原值用于避免文件名冲突；只有当 `maxSequence+1` 低于输入最高层级时才抬到 `maxInputLevel-1`。
 - 抬升后输出 `sequence = maxInputLevel`，层级 `min(maxInputLevel,4)`，因此最高只到 L4（不会凭空造 L5）。
 - `max`/`min` 是 Go 1.21 内置函数；旧版 `go.mod` 是 `go 1.13`，新版是 `go 1.24.0`（`v1.12.3:go.mod:3`）。
@@ -706,7 +746,7 @@ if maxSequence+1 < maxInputLevel {
 官方回归测试（`v1.12.3:tsdb/engine/tsm1/compact_test.go`，来自 #27233）：
 
 - `TestCompactor_CompactFull_MixedLevelNoRegression`：输入 `1-4`、`2-5`（L4）与 `3-1`、`4-1`（L1），要求输出 `>= 4`；注释明确“Without the fix, maxSequence was scoped to the max generation (gen=4, seq=1), producing seq=2 (L2)”。
-- `TestCompactor_CompactFull_SplitFilesNoLevelInflation`：`1-2`、`1-3`（同一 L2 世代被 2GB 拆分）与 `8-2`，要求输出 `seq=3`（L3），不能被拆分裂出的 `seq=3` 抬成 L4。这正是“用 min 而不是 max”的动机。
+- `TestCompactor_CompactFull_SplitFilesNoLevelInflation`：`1-2`、`1-3`（同一 L2 世代被 2GB 拆分）与 `8-2`，要求输出 `seq=3`（L3）。它防的是“用全局最大 sequence（3）当输出基准”（会得到 `8-4`）；但对 min/max 不可区分：换成 max 后 `maxInputLevel=3`，`maxSequence+1=3`，仍输出 `seq=3`。
 
 ### 3.10 执行策略、双 limiter 与统计归属
 
@@ -815,7 +855,7 @@ for i := 0; i < end; i++ {
 
 - 旧版第 39 行把 `TSMFullCompactionsActive + TSMOptimizeCompactionsActive` 相加作为 `level4Running`；新版拆成 `level4Running` 与 `level5Running`。
 - **`end = 2` 的保护仍然是不可达死代码**：若 `level1Running+level2Running == maxConcurrency`，则总和已 `>= maxConcurrency`，第 43 行先返回 `false`。旧版同样如此（`v1.8.10:.../scheduler.go:53`）。也就是说“防止低优先级饿死高优先级”的意图从未生效。新版沿用了这段逻辑，风险仍在（见 §7）。
-- 权重 `0.01` 意味着：只要 L1–L4 任一队列非空且分数更高，L5 就不会被选中；L5 实际上只在 shard 空闲时运行，与 holdoff 的设计意图一致。
+- 权重 `0.01` 只影响加权分数，**没有 “shard 空闲” 门槛**：L5 通常在其他队列较浅/为空时才被选中，但 L5 积压很深时仍可能胜出（如 `depths=[1,0,0,0,41]` 时 L1=0.40、L5=0.41）。这与 holdoff 只是“降低 L5 被选中概率”的设计意图一致。
 - `Scheduler.SetDepth` 的越界检查 `level > len(s.queues)` 应为 `>=`，但调用方固定 1..5，不会触发（旧版同样）。
 
 ### 3.12 optimize holdoff：从无到 1h/5m，以及一个“值传递”bug
@@ -832,14 +872,14 @@ const optimizationHoldoff = 5 * time.Minute
 
 引入与修复历史：
 
-- #26432（`2a0353ffd2`）引入 `waitForOptimization = time.Hour`、`initialOptimizationHoldoff`、`optimizationHoldoff`，并把已经进行中的 `firstBlockCount` 缓存用于规划。
+- #26432（`2a0353ffd2`）把已存在的 `waitForOptimization` 改名并拆分为 `initialOptimizationHoldoff`，新增 `optimizationHoldoff = 5m`，并把已经进行中的 `firstBlockCount` 缓存用于规划。
 - #26488（`0fdb6adcb2`）修掉一个真实 bug：`StartOptHoldOff(holdOffDurationCheck time.Duration, optHoldoffStart time.Time, optHoldoffDuration time.Duration)` 以**值传递**接收两个时间变量，闭包里的赋值只改副本，`optHoldoffStart/optHoldoffDuration` 永远为零值，导致 holdoff 判定失效。修复方式是把闭包内联进 `compact()` 的局部变量（`v1.12.3:.../engine.go:2183-2190`）。
 - #26670（`95e86be3f4`）把 holdoff 完全移到 `Engine.compact`，删除 planner 的 `PT_SmartOptimize`/`PT_NoOptimize`。
 - #26945（`439604ecd9`）把“holdoff timer started”从 Info 降为 Debug，避免每 5 分钟刷日志。
 
 当前语义：
 
-- 进程启动/engine 启动后 **1 小时**内不调度 L5。
+- 每个 engine（shard）在 `compact()` goroutine 启动时开始计时，**1 小时**内不调度 L5；`do_not_compact` 的跳过分支不重置它（`engine.go:2206-2214`）。
 - 每次进入 `case 5`（无论成功、被限流还是报错）都重置为 **5 分钟**。
 - holdoff 期间 `SetDepth(5, 0)`，`Scheduler.next` 不会选 L5；但 `level5Groups` 仍然会走 `ReleaseCompactionPlans`，不会泄漏 in-use。
 
@@ -909,7 +949,7 @@ func (t *TSMReader) parseAndCacheFileName(path string) error {
 
 收益与代价：
 
-- 规划期从 O(文件数) 次字符串解析降为 0；解析只发生在打开/重命名时。
+- 规划期从 O(文件数) 次字符串解析降为 0；解析发生在打开（`reader.go:276`）、重命名（`:444`）和每次 `compact()` 起始（`compact.go:981-985`）。
 - 新 `findGenerations` **不再缓存**整个世代列表，每次 tick 重建（但依据 `FileStore.Stats()` 的缓存切片，`v1.12.3:.../file_store.go:858`），状态永远新鲜，配合 `isInUse` 使用是正确的。
 - 兼容性注意：自定义 `FormatFileNameFunc` 产生的名字必须能被 `ParseFileNameFunc` 解析出 `generation-sequence`，否则 `NewTSMReader`/`Rename` 现在会直接报错（旧版只在规划时用到解析结果，读取本身不受影响）。
 
@@ -967,7 +1007,7 @@ type ExtFileStat struct {
 }
 ```
 
-`FileStore.Stats()` 改为返回 `[]ExtFileStat` 并调用 `fd.ExtStats()`（`v1.12.3:.../reader.go:687`）；planner 的阈值判断改用 `FirstBlockCount >= tsdb.DefaultMaxPointsPerBlock`（`generationsFullyCompacted` 例外，用严格 `>`，`compact.go:280`，见 §7 第 7 条），不再触碰磁盘。语义上还从 `==` 改成了 `>=`（能识别 aggressive 文件）。
+`FileStore.Stats()` 改为返回 `[]ExtFileStat` 并调用 `fd.ExtStats()`（`v1.12.3:.../reader.go:687`）；planner 的阈值判断改用 `FirstBlockCount >= tsdb.DefaultMaxPointsPerBlock`（`generationsFullyCompacted` 例外，用严格 `>`，`compact.go:280`，见 §7 第 7 条），不再直接调用 `BlockCount`：首块点数在 `TSMReader` 内缓存，每个新 reader 首次 `Stats()` 时读一次盘（旧版仅 >2GB 世代），之后只读缓存。注意：`FileStore.Stats()` 缓存未命中时持**写锁**（`v1.12.3:.../file_store.go:868-888`）逐个调用 `ExtStats()`，而旧版 `BlockCount` 只持读锁（`v1.8.10:.../file_store.go:927-929`）；`findGenerations` 又持 planner 读锁调用 `Stats()`（`compact.go:699-724`）。因此 replace 后首个 `Stats()` 会在 `FileStore` 写锁内读盘，短暂阻塞查询 KeyCursor；批量替换后应避免同一 tick 对大量新 reader 同时求 Stats。语义上还从 `==` 改成了 `>=`（能识别 aggressive 文件）。
 
 **#26615 FileStore merge 指标**（注意：这是**查询读路径**，不是 compaction 写路径）：
 
@@ -984,7 +1024,7 @@ floatBlocksMergeOver4Count     = metrics.MustRegisterCounter("float_blocks_"+Tsm
 floatBlocksMergeValuesCount    = metrics.MustRegisterCounter("float_blocks_"+TsmGroupMergeValuesCountSuffix, metrics.WithGroup(tsmGroup))
 ```
 
-在 `KeyCursor.Read<Type>Block`（`file_store.gen.go`）里统计：`mergeCount`、`mergeValuesCount`、`start = time.Now()`，并在 `mergeCount > 4` 时递增 `..._over4_count`，注释说明“如果这个值很高，说明当前顺序归并是 O(n²)，可能值得换成树形归并”。`pkg/metrics.Timer` 也从 `int64 + atomic.Load/Store` 改为 `atomic.Int64` 并新增 `AddSince`。
+在 `KeyCursor.Read<Type>Block`（`file_store.gen.go`）里统计：`mergeCount`、`mergeValuesCount`、`start = time.Now()`，并在 `mergeCount > 4` 时递增 `..._over4_count`，注释说明“如果这个值很高，说明当前顺序归并是 O(n²)，可能值得换成树形归并”。这些指标通过 tracing span/`pkg/metrics.Timer` 记录，**不在 `/debug/vars` 暴露**（与 16 号文档一致）。`pkg/metrics.Timer` 也从 `int64 + atomic.Load/Store` 改为 `atomic.Int64` 并新增 `AddSince`。
 
 ### 3.15 文件替换与延迟清理：`replace` 与 purger
 
@@ -1114,6 +1154,8 @@ for p.hasFiles() {
 - `hasFiles()` 在**同一把锁内**完成“检查是否为空 + 设置 running=false”，消除了 `add()` 与 goroutine 退出之间的丢唤醒竞争。
 - 失败条目不再永久重试（避免“每秒一条错误日志”），但代价是失败文件会留在磁盘上（见 §7）。
 
+**替换失败的回滚（两版相同，均非原子）**：`Replace` 先把新文件从 `.tsm.tmp` rename 为 `.tsm`（`file_store.go:924`），再在写锁内逐个处理旧文件：in-use 的 rename 为 `.tsm.tmp`，否则 `Close`+`Remove`（`:1016`、`:1033`、`:1037`）。任一步返回错误即直接返回，**已关闭/删除/改名的旧文件不会回滚**，`SyncDir`/`purger.add(inuse)`/`f.files = active`（`:1049`、`:1054`、`:1066`）均未执行，`f.files` 仍是旧列表。`compactGroup` 失败分支只按传入的 `.tsm.tmp` 路径 `os.Remove`（`engine.go:2641-2652`；旧 `:2321-2330`），但文件已被 rename 成 `.tsm`，删除失败仅打日志。结果是：孤儿 `.tsm` 不在 `f.files` 中，`f.files` 可能仍指向已 `Close/Remove` 的 reader（`ReadBytes` 返回 `ErrTSMClosed`，`reader.go:1653-1656`），filter 路径再折叠为“无数据”（03 §7.2），进程内可能静默少数据，直到重启重扫目录。并非“旧文件继续服务 + 新文件被清理”；详见主 04 §5.4、§7.1/§7.2 与主 16 §2.6。
+
 ### 3.16 写出路径：错误处理与临时文件清理
 
 **旧版 `writeNewFiles`**：
@@ -1169,7 +1211,7 @@ if rollToNext {
 差异：
 
 1. `write` 的返回值从 `error` 变成 `(rollToNext bool, err error)`（`v1.12.3:.../compact.go:1198`），是否轮转不再依赖哨兵错误比较。
-2. 全部改用 `errors.Is` / `errors.As`；`errCompactionInProgress` 新增 `Is` 方法（`v1.12.3:.../compact.go:72`），嵌套错误也能识别。
+2. `writeNewFiles`/`write` 改用 `errors.Is` / `errors.As`；`errCompactionInProgress` 新增 `Is` 方法（`v1.12.3:.../compact.go:72`），故 Joined 的哨兵错误在这些调用点能被识别。注意 `compactGroup` 仍用类型断言 `err.(errCompactionInProgress)`（`engine.go:2622`/`:2626`），经 `RemoveTmpFilesOnErr`/`errors.Join` 包装后的 in-progress 错误不会命中 “Aborted compaction” 分支。
 3. 清理集中到 `RemoveTmpFiles` / `RemoveTmpFilesOnErr`（`v1.12.3:.../compact.go:1116/1126`），把所有清理错误与原始错误 `errors.Join` 后返回，不再“清理失败就把原始错误吞掉”。
 4. `write()` 的 defer 也改为 `errors.Join(err, closeErr, removeErr)`，并在 `rollToNext`/`inProgress` 时保留文件（`v1.12.3:.../compact.go:1233-1251`）。
 5. 新增每 `logEvery = 2 * DefaultSegmentSize` 的进度 Debug 日志（`v1.12.3:.../compact.go:36,1292`）。
@@ -1194,8 +1236,8 @@ if rollToNext {
 | 索引计数/类型 | `indexCountSize=2`、`indexTypeSize=1`（`writer.go:90,93`） | 同（`writer.go:91,94`） | 未变 |
 | 单 key 索引上限 | `maxIndexEntries=(1<<16)-1`（`writer.go:96`） | 同（`writer.go:97`） | 未变 |
 | 四段布局 | header(5B)/blocks/index/footer(8B offset) | 同 | 未变 |
-| `IndexEntry` 编解码 | 固定 28B | 逐字节相同（`reader.go:1738-1816` vs 旧 `reader.go:1562-1637`） | 未变 |
-| mmap 初始化 | 读 footer 8B → `indexStart` → `UnmarshalBinary`（旧 `reader.go:1352-1361`） | 同（新 `reader.go:1528-1537`），仅多一次 `Seek(0,0)` 与 `MmapError` 包装 | 未变 |
+| `IndexEntry` 编解码 | 28B 固定布局（`writer.go:179-219`）；`indexEntries` 拼装/解析（`reader.go:1562-1637`） | 同（`writer.go:180-220`）；`indexEntries`（`reader.go:1738-1816`） | 未变 |
+| mmap 初始化 | 读 footer 8B → `indexStart` → `UnmarshalBinary`（旧 `reader.go:1352-1361`） | 同（新 `reader.go:1528-1537`），`verifyVersion` 改为 `io.Reader`，由 `init()` 负责两次 `Seek(0,0)`；总 seek 次数不变，另加 `MmapError` 包装；`FileStore.Open` 据此区分 mmap 限制与普通损坏（§5.1） | 格式未变 |
 | `verifyVersion` | `writer.go:802` | 搬到 `reader.go:1442`（逻辑相同） | 位置变，行为不变 |
 | KeyCursor | 结构、`seek`、`nextAscending/nextDescending`、`locations` | 同（只在 `Read*Block` 里加指标） | 未变 |
 | Tombstone 文件 | `<tsm>.tombstone`，v3 gzip / v4 增量（`tombstone.go:272/303`） | 同（`tombstone.go:271/302`），仅 `ioutil.TempFile` → `os.CreateTemp` | 未变 |
@@ -1261,7 +1303,8 @@ var AdjacentFileProperty = CompactionProperty{
 
 - 旧 `.tsm`、`.tombstone`、digest 文件**可直接读**，无需 `influx_inspect` 转换（§3.17）。
 - 新版本写出的文件仍是 version 1、28B 索引项，旧版本也能读——**支持原地回滚**。
-- `.tsm.tmp` 启动清理、`.bad` 重命名、`.tombstone` 旁车文件语义均未变。
+- `.tsm.tmp` 启动清理与 `.tombstone` 旁车文件语义未变。
+- `.bad` 重命名的**触发条件变了**：v1.8.10 对任何打开失败一律 rename；v1.12.3 先用 `errors.Is(err, MmapError{})` 区分——mmap 系统限制（`vm.max_map_count` 过低或句柄不足）**不 rename**，保留原文件并返回提示，只有普通损坏才 rename 成 `.bad`（`v1.12.3:tsdb/engine/tsm1/file_store.go:649-668`；`v1.8.10:tsdb/engine/tsm1/file_store.go:549-561`）。排障时若日志出现 “system limit for vm.max_map_count may be too low”，应调高内核参数后重启，而不是去找 `.bad` 文件。
 
 ### 5.2 配置变化
 
@@ -1285,8 +1328,8 @@ var AdjacentFileProperty = CompactionProperty{
 
 ### 5.4 语义变化：升级后会发生什么
 
-- **L5 第一次运行最早在进程启动 1 小时后**；之后每次 L5 尝试后至少间隔 5 分钟。
-- **optimize 只对冷 shard 生效**（默认 `since(lastWrite) >= 4h`）。默认配置下热 shard 不会做 L5，即使有很多 L4 文件；这与旧版“`Plan` 为空就 optimize”不同。把 `compact-full-write-cold-duration` 调小会让 L5 更频繁（并放大 §7 第 6 条的重复重写风险）。
+- **L5 第一次运行最早在该 engine（shard）启动 1 小时后**（每个 shard 的 compact goroutine 各自计时）；之后每次 L5 尝试后至少间隔 5 分钟。
+- **`PlanOptimize` 只对冷 shard 生效**（默认 `since(lastWrite) >= 4h`），但 **L5 并非只服务冷 shard**：`planCompactionsInner` 会把含已优化文件的 L4 组直接提升为 L5 aggressive（`IsGroupOptimized`，`v1.12.3:tsdb/engine/tsm1/engine.go:2373-2395`），即使 shard 是热的。因此热 shard 也可能做 L5，只是入口是 L4 提升而不是 `PlanOptimize`；把 `compact-full-write-cold-duration` 调小只会增加 `PlanOptimize` 那条冷写入口（并放大 §7 第 6 条的重复重写风险）。
 - **单世代多文件会被重写一次**：旧版认为“1 个世代且无 tombstone = 完全压缩”，新版在“≥2 个文件、≥2 个文件小于 2GB、并非全部 aggressive”时会做一次 L5，把块大小抬到 10000。升级后首次空闲期可能看到一次额外的磁盘写入与短暂的磁盘占用上升（新文件写完、旧文件删除前）。
 - **`Engine.IsIdle` 更严格**：单世代多文件且未 aggressive 时不再算 idle，`influxd` 的 “shard idle” 判断与相关日志会变化。
 - **L4 段与 full 分支的边界变化**：非 full 的 L4 窗口不再丢弃含低层文件的组，也不再被夹心层截断；冷 shard 的 full 分支新增 `isInUse` 跳过与首块缓存判定。热 shard 上两版的分组边界可能不同（见 §6.4）。
@@ -1297,8 +1340,8 @@ var AdjacentFileProperty = CompactionProperty{
 | 资源 | 预期变化 | 原因 |
 |---|---|---|
 | 磁盘占用 | 升级后短期内可能**先升后降** | L5 重写产生新文件；旧文件在 `replace` 后被删除（被查询占用的延迟到 purger）。长期看 #26670 修复 1.12.1 引入的 in-use 泄漏、#26911 修复 1.12 线热 shard 的嵌套低层调度（相对 1.12.0–1.12.2；v1.8.10 由 `PlanOptimize` 兜底，跨版本改善有限） |
-| 磁盘写放大 | 冷 shard 上略增 | 多了一次 L5 aggressive 重写；但只发生一次（之后 `generationsFullyCompacted` 返回 true） |
-| CPU（规划） | 明显下降 | `FirstBlockCount` 缓存 + generation/sequence 缓存（#26432/#26905） |
+| 磁盘写放大 | 冷 shard 上略增 | 多了一次 L5 aggressive 重写；在首 block 达到 aggressive 阈值的前提下只发生一次（之后 `generationsFullyCompacted` 返回 true），否则见 §7 第 6 条 |
+| CPU（规划） | 机制上降低规划开销（未做基准） | `FirstBlockCount` 缓存 + generation/sequence 缓存（#26432/#26905）；代价是 replace 后首次 `Stats()` 在 FileStore 写锁内读首块（旧版读锁），短暂阻塞查询 KeyCursor（§3.14） |
 | CPU（压缩） | 冷 shard 上短时上升 | L5 会解码/重编码整组文件（`fast=false`） |
 | 查询延迟 | 长期改善 | block 更大（10000 点）→ 索引更小、块更少；但**正在进行的 L5** 会与查询争抢 I/O 与 page cache |
 | 写延迟 | 基本不变 | compaction 不阻塞写入；snapshot 路径未变（仅多 logger 参数与 `errors.Join`） |
@@ -1408,7 +1451,7 @@ var AdjacentFileProperty = CompactionProperty{
 | 输出 level | — | `min(7,4)=4`（文件名仍是 L4；“已优化”由 `FirstBlockCount>=10000` 表达，而不是靠 sequence） |
 | 下一轮 | 永远不再变化 | 若首 block 足够满：`generationsFullyCompacted` 中所有文件 `FirstBlockCount > 1000` → true → L5 停止，幂等（首 block 偏小的边界见 §7 第 5、6 条） |
 
-要点：**level 仍然只由 sequence 决定，L5 不会写出 `seq=5` 的文件**；“L5 是 optimize”是调度层的概念，不是文件命名层的概念。判断一个文件是否“已优化”用的是首 block 点数，不是文件名。
+要点：**level 仍然只由 sequence 决定，L5 不引入独立的第 5 级编号**；输出 sequence 仍由输入的 `maxSequence+1` 决定（本例为 7），层级恒按 `min(seq,4)` 视为 L4；“L5 是 optimize”是调度层的概念，不是文件命名层的概念。判断一个文件是否“已优化”用的是首 block 点数，不是文件名。
 
 ---
 
@@ -1447,13 +1490,15 @@ sequenceDiagram
     FS->>FS: file.InUse() == true
     FS->>D: old.tsm → old.tsm.tmp
     FS->>D: 删除旧 .tombstone
-    FS->>D: SyncDir
-    FS->>P: add([old.tsm.tmp])
-    P->>P: gensyncmap.Store + purge()
-    FS->>FS: f.files = active（原子替换）
-    Q-->>FS: 查询结束 Unref
+    FS->>FS: 收集到 inuse 切片
+    FS->>D: SyncDir（循环结束后）
+    FS->>P: add(inuse) — 整批
+    P->>P: gensyncmap.Store + purge()（若未运行则起 goroutine）
+    FS->>FS: lastModified / lastFileStats=nil / f.files=active / FileCount / DiskBytes
+    Q->>Q: 查询结束 Unref TSMFile（refs→0）
     loop 每秒 hasFiles
-        P->>D: InUse()==false → Close + Remove
+        P->>P: 下次轮询发现 InUse()==false
+        P->>D: Close + Remove
         P->>P: files.Delete
     end
     P->>P: hasFiles()==false → running=false 退出
@@ -1530,7 +1575,7 @@ sequenceDiagram
 | Tombstone 写入 | `tsdb/engine/tsm1/tombstone.go:272,303` | `tsdb/engine/tsm1/tombstone.go:271,302` | 未变 |
 | Digest | `tsdb/engine/tsm1/digest.go:25` | `tsdb/engine/tsm1/digest.go:25` | 仅错误处理 |
 | 删除 `tsmKeyIterator` | `tsdb/engine/tsm1/compact.gen.go`（两份生成代码） | 只剩 `tsmBatchKeyIterator` | `9e9f1be574` #23888 |
-| 空索引工具修复 | 旧条件 `!(blockWritten \|\| ErrNoValues)` | `cmd/influx_inspect/deletetsm/deletetsm.go:147` | `52cd83dc6f` #27123 |
+| 空索引工具修复 | 无 `blockWritten`，`WriteIndex` 错误直接返回（`cmd/influx_inspect/deletetsm/deletetsm.go:135`） | `!(errors.Is(err, ErrNoValues) && !blockWritten)`（`:147`）；#27123 前为 `!(blockWritten \|\| ErrNoValues)` | `52cd83dc6f` #27123 |
 | property 测试 | 无 | `tsdb/engine/tsm1/compact_property_test.go:18-143` | `ba2c2b6432` #26783、`7f56ad35ac` #26816 |
 | 冷写时长 | `tsdb/config.go:38` | `tsdb/config.go:38` | 未变 |
 | aggressive ppb | 无 | `tsdb/config.go:55-57,135` | `f04105bede` #25594 |
@@ -1546,8 +1591,8 @@ sequenceDiagram
 3. **调整看板/告警**：`tsmOptimizeCompactions*` 会从 0 变为真实值；`tsmOptimizeCompactionQueue`（单数）不再代表 L4。
 4. **按需设置 `aggressive-points-per-block`**：默认 10000。若查询对 point-per-block 敏感（例如大量按时间点精确查找），先在测试环境验证；不要设置为 ≤1000，否则会与 `generationsFullyCompacted` 的判定冲突。
 5. **按需设置 `max-concurrent-optimized-compactions`**：默认 1。提高会增加 L5 与查询/写入争抢 I/O 的概率。
-6. **不要删除 `do_not_compact` 文件后立刻观察 L5**：holdoff 1h 会延迟首次 optimize；这是预期行为。
-7. **回滚安全**：文件格式未变，可直接回滚；但 L5 产生的 10000 points/block 文件不会被旧版自动拆回 1000。
+6. **不要删除 `do_not_compact` 文件后立刻观察 L5**：holdoff 1h 是 engine（shard）启动时开始计时的；若 shard 已运行超过 1h，删除后 L5 可立即调度，不必再等 1h。
+7. **回滚安全**：文件格式未变，可直接回滚；但 L5 产生的 10000 points/block 文件不会被旧版自动拆回 1000（除非旧版之后再做一次 full/L4 compaction 按 1000 ppb 重写；仅靠 `PlanOptimize` 不会主动碰它）。
 8. **监控 `disk bytes` 与 `numFiles`**：升级后若 `numFiles` 持续增长而 `tsmFullCompactions` 不增长，检查是否有 in-use 泄漏（理论上 #26670 已修复），以及 `purger` 是否留下 `.tsm.tmp`。
 
 ---

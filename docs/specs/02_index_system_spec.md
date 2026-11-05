@@ -39,17 +39,17 @@ sequenceDiagram
 
     Index->>Partition: 分区路由 (hash(key) & (PartitionN-1))
     Partition->>LogFile: AddSeriesList(seriesSet, names, tagsSlice, tracker)
-    alt 已存在
-        LogFile-->>Partition: seriesIDs[i]=0（已存在，不重复写 WAL）
-    else 不存在
-        LogFile->>SeriesFile: CreateSeriesListIfNotExists(..., tracker)
-        SeriesFile->>SeriesPartition: 分区路由 (hash(key) % 8)
-        SeriesPartition->>SeriesPartition: 写入 SSEG segment
-        SeriesPartition->>SeriesPartition: 更新 SeriesIndex (RHH)
-        SeriesPartition-->>SeriesFile: 返回新 seriesID
+    LogFile->>SeriesFile: CreateSeriesListIfNotExists(..., tracker)（无条件 fan-out）
+    SeriesFile->>SeriesPartition: 分区路由 (hash(key) % 8)
+    SeriesPartition->>SeriesPartition: 写入 SSEG segment
+    SeriesPartition->>SeriesPartition: 更新 SeriesIndex (RHH)
+    SeriesPartition-->>SeriesFile: 返回新 seriesID
+    alt 全部已存在（writeRequired=false）
+        LogFile-->>Partition: 直接返回，不写 WAL
+    else 存在新 series
+        LogFile->>LogFile: appendEntry → execEntry → seriesSet.AddNoLock
+        LogFile->>LogFile: FlushAndSync()（flush + fsync）
     end
-    Partition->>LogFile: appendLogEntry(seriesID, name, tags)
-    LogFile->>LogFile: 更新内存索引 (mms)
     Partition-->>Shard: 返回 seriesIDs
 ```
 
@@ -305,7 +305,7 @@ func (p *Partition) createSeriesListIfNotExists(names [][]byte, tagsSlice []mode
 
 **加锁说明**: `AddSeriesList` 同时持有 `f.mu.Lock()`（LogFile 写锁）和 `seriesSet.Lock()`（SeriesIDSet 写锁），在写锁下 double-check 避免重复写入，然后追加 entry、更新内存索引、并将新 series ID 注册到 SeriesIDSet
 
-**统计说明**: `tracker tsdb.StatsTracker` 不是可省略的装饰参数。它从 `Shard.WritePoints` 一直传到 `SeriesPartition.CreateSeriesListIfNotExists`，用于记录新增 series / measurement-series 统计；测试中通常传 `tsdb.NoopStatsTracker()`。
+**统计说明**: `tracker tsdb.StatsTracker` 不是可省略的装饰参数。它从 `Shard.WritePoints` 一直传到 `SeriesPartition.CreateSeriesListIfNotExists`，用于记录新增 series / measurement-series 统计；测试中通常传 `tsdb.NoopStatsTracker()`。**并发合同**：回调可能被多个 shard goroutine、TSI `availableThreads` fan-out 和 SeriesFile 的 8 个分区 goroutine 并发调用，实现必须并发安全；`Store` 的实现使用 `atomic.AddInt64`。
 
 #### 步骤 5: SeriesFile.CreateSeriesListIfNotExists — 8 分区 SeriesFile
 
@@ -791,8 +791,9 @@ sequenceDiagram
 
     Index->>Partition: DropSeries(seriesID, key, cascade)
     Partition->>LogFile: DeleteSeriesID(id)（p.mu.RLock 保护）
-    LogFile->>LogFile: appendEntry(Flag=0x01) + FlushAndSync
+    LogFile->>LogFile: appendEntry(Flag=0x01)（只进 bufio）
     LogFile->>MMs: execEntry → execSeriesEntry(deleted=true)
+    LogFile->>LogFile: FlushAndSync()（flush + fsync）
     Note over MMs: mm.removeSeriesID(id)<br/>每个 tag value：tv.removeSeriesID(id)<br/>f.seriesIDSet.Remove / f.tombstoneSeriesIDSet.Add
     Partition->>PSet: Remove(id)
     Partition->>Partition: CheckLogFile()（必要时轮转并触发 L0 压缩）
@@ -812,8 +813,8 @@ sequenceDiagram
 2. **Partition 层**（`partition.go:751-765`）：持 `p.mu.RLock()` 调 `p.activeLogFile.DeleteSeriesID(id)`；
    成功后 `p.seriesIDSet.Remove(id)`，最后 `CheckLogFile()` 检查 WAL 是否需要轮转/压缩。
 3. **LogFile 层**（`log_file.go:578-590`）：`DeleteSeriesID` 持 `f.mu.Lock()`，构造
-   `LogEntry{Flag: LogEntrySeriesTombstoneFlag, SeriesID: id}` → `appendEntry` → `execEntry` →
-   `FlushAndSync()`。**WAL 先落盘、内存索引后更新**。
+   `LogEntry{Flag: LogEntrySeriesTombstoneFlag, SeriesID: id}` → `appendEntry`（只进 bufio）→ `execEntry` →
+   `FlushAndSync()`。**WAL 缓冲先追加、内存索引先更新、最后统一 flush+fsync**。
 4. **内存索引**（`execSeriesEntry`，`log_file.go:692-762`）：`deleted=true` 分支会
    `mm.removeSeriesID(id)`、逐个 tag value `tv.removeSeriesID(id)`，并对称更新
    `f.seriesIDSet.Remove` / `f.tombstoneSeriesIDSet.Add`。注意 `mm.deleted = false` 在删除时也会执行
@@ -864,7 +865,7 @@ func (p *SeriesPartition) DeleteSeriesID(id uint64, flush bool) error {
 
 | 阶段 | 操作 | 源码 |
 |------|------|------|
-| 启动/压缩后重建 | 从最新文件到最旧：先 `Diff(TombstoneSeriesIDSet)` 再 `Merge(SeriesIDSet)` | `partition.go:324-349` |
+| 启动/压缩后重建 | 从最旧文件到最新（`files[len-1] → 0`）：先 `Diff(TombstoneSeriesIDSet)` 再 `Merge(SeriesIDSet)` | `partition.go:324-349` |
 | 新建 series | `LogFile.AddSeriesList` 写 entry 后 `seriesSet.AddNoLock(id)` | `log_file.go:551-565` |
 | 删除 series | `Partition.DropSeries` 中 `p.seriesIDSet.Remove(id)` | `partition.go:762` |
 | 多分区汇总 | `Index.SeriesIDSet()` 把所有分区的集合 `Merge` 到一起 | `index.go:244-251` |
@@ -875,9 +876,9 @@ func (p *SeriesPartition) DeleteSeriesID(id uint64, flush bool) error {
 1. `IndexSet.MeasurementSeriesByExprIterator` 的两条路径都会在出口包
    `FilterUndeletedSeriesIDIterator(is.SeriesFile, itr)`（`tsdb/index.go:2298-2331`）；过滤器对每个 id 调
    `SeriesFile.IsDeleted(id)`（`tsdb/index.go:410-432`）。
-2. tag 值路径 `FileSet.TagValueSeriesIDIterator` 从**最新文件向最旧文件**遍历：每轮先用更新文件的
-   `TombstoneSeriesIDSet` 对累计结果 `AndNot`，再 `Merge` 当前文件的 tag value 集合
-   （`tsdb/index/tsi1/file_set.go:341-371`）。
+2. tag 值路径 `FileSet.TagValueSeriesIDIterator` 从**最旧文件向最新文件**遍历（`files[len-1] → 0`）：
+   每轮先用上一轮（更旧）文件的 `TombstoneSeriesIDSet` 对累计结果 `AndNot`，再 `Merge` 当前（较新）文件的
+   tag value 集合（`tsdb/index/tsi1/file_set.go:341-371`）。
 
 #### 1.3.5 必背案例：删除 id=5
 
@@ -1300,8 +1301,8 @@ func (fs *FileSet) MeasurementSeriesIDIterator(name []byte) SeriesIDIterator {
 > 3. 过滤 host='web'（FileSet.TagValueSeriesIDIterator，file_set.go:341-371）:
 >    - LogFile 中 host=web 的 series: {1, 3, 5}
 >    - IndexFile L1 中 host=web 的 series: {1, 3, 5}
->    - 不是"求交集"，而是从最新文件向最旧文件逐文件 Merge；
->      遇到更新的文件的 tombstone 集时先 AndNot 掉这些 id
+>    - 不是"求交集"，而是从最旧文件向最新文件逐文件 Merge；
+>      遇到上一（更旧）文件的 tombstone 集时先 AndNot 掉这些 id
 >
 > 4. 排除已删除的 series（不是本地的 SeriesIDSet.Tombstone，而是 SeriesFile 层）:
 >    - FilterUndeletedSeriesIDIterator 用 SeriesFile.IsDeleted(id) 过滤（tsdb/index.go:410-432）
@@ -1428,8 +1429,9 @@ sequenceDiagram
     alt 文件不存在
         Partition->>Manifest: NewManifest()（复制 DefaultCompactionLevels）
     else 读取/解析失败
-        Partition-->>Index: 返回 error
+        Partition-->>Index: 返回 error（终止，不执行 Validate/NewFileSet）
     end
+    Note over Partition,Manifest: 以下仅在 ReadManifestFile/Validate 成功时执行
     Partition->>Manifest: m.Validate()（Version != Version → ErrIncompatibleVersion）
     Partition->>Partition: p.levels = copy(m.Levels)，levelCompacting = make([]bool, len(m.Levels))
     loop 按 m.Files 顺序
@@ -1459,7 +1461,7 @@ sequenceDiagram
 5. **收尾**：`p.fileSet = NewFileSet(files)`、`p.seq = p.fileSet.MaxID()`；
    `deleteNonManifestFiles(m)` 尝试删除不在清单中的孤儿文件，但 `os.RemoveAll(filename)` 用的是相对 CWD 的 base name，路径不存在时静默返回 nil，孤儿文件实际留在分区目录（`partition.go:297-322`，`:316`）；
    没有 active log 则 `prependActiveLogFile()`（`partition.go:528`）。
-6. **重建内存集合**：`buildSeriesSet()` 从最新文件到最旧文件做 `Diff(TombstoneSeriesIDSet)` +
+6. **重建内存集合**：`buildSeriesSet()` 从最旧文件到最新（`files[len-1] → 0`）做 `Diff(TombstoneSeriesIDSet)` +
    `Merge(SeriesIDSet)`（`partition.go:324-349`）；随后 `p.opened = true`，
    `go p.runPeriodicCompaction()`——**启动立即压缩一次**，之后每小时 `NeedsCompaction(true)` 巡检
    （`partition.go:979-1001`）。

@@ -38,8 +38,8 @@
 
 ```bash
 git show -s --format=%H v1.8.10
-# 688e697c51fd5353725da078555adbeff0363d01
-# （v1.8.10 是 annotated tag，git rev-parse 会输出 tag 对象；等价写法 git rev-parse 'v1.8.10^{}'）
+# 输出含 tag 对象头（tag / Tagger），最后一行才是 commit hash：
+# 688e697c51fd5353725da078555adbeff0363d01（等价写法：git rev-parse 'v1.8.10^{}' 或 git log -1 --format=%H v1.8.10）
 
 git rev-parse v1.12.3
 # f3d5cb68ab25a07d89f76d8c18e52c362cc37bfb
@@ -96,16 +96,22 @@ git diff --shortstat v1.8.10 f3d5cb68ab
 ```mermaid
 flowchart TB
     subgraph W["① 写入链路"]
-        W1["HTTP /write"] --> W2["PointsWriter<br/>WriteContext + StatsTracker<br/>RP WriteWindow"]
-        W2 --> W3["Shard.validateSeriesAndFields<br/>time 字段 -> PartialWriteError"]
-        W3 --> W4["Engine.WritePoints<br/>Cache + WAL"]
+        W1["HTTP /write"] --> W2["PointsWriter<br/>WriteContext（RP WriteWindow）"]
+        W2 --> STK["Store.WriteToShard<br/>WriteContext + statsTracker(db,rp,login)"]
+        STK --> SH["Shard.WritePoints<br/>shard.go:562"]
+        SH --> W3["validateSeriesAndFields<br/>time 字段 -> PartialWriteError"]
+        SH --> CF["saveFieldsAndMeasurements<br/>-> fields.idxl"]
+        SH --> W4["Engine.WritePoints<br/>Cache + WAL"]
+        W2 -.-> WD["dropped / PartialWriteError<br/>（RP 窗口 / 空 shard group）"]
+        W2 -.-> SUB["Subscriber.Send（旁路）"]
+        W2 -.-> CR["ErrShardNotFound -> CreateShard -> 重试"]
         W4 -.-> W5["TSM snapshot<br/>（后台 compactCache tick 触发）"]
     end
 
     subgraph I["② 索引 / Series"]
         I1["SeriesFile<br/>建/删 series<br/>DeleteSeriesID(flush)"]
         I2["TSI LogFile / IndexFile<br/>MANIFEST 原子写<br/>TagValueIterator 缩短锁"]
-        I3["TagValueSeriesIDCache<br/>字符串只转换一次"]
+        I3["TagValueSeriesIDCache<br/>Put 复用一次转换（Get 仍 3 次）"]
     end
 
     subgraph Q["③ 查询引擎"]
@@ -117,9 +123,10 @@ flowchart TB
     subgraph S["④ 存储 / Compaction"]
         S1["Scheduler<br/>4 队列 -> 5 队列<br/>（Engine.compact 设 depth<br/>并管 1h/5m holdoff）"]
         S2["PlanCompactions<br/>L1 到 L5"]
-        S3["compactOptimize<br/>optimizedCompactionLimiter<br/>aggressive points-per-block"]
-        S4["compact 函数<br/>minSeqByGen 防 level 回退"]
+        S3["compactOptimize<br/>optimizedCompactionLimiter<br/>aggressive ppb（单世代/已优化组）"]
+        S4["compactGroup 执行<br/>CompactFull/Fast（minSeqByGen 防回退）"]
         S5["FileStore<br/>TSM 文件名缓存<br/>purger 并发 map<br/>（TSMReader first-block 缓存）"]
+        RCP["ReleaseCompactionPlans<br/>（tick 末释放未用计划）"]
     end
 
     subgraph M["⑤ 元数据 / 后台"]
@@ -133,12 +140,14 @@ flowchart TB
         H2["/query<br/>time_format<br/>CSV 不转义 tag"]
         H3["/debug/vars<br/>config / cq / compact-throughput"]
         H4["/api/v2/delete + buckets"]
+        HF["serveFluxQuery<br/>handler.go:2175"]
         H5["Flux v0.196.1<br/>query/control 资源配额"]
     end
 
     subgraph B["⑦ 构建 / 依赖"]
-        B1["Go 1.13 -> 1.24"]
+        B1["Go 1.13 -> 1.24<br/>（全部 Go 组件）"]
         B2["InfluxQL 1.4.1<br/>protobuf 工具链升级<br/>JWT v4 / xxhash v2"]
+        B4["Flux v0.65.1 -> v0.196.1"]
         B3["CI/打包<br/>build.py + fpm -> cross-builder + packager"]
     end
 
@@ -149,26 +158,39 @@ flowchart TB
     S2 --> S1
     S1 --> S3
     S1 --> S4
+    S3 --> S4
+    S4 --> S5
+    S1 -.-> RCP
     S5 --> S2
     Q1 --> I2
+    Q1 --> Q2
     Q3 --> I2
     Q3 --> S5
     H2 --> Q1
     H4 --> M1
+    HF --> H5
     H5 --> Q3
+    I2 --> I3
+    I2 --> I1
+    H1 --> H2
+    H1 --> H3
+    H1 --> H4
     M2 --> S5
     M2 --> I1
-    M1 --> M2
+    M2 --> M1
+    M3 --> M1
     B1 -.-> W4
     B1 -.-> H5
-    B2 -.-> H5
+    B2 -.-> Q1
+    B4 -.-> H5
 ```
 
 **怎么读这张图：**
 
-1. 先看 **④ 存储/Compaction**：这是本次区间里行为变化最集中、最容易影响磁盘和 CPU 的块。`S2`→`S1`→`S3`/`S4`（规划→调度→执行）是新的 5 级调度主链。
+1. 先看 **④ 存储/Compaction**：这是本次区间里行为变化最集中、最容易影响磁盘和 CPU 的块。`S2`→`S1`→`S3`/`S4`→`S5`（规划→调度→执行→`fileStore.Replace`/purger 写回）是新的 5 级调度主链。
 2. 再看 **① 写入链路** 与 **② 索引/Series**：写入校验、`WriteContext`、TSI 锁与缓存分配都在这条线上，影响写入延迟和错误语义。
 3. 最后看 **③/⑤/⑥/⑦**：查询、后台、HTTP/Flux、构建依赖大多是外围行为或可观测性变化，但 `M2` retention 和 `H1` TLS 会直接影响运维。
+4. 这张图只画变更主题与主要依赖，不是完整调用图；`B1`/`B2` 的虚线是示例性影响边，错误/重试分支与省略的次要依赖见各专题。
 
 ---
 
@@ -181,7 +203,7 @@ flowchart TB
 | 代表项 | 变化要点（旧 → 新） | 代表 commit | 子文档 |
 |---|---|---|---|
 | RP 写入时间窗口 | v1.8.10 没有窗口概念；v1.12.3 支持 `FUTURE LIMIT` / `PAST LIMIT`，窗口外的点返回 `PartialWriteError`，并让 `SHOW RETENTION POLICIES` 增加 future/past 两列 | `07c261a21a` | [01](01_write_path_diff.md) |
-| Level 5 optimize 独立调度 | 旧版 optimize 复用 level 4 计划，且 `compactFull` 硬编码 `optimize=false`，计划实际按 full 执行；新版拆出 L5、独立 `compactOptimize`（aggressive points-per-block）、独立 limiter 与 holdoff | `f738344a81`、`0fdb6adcb2` | [04](04_storage_compaction_diff.md) |
+| Level 5 optimize 独立调度 | 旧版 optimize 复用 level 4 计划，且 `compactFull` 硬编码 `optimize=false`，计划实际按 full 执行；新版拆出 L5、独立 `compactOptimize`（单世代/已优化组用 aggressive points-per-block）、独立 limiter 与 holdoff | `f738344a81`、`0fdb6adcb2` | [04](04_storage_compaction_diff.md) |
 | TLSConfigManager 与证书热重载 | 旧版启动时 `tls.LoadX509KeyPair` 静态加载；新版管理器支持 SIGHUP 重载、客户端证书、证书/私钥权限检查（TLS 1.3 两版都可配置） | `049b1f7e00`、`aa1775bfc2`、`e3b058616c` | [06](06_http_flux_diff.md) |
 | `/query` 的 `time_format` 参数 | 旧版只有 `epoch`；新版支持 `epoch` / `rfc3339`，默认仍是 `epoch` | `b9a0155ca9` | [06](06_http_flux_diff.md) |
 | `/debug/vars` 扩展 | 新增 `config`、`stats.compact-throughput-usage-percentage` 等诊断；`cq` 由 Statistic 包装改为扁平 values | `269f1b6281`、`f75be56eee`、`0e656d6dd5` | [06](06_http_flux_diff.md)、[07](07_build_perf_diff.md) |
@@ -194,11 +216,11 @@ flowchart TB
 | 代表项 | 变化要点（旧 → 新） | 代表 commit | 子文档 |
 |---|---|---|---|
 | 写入 Go API 签名 | 旧版 `Engine.WritePoints(points)` / `WritePointsWithContext(ctx)`、`Store.WriteToShard(shardID, points)`；新版改为 `WritePoints(points, StatsTracker)`、`WriteToShard(WriteContext, ...)` | `dd3baf6d4a`、`6795ec6c01` | [01](01_write_path_diff.md) |
-| `time` 字段错误语义 | 旧版静默跳过字段 `time`；新版返回 `PartialWriteError`（`Dropped=0`），点仍写入，但调用方会收到错误；engine 层也不再跳过 `time`（`v1.8.10:tsdb/engine/tsm1/engine.go:1330-1333` → `v1.12.3:tsdb/engine/tsm1/engine.go:1366-1367` 删除），字段可能落盘，与错误文本不一致（01 §7.1，待回归） | `1356a21321` | [01](01_write_path_diff.md) |
+| `time` 字段错误语义 | 旧版静默跳过字段 `time`（只有该字段的点两版都整点丢弃，`Dropped≥1`）；新版返回 `PartialWriteError`（混合字段点 `Dropped=0`，点仍写入），但调用方会收到错误；engine 层也不再跳过 `time`（`v1.8.10:tsdb/engine/tsm1/engine.go:1330-1333` → `v1.12.3:tsdb/engine/tsm1/engine.go:1366-1367` 删除），字段可能落盘，与错误文本不一致（01 §7.1，待回归） | `1356a21321` | [01](01_write_path_diff.md) |
 | `SHOW TAG VALUES` 的 RP 作用域 | 旧版跨所有 RP 收集；新版按语句中的 RP 限定，多个不同 RP 直接报错；该限制只对 TSI 生效 | `519e23b86a` | [03](03_query_engine_diff.md) |
 | `SHOW SERIES CARDINALITY` 近似化 | 旧版带 FROM/WHERE 的非 `EXACT` 查询走精确 `count(distinct(_seriesKey))`；新版改走 `count_hll(sum_hll(_seriesKey))` | `de1a0eb2a9` | [03](03_query_engine_diff.md) |
 | `SHOW QUERIES` 授权过滤 | 旧版非管理员能看到其他数据库的查询；新版按 `AuthorizeDatabase(ReadPrivilege, db)` 过滤；列数同时 5→6（+`user`），按固定列解析的脚本会错位 | `2b7164440f` | [03](03_query_engine_diff.md)、[06](06_http_flux_diff.md) |
-| array cursor 时间区间 | 底层存储两版都是闭区间；旧版把半开 stop 原样传入，会多返回恰好落在 stop 的点；新版构造 `CursorRequest` 时统一 `end-1`，对 Flux/InfluxQL 仍是 `[start, stop)` | `8edf7a4e2f` | [03](03_query_engine_diff.md) |
+| array cursor 时间区间 | 底层存储两版都是闭区间；旧版把半开 stop 原样传入，会多返回恰好落在 stop 的点；新版构造 `CursorRequest` 时统一 `end-1`，对 Flux 仍是 `[start, stop)`（InfluxQL 不走 `storage/reads`，见 03 §2.1） | `8edf7a4e2f` | [03](03_query_engine_diff.md) |
 | `/api/v2/delete` 语义 | v1.8.10 不存在该端点（v1.10.0 的 `2fe52d8edc` 引入）；区间内修正初版的 nil `Sources`、db/rp 混入 measurement、measurement 引号 | `f365bb7e3a`、`c31e99574f`、`e3e9232de5`、`2fe52d8edc` | [06](06_http_flux_diff.md) |
 | CSV 输出转义 | 旧版 CSV formatter 对 tag 做转义；新版 `HashKey(false)`，CSV 中不再出现反斜杠转义 | `2dc3dcb3d1` | [06](06_http_flux_diff.md) |
 | 字段长度上限 | 旧版没有字段长度限制；新版 `MaxFieldValueLength = 1048576`，字符串字段超过 1 MiB 返回 `PartialWriteError`，可用 `skip-field-size-validation` 关闭 | `6d22e69ef1` | [01](01_write_path_diff.md) |
@@ -213,7 +235,7 @@ flowchart TB
 | TSI series cache 字符串分配 | 旧版 `Put` 在 exists/元素/map key 处重复 `string(...)`；新版 `Put` 一次转换、复用同一 backing string（`Get` 未变，仍每次转换 3 次） | `f3d5cb68ab` | [02](02_index_series_diff.md) |
 | TagValueIterator 锁持有时间 | 旧版 `defer RUnlock` 覆盖整个 iterator 构造；新版查到 `logTagKey` 后立即释放 RLock，但随后在锁外 range 共享 map，并发写会 fatal（02 §7.7） | `e51acc4882` | [02](02_index_series_diff.md) |
 | purger 锁竞争 | 旧版用全局 mutex 管理待删文件；新版 `gensyncmap.Map` + 缩小临界区 | `d5a48e0662` | [04](04_storage_compaction_diff.md) |
-| retention 删除 fsync 策略 | v1.8.10 的 `DeleteSeriesID` 只 `Flush()` 缓冲、不 `file.Sync()`；区间内 `b4e781eff6` 给 `SeriesSegment.Flush` 加上 `file.Sync`；新版 `1420aaf2bc` 改为 `NoFlush` + `FlushSegments` 按 partition 批量 fsync；另有写路径：建新 series 的请求每个分区一次 fsync（v1.8.10 为 0，新版 ≤8） | `b4e781eff6`、`1420aaf2bc` | [05](05_meta_background_diff.md) |
+| retention 删除 fsync 策略 | v1.8.10 的 `DeleteSeriesID` 只 `Flush()` 缓冲、不 `file.Sync()`；区间内 `b4e781eff6` 给 `SeriesSegment.Flush` 加上 `file.Sync`；新版 `1420aaf2bc` 改为 `NoFlush` + `FlushSegments` 按 partition 批量 fsync；另有写路径：建新 series 的请求每个 (TSI 分区, SeriesFile 分区) 组合至多一次 fsync（单 shard 上限 64，跨 shard 叠加；v1.8.10 为 0） | `b4e781eff6`、`1420aaf2bc` | [05](05_meta_background_diff.md) |
 | `fields.idx` 增量持久化 | 旧版每个含新字段的写请求都重写整个 `fields.idx`；新版把变更追加到 `fields.idxl`；启动时 ApplyChanges / Close / LoadMetadataIndex 重建 / Restore·Import 时合并回 `fields.idx`；注意删除 measurement 的变更不会写入 `fields.idxl`（02 §7.8） | `80c10c8c04` | [01](01_write_path_diff.md)、[02](02_index_series_diff.md) |
 
 ### 3.4 正确性修复
@@ -247,7 +269,7 @@ flowchart TB
 
 | 代表项 | 变化要点（旧 → 新） | 代表 commit | 子文档 |
 |---|---|---|---|
-| compaction 属性测试 | 旧版以表驱动用例为主；新版增加 property-based 框架与随机计划校验 | `ba2c2b6432` | [07](07_build_perf_diff.md) |
+| compaction 属性测试 | 旧版以表驱动用例为主；新版增加 property/不变量校验框架（相邻性），作用于既有表驱动用例，未做随机生成 | `ba2c2b6432` | [07](07_build_perf_diff.md) |
 | FileStore merge 指标 | 新增每种类型的 `merge_duration`、`merge_count`、`merge_values_count`、`merge_over4_count` | `133c290fc2` | [04](04_storage_compaction_diff.md) |
 | compact throughput 诊断 | `/debug/vars` 新增 `stats.compact-throughput-usage-percentage` | `0e656d6dd5` | [06](06_http_flux_diff.md)、[07](07_build_perf_diff.md) |
 | `/debug/vars` 的 config/cq | 新增 `config` 诊断；`cq` 输出形状改为扁平 values（`cq` 本身旧版已有） | `269f1b6281`、`f75be56eee` | [06](06_http_flux_diff.md) |
@@ -265,8 +287,8 @@ flowchart TB
 ### 1. Compaction 从 4 队列模型变成 5 队列模型
 
 **旧**：`scheduler` 的 `defaultWeights` 是 `[4]float64{0.4, 0.3, 0.2, 0.1}`，L4 同时承载 full 和 optimize；并且只有 `len(level4Groups) == 0` 时才会调用 `PlanOptimize()`，而 `compactFull` 硬编码 `optimize=false`，所以这些 optimize 计划实际按 full 执行（`v1.8.10:tsdb/engine/tsm1/scheduler.go:7`、`v1.8.10:tsdb/engine/tsm1/engine.go:2117`、`v1.8.10:tsdb/engine/tsm1/engine.go:2221-2222`）。
-**新**：`TotalCompactionLevels = 5`，L5 是真正的 optimize，有独立权重 `0.01`、独立队列、`compactOptimize`（aggressive points-per-block）、`optimizedCompactionLimiter`，以及启动 1 小时/间隔 5 分钟的 holdoff（`v1.12.3:tsdb/engine/tsm1/engine.go:107-113`、`v1.12.3:tsdb/engine/tsm1/scheduler.go:8`、`v1.12.3:tsdb/engine/tsm1/engine.go:2171-2175`、`:2529`）。
-**影响**：L5 会真正重写 block、提高 points-per-block，索引更小但单次 compaction 更重；它不再被 full compaction 完全阻塞，但默认只允许 1 个并发 optimize，且启动后 1 小时内不**调度** L5（仍会规划）；更重要的是 L5 只对**冷 shard**生效——shard 至少 `compact-full-write-cold-duration`（默认 4h）无写入才会被 optimize。热 shard 即使过了 1h 也不会回收磁盘，升级后不要指望“重启立刻回收磁盘”。
+**新**：`TotalCompactionLevels = 5`，L5 是真正的 optimize，有独立权重 `0.01`、独立队列、`compactOptimize`（单世代/已优化组才用 aggressive points-per-block）、`optimizedCompactionLimiter`，以及启动 1 小时/间隔 5 分钟的 holdoff（`v1.12.3:tsdb/engine/tsm1/engine.go:107-113`、`v1.12.3:tsdb/engine/tsm1/scheduler.go:8`、`v1.12.3:tsdb/engine/tsm1/engine.go:2171-2175`、`:2529`）。
+**影响**：L5 在单世代或组内已有优化文件时用 aggressive points-per-block（默认 10000）重写，其余多世代未优化组仍用 1000；索引更小但单次 compaction 更重；它不再被 full compaction 完全阻塞，但默认只允许 1 个并发 optimize，且启动后 1 小时内不**调度** L5（仍会规划）。L5 有两条入口：`PlanOptimize` 触发的 L5 需 shard 至少 `compact-full-write-cold-duration`（默认 4h）无写入；`planCompactionsInner` 对 `Plan` 产出的 L4 组做 `IsGroupOptimized`，命中即提升为 L5，**不受**冷写门槛约束——已优化 shard 被回填数据后，热 shard 上也会执行 L5。热 shard 不会被 `PlanOptimize` 选中，但升级后不要指望“重启立刻回收磁盘”。
 
 ### 2. 混合 level compaction 的 level 回退修复
 
@@ -288,7 +310,7 @@ flowchart TB
 ### 5. 写入路径的 API 重构与错误语义变化
 
 **旧**：`Engine.WritePoints(points)` 和 `Engine.WritePointsWithContext(ctx, points)`；`time` 字段被静默跳过；没有 RP 写入窗口（`v1.8.10:tsdb/engine/tsm1/engine.go:1294`、`v1.8.10:tsdb/field_validator.go:23`）。
-**新**：`WriteContext{UserId}` + `StatsTracker` 贯穿 `PointsWriter`/`Store`/`Engine`（`6795ec6c01` 引入显式 tracker，`dd3baf6d4a` 引入 WriteContext）；`time` 字段返回 `PartialWriteError`，但 engine 层也不再跳过该字段（字段可能落盘，见 01 §7.1）；RP 可用 `FUTURE LIMIT` / `PAST LIMIT` 拒绝窗口外写入（`v1.12.3:tsdb/store.go:1855`、`v1.12.3:tsdb/field_validator.go:45`、`v1.12.3:coordinator/points_writer.go:211-245`）。
+**新**：`WriteContext{UserId}` 只贯穿 `PointsWriter`/`Store`；`StatsTracker` 由 `Store.statsTracker(db,rp,login)` 创建并传给 `Shard.WritePoints`/`Engine.WritePoints`，二者只收 tracker（`6795ec6c01` 引入显式 tracker，`dd3baf6d4a` 引入 WriteContext）；`time` 字段返回 `PartialWriteError`，但 engine 层也不再跳过该字段（字段可能落盘，见 01 §7.1）；RP 可用 `FUTURE LIMIT` / `PAST LIMIT` 拒绝窗口外写入（`v1.12.3:tsdb/store.go:1855`、`v1.12.3:tsdb/field_validator.go:45`、`v1.12.3:coordinator/points_writer.go:211-245`）。
 **影响**：嵌入式/企业版调用方必须改签名；普通 HTTP 客户端可能第一次看到 `partial write` 错误；按用户统计的写入指标依赖 `WriteContext.UserId`；另外新增 1 MiB 字段长度上限，超大字符串字段会从成功变成 400。
 
 ### 6. TSI 的崩溃恢复、并发与分配优化
@@ -306,13 +328,13 @@ flowchart TB
 ### 8. Storage read 的区间语义与窗口聚合下推
 
 **旧**：storage cursor 按 `[start, stop)` 请求，和底层 file store 的 `[start, stop]` 不一致；cursor 错误在部分路径被吞掉；没有 window aggregate 下推（commit `8edf7a4e2f`、`fe6c64b21e`、`a2154f143c`）。
-**新**：`CursorRequest.EndTime` 明确为 inclusive，`newMultiShardArrayCursors` 在构造请求时做 `end - 1` 转换；cursor 错误在 tsm1 数组游标/reset 路径已上抛，但 group/filter 的 `Err()` 仍返回 nil（03 §7.1/§7.2）；`ReadWindowAggregate`/`WindowAggregate` 与 MeanCount cursor 支持窗口聚合下推（`v1.12.3:storage/reads/array_cursor.go:81-90`、`v1.12.3:tsdb/cursors/cursor.go:64-71`）。
+**新**：`CursorRequest.EndTime` 明确为 inclusive，`newMultiShardArrayCursors` 在构造请求时做 `end - 1` 转换（`v1.12.3:tsdb/cursors/cursor.go:64-71`、`v1.12.3:storage/reads/array_cursor.go:81-90`）；cursor 错误在 tsm1 数组游标/reset 路径已上抛，但 group/filter 的 `Err()` 仍返回 nil（03 §7.1/§7.2）；`ReadWindowAggregate`/`WindowAggregate` 与 MeanCount cursor 支持窗口聚合下推（`v1.12.3:storage/flux/reader.go:85`、`v1.12.3:storage/reads/aggregate_resultset.go:50`、`v1.12.3:storage/reads/array_cursor.gen.go:199`）。
 **影响**：边界点不再因半开/闭区间差异被漏掉或重复；Flux 窗口聚合可以减少读放大。但自定义 cursor 调用方如果仍按 `[start, stop)` 传参，需要检查是否多包含了一个边界点。
 
 ### 9. HTTP/TLS 运维能力增强
 
 **旧**：httpd 在启动时 `tls.LoadX509KeyPair`，证书更新必须重启；`/query` 只有 `epoch`；`/debug/vars` 没有 config/stats/compact-throughput；v1.8.10 无 `/api/v2/delete`（v1.10.0 引入，初版语义 bug 已在 1.12.3 修完：nil Sources、不设 db/rp、去引号；TLS 静态加载见 `v1.8.10:services/httpd/service.go:115`，无 v2 delete 见 `v1.8.10:services/httpd/handler.go:186-243` 的路由表）。
-**新**：`TLSConfigManager` 支持 SIGHUP 重载、客户端证书、证书/私钥权限检查；`time_format` 支持 `epoch`/`rfc3339`；`/debug/vars` 增加 config/stats，`cq` 改为扁平输出；v2 delete（v1.10.0 新增）在区间内修正为 nil `Sources`、不设 db/rp、去 measurement 引号（`v1.12.3:services/httpd/service.go:162`、`v1.12.3:services/httpd/handler.go:640`、`v1.12.3:services/httpd/handler.go:2356`）。
+**新**：`TLSConfigManager` 支持 SIGHUP 重载、客户端证书、证书/私钥权限检查（`v1.12.3:services/httpd/service.go:162`）；`time_format` 支持 `epoch`/`rfc3339`（`v1.12.3:services/httpd/handler.go:640`）；`/debug/vars` 增加 config/stats，`cq` 改为扁平输出（`v1.12.3:services/httpd/handler.go:2356`）；v2 delete（v1.10.0 新增）在区间内修正为 nil `Sources`、不设 db/rp、去 measurement 引号（`v1.12.3:services/httpd/handler.go:975,1075,1085`）。
 **影响**：证书轮换无需重启，监控项更全；但 TLS 文件权限检查、`https-insecure-certificate` 修复和多 RP 查询限制都可能改变现有部署行为。
 
 ### 10. Flux 控制器与构建基线升级
@@ -330,10 +352,10 @@ flowchart TB
 | 影响面 | 变化 | 升级动作 / 风险 | 证据 |
 |---|---|---|---|
 | 配置 | 新增 `max-concurrent-optimized-compactions`，默认/非法值按 1 处理，且不超过 `max-concurrent-compactions` | 如果旧配置没有该项，行为等于 1；需要更高 optimize 并发时显式设置，但不要超过总 compaction 上限 | `v1.12.3:tsdb/config.go:159-162`、`v1.12.3:tsdb/store.go:513-524` |
-| 运维 | L5 optimize 需同时满足：启动 holdoff 1h、两次间隔 ≥5m、shard 冷写 ≥4h；holdoff 内仍会规划但不调度 | 重启后磁盘空间不会立刻回收；热 shard 永远不会 optimize，容量告警窗口要相应放宽 | `v1.12.3:tsdb/engine/tsm1/engine.go:2171-2175`、`tsdb/engine/tsm1/compact.go:452`、`tsdb/config.go:38` |
+| 运维 | `PlanOptimize` 触发的 L5 需同时满足：启动 holdoff 1h、两次间隔 ≥5m、shard 冷写 ≥4h；holdoff 内仍会规划但不调度；另有 `IsGroupOptimized` 把已优化的 L4 组提升为 L5，不受冷写门槛约束 | 重启后磁盘空间不会立刻回收；热 shard 不会被 `PlanOptimize` 选中，但已优化 shard 回填后可能被提升为 L5；容量告警窗口要相应放宽 | `v1.12.3:tsdb/engine/tsm1/engine.go:2171-2175`、`tsdb/engine/tsm1/compact.go:452`、`tsdb/config.go:38` |
 | 运维 | TLS 证书支持 SIGHUP 重载、客户端证书、权限检查；`https-insecure-certificate` 修复 | 证书轮换流程可从“重启”改为“发 SIGHUP”；确认证书/私钥文件权限满足新检查 | `v1.12.3:services/httpd/service.go:162`、commit `aa1775bfc2`、`049b1f7e00`、`ba705ec658` |
 | SQL/DDL | `CREATE/ALTER RETENTION POLICY` 支持 `FUTURE LIMIT` / `PAST LIMIT`；`SHOW RETENTION POLICIES` 增加两列 | 新语句需要 InfluxQL v1.4.1；旧客户端如果按固定列数解析 `SHOW RETENTION POLICIES` 会受影响 | `v1.12.3:coordinator/statement_executor.go:852-871`、commit `07c261a21a` |
-| 写入 API | 窗口外的点返回 `PartialWriteError`，错误里带 database/RP 与 dropped 数 | 客户端要按 400/partial write 处理；监控 `RetentionDropped` 与 `WriteWindowDropped` | `v1.12.3:coordinator/points_writer.go:211-245`、`:314-350`、`:516-521` |
+| 写入 API | 窗口外的点返回 `PartialWriteError`，错误里带 database/RP 与 dropped 数 | 客户端要按 400/partial write 处理；错误文本会区分 retention policy 与 write window；如需按原因监控，只能采集 400 错误文本或监控 `write.writeDrop` | `v1.12.3:coordinator/points_writer.go:211-245`、`:314-350`、`:516-521` |
 | 写入校验 | 新增 `MaxFieldValueLength = 1 MiB`，字符串字段超限返回 `PartialWriteError`；`skip-field-size-validation` 可关闭 | 超大字符串字段从成功变 400；检查客户端/导入工具 | `v1.12.3:tsdb/field_validator.go:12-36`、`v1.12.3:tsdb/config.go:120`、commit `6d22e69ef1` |
 | HTTP 查询 API | 新增 `time_format=epoch / rfc3339`，默认 `epoch`；CSV 的 tag 不再转义 | 默认行为不变；显式用 `time_format` 的客户端要确认 `epoch` 参数是否被忽略；CSV 解析器要能接受未转义 tag | `v1.12.3:services/httpd/handler.go:640`、`:810`、`v1.12.3:services/httpd/response_writer.go:228` |
 | SQL 查询语义 | `SHOW TAG VALUES` 涉及多个不同 RP 时报错；INMEM 索引仍可能跨 RP 返回 | 检查依赖“跨 RP 并集”的脚本；INMEM 用户不要指望该限制生效 | `v1.12.3:coordinator/statement_executor.go:1127-1145`、commit `519e23b86a` |
@@ -344,9 +366,9 @@ flowchart TB
 | 数据格式 | **未见 TSM/WAL 文件格式版本升级**；TSI MANIFEST 内容格式未变，但写入改为临时文件 + rename；meta protobuf 追加 optional 字段 7/8 | 不需要离线重写 TSM；新旧 meta 快照按 protobuf 兼容方式读取；仍建议升级前备份 meta | `v1.12.3:tsdb/engine/tsm1/writer.go:82,85`（magic `0x16D116D1`、version 1，两版相同）；`git diff v1.8.10 f3d5cb68ab -- tsdb/engine/tsm1/encoding.go tsdb/engine/tsm1/wal.go` 是代码整理/WAL 配置生效，非格式变化；MANIFEST 权限收紧为 0644；`v1.12.3:tsdb/index/tsi1/partition.go:1490-1520`；`v1.12.3:services/meta/internal/meta.pb.go:509-521` |
 | 字段元数据 | `fields.idx` 仍是 protobuf，但新增 `fields.idxl` 增量日志，启动时 ApplyChanges / Close / LoadMetadataIndex 重建 / Restore·Import 时合并回 `fields.idx` | 升级不需要重建；降级到不识别 `.idxl` 的旧版本前先确认合并/备份，否则升级后的字段变更可能不可见 | `v1.12.3:tsdb/shard.go:51`、commit `80c10c8c04` |
 | Flux 资源 | 新增 `[flux-controller]`：`query-concurrency`、`query-queue-size`、`query-max-memory-bytes`、`total-max-memory-bytes`、`query-initial-memory-bytes`（`query/control/controller.go:81`）；默认 0 表示不限制 | 不配置时行为接近旧版；配置后 Flux 查询可能排队或被拒绝 | `v1.12.3:query/control/controller.go:71-110`、`v1.12.3:cmd/influxd/run/config.go:45` |
-| Go API | `Engine.WritePoints` 增加 `StatsTracker`；`Store.WriteToShard` 改为 `WriteContext`；`SeriesFile.DeleteSeriesID` 增加 `flush bool` 并返回 partition；Flux storage `ReadFilter`/`ReadGroup` 增 `ReadWindowAggregate` 且 `alloc` 改值类型；`pkg/limiter.Rate` 增 `Tokens()`/`Limit()`；`Tags.HashKey(bool)`/`AppendHashKey(dst, bool)` | 嵌入式/企业版/自定义工具需要改编译；不要继续调用已移除的 `WritePointsWithContext`、`WriteToShardWithContext` | `v1.8.10:tsdb/engine/tsm1/engine.go:1294`、`v1.8.10:tsdb/store.go:1412`、`v1.8.10:tsdb/series_file.go:198`；`v1.12.3:tsdb/engine/tsm1/engine.go:1346`、`v1.12.3:tsdb/store.go:1861`、`v1.12.3:tsdb/series_file.go:203`、`v1.12.3:storage/flux/reader.go:65-91`、`v1.12.3:pkg/limiter/writer.go:18-23`、`v1.12.3:models/points.go:2211,2229` |
-| 构建 | Go 1.24、Flux 0.196.1、InfluxQL 1.4.1、protobuf 工具链、JWT v4；产物收窄为 `influx`/`influx_inspect`/`influxd`，架构仅 linux-amd64/arm64、darwin-amd64、windows-amd64 | CI/构建机升级 Go；检查 Flux/InfluxQL 行为差异；不再产出 i386/armhf/armel/static_* 与 influx_tools/influx_stress，使用这些产物的部署需自建或换架构；仓库根 `Dockerfile`/`appveyor.yml` 仍指向旧工具链，不能用于 1.12.3 构建；发布路径为 `releases/<tag>/`，`logger.Level` 类型已变化；`compact-throughput` 日志键由 `throughput_bytes_per_second` 改名（`82729cf8ff`），按旧键的告警/grep 会静默失效 | `v1.12.3:go.mod:3-5`、`:21-23`、`:57`；`v1.8.10:go.mod:3`、`:21-22` |
-| 监控 | 新增 `/debug/vars` 的 config/stats，新增 merge 指标与查询字节指标；`tsmOptimizeCompactions*` 由恒 0/L4 混用变为真实 L5 指标；注意 cq 形状变化、`httpd.valuesWrittenOK` 被删除 | 监控采集器可以增加这些 key；`tsmOptimizeCompactions*` 的看板/告警需按 L5 重新配阈值（04 §5.3）；注意 `SHOW STATS` 的 per-user 项可能增加基数；旧面板需删 `valuesWrittenOK` | `v1.12.3:services/httpd/handler.go:2356`、commit `133c290fc2`、`4dcc8776c1` |
+| Go API | `Engine.WritePoints` 与 `Shard.WritePoints` 增加 `StatsTracker`；`Store.WriteToShard` 改为 `WriteContext`；`SeriesFile.DeleteSeriesID` 增加 `flush bool` 并返回 partition，`CreateSeriesListIfNotExists` 增 `StatsTracker`；`Store.MeasurementNames` 增 `retentionPolicy`；`flux/control` 整包移除（→`query/control`）；Flux storage `ReadFilter`/`ReadGroup` 增 `ReadWindowAggregate` 且 `alloc` 改值类型；`pkg/limiter.Rate` 增 `Tokens()`/`Limit()`；`Tags.HashKey(bool)`/`AppendHashKey(dst, bool)` | 嵌入式/企业版/自定义工具需要改编译；不要继续调用已移除的 `WritePointsWithContext`、`WriteToShardWithContext`，以及已删除的 `ConetextKey`/`StatPointsWritten`/`StatValuesWritten`；完整清单见 01 §5.2 / 02 §5.5 | `v1.8.10:tsdb/engine/tsm1/engine.go:1294`、`v1.8.10:tsdb/shard.go:500`、`v1.8.10:tsdb/store.go:1412`、`v1.8.10:tsdb/series_file.go:198`；`v1.12.3:tsdb/engine/tsm1/engine.go:1346`、`v1.12.3:tsdb/shard.go:562`、`v1.12.3:tsdb/store.go:1861`、`:1905`、`v1.12.3:tsdb/series_file.go:182,203`、`v1.12.3:storage/flux/reader.go:65-91`、`v1.12.3:pkg/limiter/writer.go:18-23`、`v1.12.3:models/points.go:2211,2229` |
+| 构建 | Go 1.24、Flux 0.196.1、InfluxQL 1.4.1、protobuf 工具链、JWT v4，所有目标 `CGO_ENABLED=1`；产物收窄为 `influx`/`influx_inspect`/`influxd`，架构仅 linux-amd64/arm64、darwin-amd64、windows-amd64 | 源码/自建包需 Go 1.24 + CGO 工具链；Linux 还需 Rust `libunwind` 与 cross-builder 镜像提供的 `xcc`/`find_rustlib_path`，脱离镜像自建 CI 要复刻 musl/Rust 工具链（07 §3.3/§7.2）；CI 构建机升级 Go；检查 Flux/InfluxQL 行为差异；不再产出 i386/armhf/armel/static_* 与 influx_tools/influx_stress，使用这些产物的部署需自建或换架构；仓库根 `Dockerfile`/`appveyor.yml` 仍指向旧工具链，不能用于 1.12.3 构建；发布路径为 `releases/<tag>/`，`logger.Level` 类型已变化；`compact-throughput` 日志键由 `throughput_bytes_per_second` 改名（`82729cf8ff`），按旧键的告警/grep 会静默失效 | `v1.12.3:go.mod:3-5`、`:21-23`、`:57`；`.circleci/config.yml:149-179`；07 §3.3/§7.2；`v1.8.10:go.mod:3`、`:21-22` |
+| 监控 | 新增 `/debug/vars` 的 config/stats 与查询字节指标；新增 merge 指标（`merge_*` 仅查询启用 tracing 时写入 span）；`tsmOptimizeCompactions*` 由恒 0/L4 混用变为真实 L5 指标；注意 cq 形状变化、`httpd.valuesWrittenOK` 被删除 | 监控采集器可以增加 `/debug/vars` 的 config/stats key；`merge_*` 不进 `/debug/vars`/`SHOW STATS`、无跨请求聚合，需要查 tracing span（07 §3.7.6）；`tsmOptimizeCompactions*` 的看板/告警需按 L5 重新配阈值（04 §5.3）；注意 `SHOW STATS` 的 per-user 项可能增加基数；旧面板需删 `valuesWrittenOK` | `v1.12.3:services/httpd/handler.go:2356`、commit `133c290fc2`、`4dcc8776c1` |
 
 > 上表之外还需检查 4 类变化：SIGHUP 语义反转（旧版默认终止进程）；订阅 `Subscriber` API 与 `total-buffer-bytes`；WAL 段大小配置生效；systemd 启动 `buildtsi`。监控面板还要补删 `httpd.valuesWrittenOK`。
 
@@ -358,7 +380,7 @@ flowchart TB
 - 5 级 scheduler、L5 独立 limiter/holdoff（`f738344a81`、`0fdb6adcb2`）。
 - purger 并发 map 与缩小锁区（`d5a48e0662`）。
 - TSI series cache 字符串复用（`f3d5cb68ab`）、`TagValueIterator` 缩短 RLock（`e51acc4882`；但锁外 range 共享 map，并发写会 fatal，02 §7.7）。
-- retention fsync 策略（`b4e781eff6`、`1420aaf2bc`）——v1.8.10 删除 series 不 fsync；区间内先变成每次删除 fsync，再改成按 partition 批量 fsync。相对 v1.8.10 是新增持久化保障，相对“每次 fsync”的中间版本则把持久化点后移，见 §10。另有写路径：建新 series 的请求每个分区一次 fsync（v1.8.10 为 0，新版 ≤8，见 02 §3.9(c)）。
+- retention fsync 策略（`b4e781eff6`、`1420aaf2bc`）——v1.8.10 删除 series 不 fsync；区间内先变成每次删除 fsync，再改成按 partition 批量 fsync。相对 v1.8.10 是新增持久化保障，相对“每次 fsync”的中间版本则把持久化点后移，见 §10。另有写路径：建新 series 的请求每个 (TSI 分区, SeriesFile 分区) 组合至多一次 fsync（单 shard 上限 64，跨 shard 叠加；v1.8.10 为 0，见 02 §3.9(c)）。
 - file store merge 指标（`133c290fc2`）、compaction 属性测试（`ba2c2b6432`）。
 
 ---
@@ -453,15 +475,15 @@ git diff --stat f3d5cb68ab HEAD -- '*.go'
 
 | 术语 | 含义 | v1.8.10 | v1.12.3 | 主要文档 |
 |---|---|---|---|---|
-| Compaction level | 由 TSM 文件名 sequence 编码的层级，`level = min(sequence, 4)` | 有 L1–L4 概念，optimize 复用 L4 | 有 L1–L5 概念，L5 专指 optimize | [04](04_storage_compaction_diff.md)、[17](../17_tsm_file_format_spec.md) |
+| Compaction level | 文件名编码的层级 `level = min(sequence, 4)`（上限 L4）；L5 只是调度/规划层级 | 有 L1–L4 概念，optimize 复用 L4 | 有 L1–L5 概念，L5 专指 optimize（`OptimizeCompactionLevel = 5`，调度用；输出文件层级仍 ≤ L4） | [04](04_storage_compaction_diff.md)、[17](../17_tsm_file_format_spec.md) |
 | 4 级 vs 5 级 | 调度器建模的队列数量 | `scheduler` 的 `queues/weights` 是 `[4]`，L4 同时放 full + optimize | `TotalCompactionLevels = 5`，L4 full、L5 optimize 分开 | [04](04_storage_compaction_diff.md) |
-| generation | TSM 文件名第一段，表示一次创建批次 | 每次 `parseFileName` 从路径解析 | 打开/重命名时缓存到 `ExtFileStat.Generation` | [04](04_storage_compaction_diff.md)、[17](../17_tsm_file_format_spec.md) |
-| sequence | TSM 文件名第二段，编码 level | 每次 `parseFileName` 解析 | 缓存到 `ExtFileStat.Sequence`，compaction 输出用 `minSeqByGen` 防回退 | [04](04_storage_compaction_diff.md)、[17](../17_tsm_file_format_spec.md) |
-| WriteContext | 写入请求的请求级上下文，目前只含 `UserId` | 不存在；用 `context.Context` + context value 传统计 | `tsdb.WriteContext{UserId}` 贯穿 `PointsWriter`/`Store`/`Engine` | [01](01_write_path_diff.md)、[06](../06_cluster_communication_spec.md) |
+| generation | TSM 文件名第一段，表示一次创建批次 | 每次 `parseFileName` 从路径解析 | 打开/重命名时缓存到 `TSMReader.generation`，经 `Stats()` 暴露为 `FileStat`（`ExtFileStat` 内嵌） | [04](04_storage_compaction_diff.md)、[17](../17_tsm_file_format_spec.md) |
+| sequence | TSM 文件名第二段，编码 level | 每次 `parseFileName` 解析 | 缓存到 `TSMReader.sequence`（经 `Stats()` 暴露为 `FileStat`），compaction 输出用 `minSeqByGen` 防回退 | [04](04_storage_compaction_diff.md)、[17](../17_tsm_file_format_spec.md) |
+| WriteContext | 写入请求的请求级上下文，目前只含 `UserId` | 不存在；用 `context.Context` + context value 传统计 | `tsdb.WriteContext{UserId}` 贯穿 `PointsWriter`/`Store`；`Shard`/`Engine` 只收 `StatsTracker` | [01](01_write_path_diff.md)、[06](../06_cluster_communication_spec.md) |
 | StatsTracker | 写入统计回调集合 | 不存在；统计通过 `context.Context` 的指针传递 | `tsdb.StatsTracker`，支持 `AddedPoints` 等回调 | [01](01_write_path_diff.md) |
 | optimizedCompactionLimiter | 限制并发 optimize compaction 的 `limiter.Fixed` | 不存在；optimize 与 full 共用总 limiter | 独立 limiter，默认 1，且不超过总 compaction 并发 | [04](04_storage_compaction_diff.md) |
 | L5 optimize | 只重写/重整索引、提高 points-per-block 的 compaction | 作为 L4 optimize 路径规划，但 `compactFull` 硬编码 `optimize=false`，实际按 full 执行 | 独立 L5，`compactOptimize` + `PointsPerBlock` + holdoff | [04](04_storage_compaction_diff.md) |
-| Array cursor | storage read 的批量类型化读取抽象 | 底层存储是闭区间，但旧版把半开 stop 原样传入（会多返回 stop 点）；错误可能被吞 | `EndTime` inclusive，构造时统一 `end-1`，对外仍是 `[start, stop)`；tsm1 数组游标已上抛错误，group/filter 的 `Err()` 仍为 nil | [03](03_query_engine_diff.md)、[08](../08_array_cursor_spec.md) |
+| Array cursor | storage read 的批量类型化读取抽象 | 底层存储是闭区间，但旧版把半开 stop 原样传入（会多返回 stop 点）；错误可能被吞 | `EndTime` inclusive，构造时统一 `end-1`，对 Flux 对外仍是 `[start, stop)`（InfluxQL 不走该路径）；tsm1 数组游标已上抛错误，group/filter 的 `Err()` 仍为 nil | [03](03_query_engine_diff.md)、[08](../08_array_cursor_spec.md) |
 | TSI | Time Series Index，按 measurement/tag 查 series 的索引 | MANIFEST 非原子写，部分打开清理不完整 | MANIFEST 原子替换、清理补齐、series cache 减少分配 | [02](02_index_series_diff.md)、[14](../14_series_file_deep_dive_spec.md) |
 | SeriesFile | series key 到 series ID 的持久化身份系统 | `DeleteSeriesID(id)` 每条只 `Flush()` 缓冲，无 `file.Sync()` | `DeleteSeriesID(id, flush)` + `FlushSegments` 批量 fsync（区间内 `b4e781eff6` 先加 Sync） | [02](02_index_series_diff.md)、[14](../14_series_file_deep_dive_spec.md) |
 | fields.idxl | `fields.idx` 的增量变更日志 | 不存在；每个含新字段的写请求全量重写 `fields.idx` | 变更追加到 `fields.idxl`；启动时 ApplyChanges / Close / LoadMetadataIndex 重建 / Restore·Import 合并回 `fields.idx`（删除 measurement 的变更不落盘，02 §7.8） | [01](01_write_path_diff.md)、[02](02_index_series_diff.md) |
@@ -521,11 +543,11 @@ CREATE RETENTION POLICY rp ON db DURATION 24h REPLICATION 1
 2. `WithinWindow(now-20m)` 发现 `checkBefore && t.Before(before)`，返回 `false, before, WriteWindowLowerBound`。
 3. 第一轮 `MapShards` 对 `now-20m` 直接 `continue`、不建组；同请求里同组的 `now-5m` 建出覆盖该小时的组并 `list.Add`（`v1.12.3:coordinator/points_writer.go:314-321`）。
 4. 第二轮 `list.ShardGroupAt(now-20m)` 命中该组，再判一次 `WithinWindow` 失败 → `AddDropped(p, before, WriteWindowLowerBound)`，`WriteWindowDropped=1`（`:337-350`）。
-5. `WritePointsPrivileged` 返回 `PartialWriteError`，reason 由 `SummariseDropped()` 生成：`dropped 0 points outside retention policy of duration 24h0m0s and 1 points outside write window (-10m0s) - ...`（`v1.12.3:coordinator/points_writer.go:516-521`）。
+5. `WritePointsPrivileged` 返回 `PartialWriteError`，reason 由 `SummariseDropped()` 生成：`dropped 0 points outside retention policy of duration 24h0m0s and 1 points outside write window (-10m0s to 15m0s) - ...`（`v1.12.3:coordinator/points_writer.go:516-521`）。
 
 > 反例：库里只有这一个点（或空库）时，第一轮不会建组，第二轮 `sg == nil` → `AddDropped(p, min, RetentionPolicyBound)`，即 `RetentionDropped=1`、`WriteWindowDropped=0`，错误文本是 “outside retention policy”，不是 “outside write window”。
 
-**影响**：客户端会收到 400/partial write，必须决定重试、丢弃还是修正时间戳；监控上应同时看 `RetentionDropped` 与 `WriteWindowDropped`（单点/空库会落到前者）。这不是“默认开启”的行为，只有显式设置 `PAST LIMIT` / `FUTURE LIMIT` 才会生效。
+**影响**：客户端会收到 400/partial write，必须决定重试、丢弃还是修正时间戳；监控上只有合并后的 `write.writeDrop`；错误文本会区分 retention policy 与 write window（单点/空库会落到前者），要按原因区分只能采集 400 错误文本。这不是“默认开启”的行为，只有显式设置 `PAST LIMIT` / `FUTURE LIMIT` 才会生效。
 
 ### 9.3 案例 C：`time` 字段从“静默消失”到“明确报错”
 
@@ -541,13 +563,17 @@ CREATE RETENTION POLICY rp ON db DURATION 24h REPLICATION 1
 
 | 风险 | 证据 | 影响 | 建议 |
 |---|---|---|---|
-| L5 optimize 可能被饿死或延迟 | `defaultWeights` 中 L5 权重 `0.01`，启动 holdoff 1h、间隔 5m、shard 冷写 ≥4h（`v1.12.3:tsdb/engine/tsm1/scheduler.go:8`、`tsdb/engine/tsm1/engine.go:2171-2175`、`tsdb/engine/tsm1/compact.go:452`、`tsdb/config.go:38`） | 高负载集群上 optimize 可能长期排不到；重启后磁盘回收慢；热 shard 永远不会 optimize | 观察 `tsmOptimizeCompactionQueue`/`tsmOptimizeCompactionsActive`；必要时提高 `max-concurrent-optimized-compactions`，但不要挤占 level compaction |
+| L5 optimize 可能被饿死或延迟 | `defaultWeights` 中 L5 权重 `0.01`，启动 holdoff 1h、间隔 5m、`PlanOptimize` 的 shard 冷写门槛 ≥4h（`v1.12.3:tsdb/engine/tsm1/scheduler.go:8`、`tsdb/engine/tsm1/engine.go:2171-2175`、`tsdb/engine/tsm1/compact.go:452`、`tsdb/config.go:38`）；L4 组还可在 `planCompactionsInner` 里经 `IsGroupOptimized` 提升为 L5（`engine.go:2376-2388`），不受该门槛 | 高负载集群上 optimize 可能长期排不到；重启后磁盘回收慢；热 shard 不会被 `PlanOptimize` 选中，但已优化 shard 回填后可能被提升为 L5 | 观察 `tsmOptimizeCompactionQueue`/`tsmOptimizeCompactionsActive`；必要时提高 `max-concurrent-optimized-compactions`，但不要挤占 level compaction |
 | retention 仍可能被“卡住”的 shard 阻塞 | `ShardInUse` 为 true 时直接返回 `can not delete an in-use shard`（`v1.12.3:services/retention/service.go:246-251`） | 单个长期读者会让该 shard 永远不删；日志会提示，但不会自动恢复 | 监控 retention 错误日志与 shard 目录；排查长查询/泄漏的 reader |
 | `TagValueIterator` 释放 RLock 后遍历共享 map（v1.12.3 并发回归） | `v1.12.3:tsdb/index/tsi1/log_file.go:422-437` 在 `RUnlock` 后调用 `tk.TagValueIterator()`；而 `logTagKey.TagValueIterator()` 会 `range tk.tagValues`，`execSeriesEntry` 又在 `f.mu` 写锁下更新同一 map（`:740-749`、`:1406-1411`） | 查询与写入并发会触发 `fatal error: concurrent map iteration and map write`（runtime 直接退出，`recover` 无效）。02 §3.6/§7.7 已判定这是 v1.12.3 的并发回归并用最小程序复现，本文与 02 结论一致 | 高并发写入 + TSI 查询场景先做 `-race` 回归确认触发条件；等上游把 `range` 移回锁内 |
 | retention 的 fsync 持久化窗口 | v1.8.10 的 `SeriesSegment.Flush` 只刷缓冲、不 `file.Sync()`（`v1.8.10:tsdb/series_segment.go:210-216`）；区间内 `b4e781eff6` 加上 `file.Sync()`；`1420aaf2bc` 又改为 `DeleteSeriesID(id, NoFlush)` + `FlushSegments(partitionIDs)`，后者失败只记录日志（`v1.12.3:tsdb/series_segment.go:218-227`、`v1.12.3:tsdb/series_file.go:203-220`、retention 路径 `v1.12.3:services/retention/service.go:254` → `v1.12.3:tsdb/store.go:1083-1114`；`tsdb/engine/tsm1/engine.go:1852-1885` 是另一条 DELETE series 路径） | 相对 v1.8.10 是新增持久化保障；相对“每次删除 fsync”的中间版本，批量策略把持久化点后移，崩溃窗口内未 flush 的删除可能不持久 | 升级后关注删除后的 series 是否短暂“复活”；对删除持久性敏感的场景做掉电测试 |
 | TSI cache 仍不是零分配 | `Put` 仍然对 `name/key/value` 各做一次 `string(...)`（`v1.12.3:tsdb/index/tsi1/cache.go:98-105`） | 高基数 tag 查询仍有分配压力，只是避免了重复转换 | 不要把它当成“完全消除分配”；高基数场景继续关注 heap |
 | `SHOW TAG VALUES` 的限制只对 TSI 生效 | `SHOW TAG VALUES` 单 RP 限制在 `executeShowTagValues` 中，但 INMEM shard 共享索引（commit `519e23b86a` 说明） | INMEM 用户仍可能看到跨 RP 的 tag value；TSI 用户对多个不同 RP 查询会直接报错 | 升级前确认索引类型；需要跨 RP 并集的脚本改为显式多次查询 |
 | CSV 不再转义可能破坏旧解析器 | `HashKey(false)` 只影响 CSV formatter（`v1.12.3:services/httpd/response_writer.go:228`；commit `2dc3dcb3d1`） | tag 值中含逗号/反斜杠时，CSV 列内容与旧版不同 | 用真实 tag 值做回归；解析器按标准 CSV 处理而不是按旧转义格式 |
+| `/debug/vars` 的 `config` 暴露绝对路径 | `tsdb.Config.Diagnostics()` 输出 17 个键，含 `dir`/`wal-dir`（`v1.12.3:tsdb/config.go:288-308`） | 采集端若整段落盘会记录数据目录；未来扩展 `[http]`/`[tls]` 面更大（07 §7.6） | 限制采集权限与保留期，关注上游是否扩展 `config` 键 |
+| `compact-throughput-usage-percentage` 启动瞬间接近 100% | `NewRate` 创建时 `AllowN(now, burstLimit)` 耗尽初始 burst（`v1.12.3:pkg/limiter/writer.go:27`） | 以此做告警会在每次重启时误报 | 告警加启动宽限期，或改用持续高占用判定（07 §7.7） |
+| systemd 启动期 `buildtsi` 可能超时 | 每次 start 都跑 `influx_inspect buildtsi`，脚本 `set -e` 且无 `\|\| true`（`v1.12.3:.circleci/packages/influxdb/fs/usr/lib/influxdb/scripts/influxd-systemd-start.sh:1,47-49`） | series 多时启动时间线性增长，可能撞 systemd 默认 `TimeoutStartSec` 90s，形成“重启—超时—再重启” | 评估 series 规模后提高 `TimeoutStartSec`，或提前离线 buildtsi（07 §7.9） |
+| `[flux-controller]` 不在 `etc/config.sample.toml` | `grep -n "flux-controller" etc/config.sample.toml` 无结果，但 `cmd/influxd/run/config.go:45` 定义了该段 | 运维只能靠 `influxd config` 或源码猜参数名 | 升级时用 `influxd config` 导出默认值并纳入自有配置模板（07 §7.10） |
 | `fields.idxl` 的降级风险 | 新版把字段变更追加到 `fields.idxl`，仅在 Close / ApplyChanges / LoadMetadataIndex 重建 / Restore·Import 时合并回 `fields.idx`（`v1.12.3:tsdb/shard.go:51`、`:1681-1698`；commit `80c10c8c04`） | 旧版本不认识 `.idxl`；如果降级前未正常关闭/合并，升级后的字段变更可能不可见 | 升级/降级前备份 shard 的 `fields.idx`/`fields.idxl`；降级前用新版正常关闭以触发合并 |
 | compaction 修复的版本归属：1.12.2 与 1.12.3 各含一个 | `95e86be3f4` 明确说修复的是 “introduced with 1.12.1”；`5e9d85c972` 是 1.12.3 的 backport | **修复归属**：full compaction 未排期修复（`95e86be3f4` #26670）在 v1.12.2 已包含；level 回退修复（`5e9d85c972` #27233）只在 v1.12.3。因此 1.12.1 两个 bug 都在；1.12.2 只剩 level 回退；1.12.3 两者都已修 | 直接升级到 1.12.3（或至少 1.12.2 再评估 level 回退） |
 

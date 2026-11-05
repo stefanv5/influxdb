@@ -379,7 +379,7 @@ flowchart TD
 **代码锚点**:
 
 - `store.go:126-176` `ReadFilterLimit`：`missing read source` → `validateArgs`
-  （默认 RP、把 start/end clamp 到 `models.MinNanoTime/MaxNanoTime`）→
+  （默认 RP；仅 `start<=MinNanoTime`/`end>=MaxNanoTime` 才 clamp，**`start=0`/`end=0` 不再兜底为全量**）→
   `findShardIDs(database, rp, false, start, end)` → 空则 `(nil, nil)` →
   `newIndexSeriesCursor` → `NewFilteredResultSet(start, end, cur)`；
 - `store.go:64-105` `findShardIDs`/`validateArgs`；
@@ -559,7 +559,8 @@ sequenceDiagram
 不会为 `web02` 产生空分组（与 §11.4.4 一致）。
 
 **注意**: `Cursor()` 为 nil **不**表示「该 series 无点」。`createCursor`
-（`storage/reads/array_cursor.go:108-146`）只在所有 shard 的 `shard.Next` 都返回 nil 时返回 nil；
+（`storage/reads/array_cursor.go:108-157`）只在所有 shard 的 `shard.Next` 都返回 nil
+（或末次调用返回 `err != nil`）时返回 nil，错误被折叠为「该 series 无数据」；
 无点的 series 会返回**非 nil 的空游标**。真正触发「`gc.Next()` 为 true 而 `Cursor()` 为 nil」的
 情形是 `arrayCursorIterator.Next` 返回 `(nil, nil)`——即 `SeriesRow` 引用的 measurement/field
 不在该 shard 的 fieldset 中（`tsdb/engine/tsm1/array_cursor_iterator.go:41-50`），此时
@@ -823,13 +824,14 @@ func (m *multiShardArrayCursors) createCursor(row SeriesRow) cursors.Cursor {
 
     var shard cursors.CursorIterator
     var cur cursors.Cursor
+    var err error
     for cur == nil && len(row.Query) > 0 {
         shard, row.Query = row.Query[0], row.Query[1:]
-        cur, _ = shard.Next(m.ctx, &m.req)
+        cur, err = shard.Next(m.ctx, &m.req)
     }
 
-    if cur == nil {
-        return nil
+    if cur == nil || err != nil {
+        return nil                       // 错误被折叠为「该 series 无数据」
     }
 
     switch c := cur.(type) {
@@ -1182,7 +1184,7 @@ req := cursors.CursorRequest{
     EndTime:   end - 1,   // CursorRequest 两端都 inclusive
 }
 
-// storage/reads/array_cursor.go:108-118 — createCursor
+// storage/reads/array_cursor.go:118-128 — createCursor
 var shard cursors.CursorIterator
 var cur cursors.Cursor
 var err error
@@ -1197,7 +1199,7 @@ if cur == nil || err != nil {
 
 **结论**: 在 ReadFilter / ReadGroup 路径上，"读失败"与"无数据"不可区分；
 不要写成"错误会通过 `Err()` 返回"。只有 WindowAggregate 路径会把
-`windowAggregateResultSet.err` 传播到 `storage/flux/reader.go:233` 的
+`windowAggregateResultSet.err` 传播到 `storage/flux/reader.go:837` 的
 `return rs.Err()`。
 
 ## 7. TagKeys / TagValues 查询

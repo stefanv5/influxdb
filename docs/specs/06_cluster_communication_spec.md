@@ -2359,7 +2359,7 @@ flowchart TD
 
 > engine 层的 `seriesTypeMap` 冲突只跳过单个 field（`tsdb/engine/tsm1/engine.go:1372-1391`），但正常写入路径已在 shard 层拦下。被丢弃点上已识别的新 field 仍会创建并写入 `fields.idxl`（仅限排在冲突字段之前、已迭代到的 field），因此 `SHOW FIELD KEYS` 可能看到"从未成功写入过数据"的字段。
 
-### 8.6 Field 元数据的"写—压缩—恢复"三泳道
+### 8.6 Field 元数据的"写—压缩—恢复"泳道
 
 ```mermaid
 flowchart TD
@@ -2375,11 +2375,17 @@ flowchart TD
         S4 --> S5["fd.Write + O_SYNC → fields.idxl"]
         S5 --> S6["回执 error 给所有等待方"]
     end
-    subgraph L["启动 / Close / ApplyChanges"]
+    subgraph L["启动：load + ApplyChanges"]
         L1["load fields.idx"] --> L2["ApplyChanges 重放 fields.idxl"]
         L2 --> L3["WriteToFile: tmp → rename → SyncDir"]
         L3 --> L4["remove fields.idxl"]
     end
+    subgraph C["Close / LoadMetadataIndex 重建 / Restore·Import"]
+        C1["Close：changeMgr.Close()（关队列等 SaveWriter）→ WriteToFile"]
+        C2["LoadMetadataIndex 重建 / Restore·Import overlay：直接 WriteToFile（不关队列、不重放）"]
+    end
+    C1 --> L4
+    C2 --> L4
     W4 -.->|"变更入队"| S1
     S6 -.->|"内存已生效"| W4
     S5 -.->|"进程重启后重放"| L2

@@ -5,7 +5,7 @@
 > - OLD：`v1.8.10` = commit `688e697c51`（2021-10-11）
 > - NEW：`v1.12.3` = commit `f3d5cb68ab`（`docs/specs/` 这批文档的代码基准）
 > - 区间：527 commits，602 files，+79,310 / −45,239
-> - NEW 的当前工作树只额外包含 4 个 docs 提交，代码与 `f3d5cb68ab` 相同。
+> - NEW 的当前工作树只额外包含若干 docs 提交（当前 8 个），代码与 `f3d5cb68ab` 相同。
 >
 > 引用格式：旧 `v1.8.10:path:line`，新 `v1.12.3:path:line`（即当前工作树行号）。
 > 新版本行为的详细讲解见 [10 HTTP 服务层](../10_http_service_spec.md)、
@@ -52,10 +52,10 @@
 | 14 | `https-insecure-certificate` | 无此配置；不检查文件权限 | 存在；语义=**忽略证书/私钥文件权限检查** | 权限过宽会启动失败，需显式放行 | `v1.12.3:services/httpd/config.go:53`、`services/httpd/service.go:162`-`:164` |
 | 15 | 证书文件权限检查 | 无 | `VerifyFilePermissivenessF`：证书 ≤0644、私钥 ≤0600 | **升级可能启动失败** | `v1.12.3:pkg/tlsconfig/certconfig.go:120`-`:125`、`pkg/file/file.go:58` |
 | 16 | `/debug/vars` 内容 | system/cmdline/memstats/各服务统计 | 新增 `build`/`crypto`/`config`/`stats`；`cq` 旧版已存在，改为扁平输出（`{name,tags,values}` → `values`） | 诊断能力增强，也扩大泄露面 | `v1.8.10:services/httpd/handler.go:1479` / `v1.12.3:services/httpd/handler.go:2291` |
-| 17 | 压缩吞吐诊断 | 无 | `monitor/stats.go` 注册 `stats` 诊断 | 可观测 compaction 限流占用 | `v1.12.3:monitor/service.go:156`、`monitor/stats.go:9` |
+| 17 | 压缩吞吐诊断 | 无 | `monitor/stats.go` 注册 `stats` 诊断 | 可观测 compaction 限流占用 | `v1.12.3:monitor/service.go:156`、`monitor/stats.go:12-34` |
 | 18 | TSDB 配置诊断 | 无 | `monitor` 注册 `config`（`tsdb.Config`） | `/debug/vars` 可见 3 个新 TSDB 字段 | `v1.12.3:monitor/service.go:164`、`tsdb/config.go:304-306` |
 | 19 | CQ 诊断 | 无 | CQ 服务新增空实现的 `Diagnostics()`（注册名 `cq`，当前不返回诊断值，仅满足 Monitor 接口） | `/debug/vars` 的 `cq` 两版都有，新版只是扁平化 | `v1.12.3:services/continuous_querier/service.go:175`、`cmd/influxd/run/server.go:426` |
-| 20 | Prometheus 协议类型 | 自带 `prometheus/remote`（gogo/protobuf） | 上游 `prompb`（google.golang.org/protobuf） | 线格式不变，字段名 `TimestampMs`→`Timestamp` | `v1.8.10:services/httpd/handler.go:1192` / `v1.12.3:services/httpd/handler.go:1974` |
+| 20 | Prometheus 协议类型 | 自带 `prometheus/remote`（gogo/protobuf） | 上游 `prompb`（仍由 protoc-gen-gogo 生成；influxdb 改用生成方法 `req.Unmarshal`/`resp.Marshal`，不再直接 import gogo 包） | 线格式不变，字段名 `TimestampMs`→`Timestamp` | `v1.8.10:services/httpd/handler.go:1192` / `v1.12.3:services/httpd/handler.go:1974` |
 | 21 | Flux 控制器 | `flux/control`，无内存/并发限制 | `query/control`，并发配额/内存配额/队列/指标 | 资源可控，错误码变化 | `v1.8.10:flux/control/controller.go:73` / `v1.12.3:query/control/controller.go:175` |
 | 22 | Flux 读路径 | `storage/reads/flux_reader.go`，无 window aggregate | `storage/flux/*`，新增 `ReadWindowAggregate` | 下推能力增强 | `v1.8.10:storage/reads/flux_reader.go:30` / `v1.12.3:storage/flux/reader.go:61`、`:85` |
 | 23 | `Store` 接口 | 只有 `ReadFilter` | 增加 `Delete`、`DeleteRetentionPolicy` | V2 删除/桶删除落地 | `v1.8.10:services/httpd/handler.go:2025` / `v1.12.3:services/httpd/handler.go:3088`-`:3092` |
@@ -85,11 +85,11 @@ flowchart TD
 
     MUX --> MW["AddRoutes 包装链<br/>handler.go:514"]
     MW --> REC["recovery"]
-    REC --> LOG["logging"]
+    REC --> LOG["logging（LogEnabled 且该路由 LoggingEnabled）"]
     LOG --> RID["requestID"]
     RID --> CORS["cors"]
     CORS --> OPT{"Method == OPTIONS?"}
-    OPT -->|"是"| OPTR["直接 return（仅 CORS 头，隐式 200；serveOptions 不可达）"]
+    OPT -->|"是"| OPTR["直接 return（隐式 200；CORS 头仅当带 Origin，另有版本/请求 ID 头；serveOptions 不可达）"]
     OPT -->|"否"| HDR["SetHeadersHandler"]
     HDR --> GZ["gzipFilter（Gzipped=true 时）"]
     GZ --> RW["responseWriter"]
@@ -97,10 +97,10 @@ flowchart TD
     TH -->|"是"| THR["writeThrottler.Handler"]
     TH -->|"否"| AUTH
     THR --> AUTH["authenticate（handler 签名带 meta.User 时）"]
-    AUTH --> H1["serveQuery / serveWriteV1 / serveWriteV2<br/>serveDeleteV2 / servePostCreateBucketV2"]
+    AUTH --> H1["serveQuery / serveWriteV1 / serveWriteV2<br/>serveDeleteV2 / servePostCreateBucketV2<br/>serveDeleteBucketV2 / serveRetrieveBucketV2<br/>serveListBucketsV2 / serveUpdateBucketV2"]
     AUTH --> H2["servePromWrite / servePromRead"]
     AUTH --> H3["serveFluxQuery / serveFluxQueryDisabled"]
-    AUTH --> H4["servePing / serveHealth / serveStatus"]
+    AUTH --> H4["servePing / serveHealth / serveStatus<br/>/metrics（promhttp）"]
     H1 --> RESP["Response / httpError"]
     H2 --> RESP
     H3 --> RESP
@@ -179,10 +179,12 @@ Flux 路由 `:287-299`。新版对应 `v1.12.3:services/httpd/handler.go:193-318
 
 关键点：
 
-- 新增路由全部是**兼容面**，没有删除任何旧路由；因此 v1.8.10 的客户端脚本不需要改。三条新增 OPTIONS 路由虽然注册了 `serveOptions`，但每条路由都被 `cors` 包裹，`cors` 在 `r.Method == "OPTIONS"` 时直接 `return`（`v1.12.3:services/httpd/handler.go:2966-2968`），所以实际响应只有 CORS 头。
+- 新增路由全部是**兼容面**，没有删除任何旧路由；因此 v1.8.10 的客户端脚本不需要改。三条新增 OPTIONS 路由虽然注册了 `serveOptions`，但每条路由都被 `cors` 包裹，`cors` 在 `r.Method == "OPTIONS"` 时直接 `return`（`v1.12.3:services/httpd/handler.go:2966-2968`），所以实际响应是**隐式 200**（body 为空）：CORS 头（仅当请求带 `Origin`，`handler.go:2937-2955`）+ 外层 `ServeHTTP` 的 `X-Influxdb-Version`/`X-Influxdb-Build`（`:562-563`）+ `requestID` 的 `X-Request-Id`/`Request-Id`（`:2974-3000`）；路由里的 `serveOptions`（204）不可达。
 - `/api/v2/buckets*` 用 **pat** 风格参数 `:dbrp`，源码用
   `r.URL.Query().Get(":dbrp")` 读取（`v1.12.3:services/httpd/handler.go:1265-1277`、
-  `:1280`、`:1313`、`:1390`），不是 Go 1.22 的 `r.PathValue`。
+  `:1280`、`:1313`、`:1390`），不是 Go 1.22 的 `r.PathValue`。值必须 URL 编码：`pat` 的
+  `matchPart` 遇 `/` 即断段（`bmizerany/pat mux.go:254-286`），`db/rp` 要写成 `db%2Frp`；
+  `try` 随后 `url.QueryUnescape`，handler 拿到的是解码后的值。写原始 `/` 会让路由不匹配（404/405）。
 - `labels/members/owners` 九条路由是"占位拒绝"，返回 405（文案分别为
   `bucket labels/members/owners not supported in this version`，
   `handler.go:1610/1615/1620`），让 Terraform / influx CLI 等 V2 客户端得到明确答案。
@@ -239,9 +241,12 @@ if r.Method == http.MethodPost {
 3. **新增路由的 gzip 全部为 false**：`/api/v2/delete`、`/api/v2/buckets*` 的
    `Route.Gzipped` 都是 `false`（`handler.go:214-273`），响应不压缩。
 4. **CORS 头扩张**：新版 `Access-Control-Allow-Methods` 增加 `PATCH`（`e8f7b78d68`），
-   `Access-Control-Allow-Headers` 增加 `User-Agent`（`0e458e7175`）；这是
-   `/api/v2/buckets` PATCH 与浏览器预检可工作的前提（旧 `v1.8.10:services/httpd/handler.go:1878-1895` /
-   新 `v1.12.3:services/httpd/handler.go:2939-2955`）。
+   `Access-Control-Allow-Headers` 增加 `User-Agent`（`0e458e7175`）（旧 `v1.8.10:services/httpd/handler.go:1878-1895` /
+   新 `v1.12.3:services/httpd/handler.go:2939-2955`）。但 `/api/v2/buckets*` 的 14 条路由
+   （`handler.go:218-273`）与 `POST /api/v2/delete`（`handler.go:214-217`）**都没有 OPTIONS 路由**；`cors` 是路由级包装，`pat` 在 `handlers["OPTIONS"]`
+   未命中后按命中的其他 method 写 `Allow` + **405**（`mux.go:111-138`），请求根本进不到
+   `cors`。因此加 `PATCH` 只让实际响应可带 CORS 头，**浏览器预检仍不可用**；需要为 bucket
+   路由补注册 OPTIONS handler（参照 `/api/v2/write`、`/health`、`/api/v2/query`）。
 
 ### 3.3 认证、JWT 与 pprof 授权
 
@@ -598,6 +603,7 @@ if s.HttpdService != nil {
   （`certconfig.go:394-404`）；`PrepareLoad` 在验证阶段就失败，根本不会替换。
 - **opentsdb 走另一条语义**：不能改路径，只重新加载"当前位置"的证书
   （`server.go:602-614`，`PrepareReloadTLSCertificates`）。
+- **作用域只有 TLS 证书**：`ApplyReloadedConfig` 只收集 `HttpdService.PrepareReloadConfig` 与 `OpenTSDBServices.PrepareReloadTLSCertificates`（`server.go:583-627`）；`httpd.PrepareReloadConfig` 只比较 `https-enabled` 并准备证书闭包（`services/httpd/service.go:296-322`），OpenTSDB 只重载当前位置的证书（`services/opentsdb/service.go:209-212`）。`auth-enabled`、`max-body-size`、`max-concurrent-write-limit`、`[flux-controller]`、`[coordinator]` 等即使被 `LoadConfig` 解析也**不会 apply，且不报错**——改这些必须重启。
 - **同一区间还新增 SIGTERM 查询转储**：收到 SIGTERM 时若 `[coordinator] termination-query-log=true`，
   会把当前查询写入日志（`fd1d51690d` #22638；`cmd/influxd/main.go:91-109`、`cmd/influxd/run/server.go:759`）。
 
@@ -771,6 +777,9 @@ if h.Config.AuthEnabled && h.Config.PromReadAuthEnabled {
 }
 ```
 
+注意：`user==nil` 的 403 只在引导模式（`AdminUserExists()==false`）可达；正常认证开启且已有
+管理员时，无凭据请求在 `authenticate` 阶段就返回 **401**（`handler.go:2847-2853`），到不了这里。
+
 旧版 `servePromRead`（`v1.8.10:services/httpd/handler.go:1248-1372`）的配置里虽然
 有 `prom-read-auth-enabled`，但**函数体完全没有使用它**：只要通过 `authenticate`
 （`AuthEnabled=false` 时连认证都没有），调用者就能读任意 `db`。新版补上了这道
@@ -806,7 +815,7 @@ READ 授权，但仍受开关约束——`prom-read-auth-enabled` 默认 `false`
 
 `decodeQueryRequest` 的两种 Content-Type 处理不变
 （`v1.8.10:services/httpd/flux.go:25-53` / `v1.12.3:services/httpd/flux.go:25-53`），
-`ioutil.ReadAll` → `io.ReadAll` 只是 API 现代化。
+`ioutil.ReadAll` → `io.ReadAll` 只是 API 现代化。注意 `decodeQueryRequest`（调用点 `handler.go:2186`）对 `application/vnd.flux` 直接 `io.ReadAll`、对 JSON 直接 `json.Decoder`，**不经过 `MaxBodySize`**，也不做 `ContentLength` 预检（见 5.3、7.14）。
 
 ### 3.16 `query/control`：Flux 控制器从"薄壳"到"资源管理器"
 
@@ -879,6 +888,10 @@ c.metrics.requests.WithLabelValues(lvs...).Inc()  // label: success/compile_erro
   不是 429/503，客户端只能从 body 文本区分。
 - 控制器由 `cmd/influxd/run/server.go:338-346` 构造，Prometheus collector 在
   服务端启动时注册（不在 `Handler.Open` 里）。
+- **生命周期未接入**：`Controller.Shutdown`（`query/control/controller.go:516-560`）会置 `shutdown`、
+  cancel 在跑查询并 `wg.Wait()`，但 OSS 生产代码**没有调用方**（仅测试）；`httpd.Service.Close`/
+  `Server.Close` 都不调用它。关闭时队列中的查询与 worker goroutine 依赖进程退出，
+  `http.Server.Shutdown` 的 10s 超时是唯一上限（见 7.15）。
 
 ### 3.17 `storage/flux`：Flux 读路径重写
 
@@ -955,7 +968,7 @@ selector 走 `createEmpty`/降序游标优化（`reader.go:689-720`，`isSelecto
    `reads.IsAscendingGroupAggregate` / `IsAscendingWindowAggregate` 决定
    `findShardIDs(..., descending, ...)`（`store.go:195`、`:252`）。这影响
    `last()` 类函数的正确性。
-2. **时间范围下界判定修正**：
+2. **时间范围边界判定修正**：
 
    ```go
    // v1.8.10:services/storage/store.go:100-105
@@ -966,15 +979,16 @@ selector 走 `createEmpty`/降序游标优化（`reader.go:689-720`，`isSelecto
    if end >= models.MaxNanoTime { end = models.MaxNanoTime }
    ```
 
-   旧版把 `end<=0` 当作"未指定"；新版只把 `end>=MaxNanoTime` 归一化，
-   `end=0`（1970-01-01）会被当成真实上界。对一个显式传 `stop=0` 的请求，
-   旧版返回全量、新版返回空——**这是一处真实的行为变化**。省略 `Range`（nil）同样受影响：
-   `GetStart/GetEnd` 返回 0，`[0,0]` 被当作真实区间；旧版值类型零值会被 `end<=0` 兜底为全量。
-   当前生产调用方都显式设置 `Range`，影响面主要是自定义/企业调用方。
+   旧版把 `start<=0`/`end<=0` 都当作"未指定"；新版只归一化 `start<=MinNanoTime`/`end>=MaxNanoTime`，
+   **0 不再被兜底**，三种显式取值都变了：`stop=0` 从"全量"变"空"；`start=0, stop>0` 从"全量"
+   变"1970-01-01 起"（1677–1969 的合法历史点被排除）；`[0,0]` 从"全量"变"空区间"。
+   Prometheus remote read 的 `StartTimestampMs=0`（`v1.12.3:prometheus/converters.go:112-117`）
+   与 Flux `range(start: 0)` 都会命中第二种。省略 `Range`（nil）同样受影响：`GetStart/GetEnd`
+   返回 0，`[0,0]` 被当作真实区间。因此影响面不只是自定义/企业调用方：Prom/Flux 显式传 0 时也命中。
 3. **`GetReadSource` 空指针防护**：`*anypb.Any == nil` 返回 `ErrMissingReadSource`
    （`v1.12.3:services/storage/store.go:28-31`）。旧版各入口各自判 `req.ReadSource == nil`
    并返回 `"missing read source"`（`v1.8.10:services/storage/store.go:110/148/193/268/356`），
-   不会 panic；新版只是把检查集中到一个函数。
+   不会 panic；新版仍保留各入口判空（`:127-129`、`:178-180`、`:235-237`，TagKeys/TagValues 另判 `TagsSource`），只是在 `GetReadSource` 内额外增加 `*anypb.Any == nil` 的集中判定。
 4. **删除能力**：
 
    ```go
@@ -996,17 +1010,26 @@ selector 走 `createEmpty`/降序游标优化（`reader.go:689-720`，`isSelecto
 `POST /api/v2/delete`（`handler.go:975-1111`）流程：
 
 1. `bucket2dbrp(bucket)`，失败 → **404**（注意不是 400）。
-2. 库/RP 不存在 → 404。
+2. 库/RP 不存在 → 404。**RP 只做存在性校验，不参与删除谓词**（`handler.go:986-988`）。
 3. `AuthEnabled` 时：`user==nil` → 403；`AuthorizeWrite(user.ID(), db)` 失败 → 403
-   （复用写权限，**不是**单独 delete 权限）。
+   （复用写权限，**不是**单独 delete 权限）。正常认证开启且已有管理员时，无凭据请求在
+   `authenticate` 就先得到 **401**（`handler.go:2847-2853`）；这里的 `user==nil` 403 只在引导模式
+   （`AdminUserExists()==false`，认证放行 nil 用户）可达。
 4. `ContentLength > MaxBodySize` → 413；读 body / JSON 失败 → 400。
 5. `start`/`stop` 必填且必须是 RFC3339Nano → 否则 400。
 6. 拼接 `predicate AND time >= 'start' AND time < 'stop'`，`influxql.ParseExpr`。
-7. `PartitionExpr` 抽出 `_measurement = 'x'` 作为 `sources`，同时**拒绝**
+7. `PartitionExpr` 抽出 `_measurement = 'x'` 构造 `&influxql.Measurement{Name: ...}`，**不带 `RetentionPolicy`**（`c31e99574f`，`handler.go:1085`），同时**拒绝**
    `!=`、`=~`、`!~`、`OR` → 400。
 8. `fixLiterals` 把双引号值转成字符串字面量（由 `2fe52d8edc` #23247 引入；#25407 的 `e3e9232de5` 只增加 measurement 名去引号，`handler.go:1085`），
-   `srcs` 初始化为 nil（#24145，避免空 WHERE 破坏企业版远程执行）。
+   `srcs` 初始化为 nil（#24145，避免空 WHERE 破坏企业版远程执行）；**无 `_measurement` 时 `srcs=nil`**。
 9. `Store.Delete(db, srcs, remainingExpr)`，失败 → 400。
+
+**删除范围（务必注意）**：`services/storage/store.go:500-502` 直接转 `TSDBStore.DeleteSeries(db, srcs, condition)`；`tsdb/store.go:1697-1714` 的 shard 过滤只固定 `byDatabase(db)`，仅当某个 `Measurement.RetentionPolicy != ""` 才追加 `byRetentionPolicy(rp)`。本端点从不设置该字段，因此：
+
+- `bucket=db/rp` + `_measurement='cpu'` 会删除 **`db` 下所有 RP** 的 `cpu` 数据，RP 只决定 404；
+- predicate 里没有 `_measurement` → `srcs=nil`，`tsdb/store.go:1738-1748` 遍历 shard 内**所有 measurement**，删除整个 `db` 在时间区间内的数据。
+
+若要 bucket 级语义，需把 RP 写进 `Measurement.RetentionPolicy`（并评估 `c31e99574f` 的企业版兼容性）。
 
 历史修复都在新版里：`f365bb7e3a`（nil Sources）、`c31e99574f`（不在 V2 delete 里
 设置 measurement 的 db/rp）、`e3e9232de5`（剥离 measurement 名双引号）。
@@ -1019,7 +1042,8 @@ bucket 端点族（`handler.go:1159-1624`）语义：
 | delete | `AuthorizeDeleteRetentionPolicy`（`:1290`） | `Store.DeleteRetentionPolicy` → `MetaClient.DropRetentionPolicy` | 200 空体 |
 | update | `AuthorizeCreateDatabase`（`:1324`，源码有意复用 create 权限） | `UpdateRetentionPolicy` | 200 + JSON |
 | retrieve | `AuthorizeDatabase(ReadPrivilege, db)`（`:1402`） | `oneBucket` | 200 / 404 |
-| list | 逐库 `AuthorizeDatabase(ReadPrivilege, db)`（`:1512`） | 默认 `limit=100`，`limit<=0` 视为 `MaxInt`；`after` 与 `offset` 互斥 | 200 |
+| list（普通遍历） | 逐库 `AuthorizeDatabase(ReadPrivilege, db)`（`:1512`） | 默认 `limit=100`，`limit<=0` 视为 `MaxInt`；`after` 与 `offset` 互斥 | 200 |
+| list（`?id=` / `?name=` 单桶） | **仅 `user != nil`**（`:1429-1434`）；`oneBucket` 内无任何授权（`:1439-1452/1529-1543`） | 已认证低权用户可读任意 bucket 元数据 | 200 / 404（已知缺口） |
 | labels/members/owners | — | 统一 405，文案分别为 `bucket labels` / `bucket members` / `bucket owners` + `not supported in this version`（`handler.go:1610/1615/1620`） | 405 |
 
 **注意 create 的 body 读取没有 `truncateReader`**，只有
@@ -1061,7 +1085,7 @@ commit `6795ec6c01` 先移除 context-value 反模式，改为显式 tracker，�
 V1 与 V2 的 `default` 分支在旧版都缺 `return`（V1 `v1.8.10:services/httpd/handler.go:874-877`、V2 `:855-858`），新版两处都补上（V1 `:1656-1660`、V2 `:1636-1640`），同一 commit `997698f891` (#21746)。
 
 ```go
-// v1.8.10:services/httpd/handler.go:855-858（V1/V2 同形）
+// v1.8.10:services/httpd/handler.go:855-858（V2；V1 同形但文案为 `use n, u, ms, s, m or h`）
 default:
     err := fmt.Sprintf("invalid precision %q (use ns, us, ms or s)", precision)
     h.httpError(w, err, http.StatusBadRequest)
@@ -1092,7 +1116,8 @@ default:
 | `Open` 后 `Close` 再 `Open` | 可能成功但状态错乱 | 明确报错 `"attempt to Open http service after Close"`（`:155-157`） |
 | listener 归属 | `Close` 总是 `s.ln.Close()` | `tcpServerStarted` 后交给 `httpServer.Shutdown`（`:260-275`） |
 | `BoundHTTPAddr` | 直接 `s.ln.Addr()`（可能 nil panic） | 加 RLock + nil 判断（`:345-353`） |
-| 证书 loader 关闭 | 无（一次性 LoadX509KeyPair） | `tlsManager.Close()` 停巡检 goroutine（`:277-282`） |
+| 证书 loader 关闭 | 无（一次性 LoadX509KeyPair） | `tlsManager.Close()` 停巡检 goroutine（`:277-282`）；但 `Shutdown`/listener `Close` 出错会提前 return 跳过此步，`OnceValue` 不会重试 |
+| `Open` 失败清理 | 不清 access log，无巡检 goroutine | `Handler.Open` 已开 access log（`:159`），`NewTLSConfigManager` 已启动证书巡检 goroutine（`pkg/tlsconfig/certconfig.go:247-274`）；随后 `Listen`/unix socket 设置失败直接 return，未 Close `tlsManager`/listener/access log（`:149-236`），需重启进程 |
 
 **(e) CSV 输出不转义**（#24311）：CSV formatter 生成 tag 列时改用
 `HashKey(false)`（`v1.12.3:services/httpd/response_writer.go:228`，
@@ -1150,6 +1175,12 @@ Flux 内存配额只改变 OOM 的触发方式（从进程崩溃变成查询失�
 `[flux-controller]` 在 `v1.12.3:cmd/influxd/run/config.go:45` 与
 `v1.12.3:query/control/controller.go:71-110`。
 
+> `[flux-controller]` 有互斥/正值校验，违反时 `New` 失败、启动即报错（`query/control/controller.go:112-165`）：
+> `query-concurrency > 0` 时 `query-queue-size` 必须 > 0；`query-concurrency == 0`（不限制）时
+> `query-queue-size` 与 `total-max-memory-bytes` 必须为 0；`query-initial-memory-bytes`/
+> `query-max-memory-bytes` 不得为负（complete 路径要求非 0）；`total-max-memory-bytes` 非 0 时
+> 必须 ≥ `query-concurrency × query-initial-memory-bytes`。
+
 ### 5.2 状态码与错误体变化
 
 | 场景 | v1.8.10 | v1.12.3 | 是否破坏兼容 |
@@ -1172,9 +1203,10 @@ Flux 内存配额只改变 OOM 的触发方式（从进程崩溃变成查询失�
 | `/api/v2/delete` body | 不适用 | 仅 `ContentLength` 预检 | chunked 无上限（`handler.go:1004-1021`） |
 | `/api/v2/buckets` body | 不适用 | 仅 `ContentLength` 预检 | 同上（`handler.go:1160-1173`） |
 | `/api/v1/prom/read` body | 无限制（`io.ReadAll`） | 无限制 | 未改善（`handler.go:2033`） |
+| `/api/v2/query` body | 无限制（`io.ReadAll`） | 无限制 | Flux 与 JSON 都不经过 `MaxBodySize`/`truncateReader`，也不做 `ContentLength` 预检（`handler.go:2186`、`flux.go:25-54`） |
 | 写并发限流 | `/write`、`/api/v1/prom/write` | 同 | `/api/v2/write` 仍未覆盖 |
 | 连接数上限 | `max-connection-limit` | 同 | 超出直接 `Close`，不排队 |
-| 查询取消 | `CloseNotifier` → `closing` | 同 | 仍是 deprecated API |
+| 查询取消 | `CloseNotifier` → `closing`（仅 `/query`） | `/query` 同；Flux 用 `r.Context()`（随连接断开取消）；Prom read 用 `context.Background()`（不随客户端断开） | `/query` 仍是 deprecated API（`handler.go:2192/2097`） |
 | HTTP server 超时 | 无 Read/Write/IdleTimeout | 无 | 两版都只设置 `Handler`（`v1.12.3:services/httpd/service.go:132-134`） |
 
 ### 5.4 升级检查清单
@@ -1186,13 +1218,17 @@ Flux 内存配额只改变 OOM 的触发方式（从进程崩溃变成查询失�
 4. **V2 客户端**：现在可以使用 `/api/v2/delete`、`/api/v2/buckets*`；
    但 labels/members/owners 一律 405。
 5. **SIGHUP 语义变化**：旧版没有注册 SIGHUP handler，Unix 上的默认动作是**终止进程**
-   （且不走优雅关闭）；新版会触发配置重载，**配置写错只会让重载失败并打错误日志**，
-   进程继续用旧配置服务。
+   （且不走优雅关闭）；新版会触发**配置重载**，但**作用域只有 HTTP 与 OpenTSDB 的 TLS 证书**：
+   `ApplyReloadedConfig` 仅收集这两类 apply 闭包（`server.go:583-627`），其余配置项
+   （`auth-enabled`、`max-body-size`、`[flux-controller]`、`[coordinator]` 等）**不会生效，也不报错**。
+   即使证书重载也是两阶段：`LoadConfig`/`PrepareReloadConfig` 验证失败则完全不 apply；
+   apply 阶段单个失败仍继续并 `errors.Join`（失败者保留旧证书）。**改证书以外的配置必须重启**。
 6. **SIGTERM 查询转储**：需要排障时打开 `[coordinator] termination-query-log=true`，
    进程收到 SIGTERM 会把在跑的查询写进日志（`fd1d51690d`）。
 7. **Flux 资源**：如启用 Flux 且希望限制资源，配置
    `[flux-controller]` 的 `query-concurrency`/`query-queue-size`/
-   `query-max-memory-bytes`；不配置则保持旧的"不限制"行为。
+   `query-max-memory-bytes`；不配置则保持旧的"不限制"行为。注意 5.1 的互斥约束，例如
+   `query-concurrency > 0` 必须同时给 `query-queue-size > 0`，否则启动失败。
 
 ---
 
@@ -1226,7 +1262,7 @@ q=SELECT mean(usage_user) FROM cpu WHERE time > now()-1h GROUP BY time(1m),host
 
 1. `serveQuery`（`v1.12.3:services/httpd/handler.go:595`）先校验
    `time_format`（`:635-646`）：`rfc3339` 合法。
-2. `userName := user.ID()`，写入 `ExecutionOptions.UserID`（`:724-737`）。
+2. `userName` 先声明为空，`user != nil` 时 `userName = user.ID()`，写入 `ExecutionOptions.UserID`（`:724-737`）。
 3. 写 200 + Flush（`:793-796`）。
 4. 因为 `timeFormat != "epoch"`，走
    `convertToTimeFormat(r, time.RFC3339Nano)`（`:809-813`），
@@ -1257,7 +1293,7 @@ Content-Length: 120
 
 1. `serveWriteV1` 校验 precision（`v1.12.3:services/httpd/handler.go:1651-1666`）。
 2. `serveWrite` 校验 `database != ""`、库存在、`AuthorizeWrite`。
-3. `body := truncateReader(r.Body, MaxBodySize)`（`:1701-1704`）。
+3. `body := r.Body`；仅当 `h.Config.MaxBodySize > 0` 时 `body = truncateReader(body, int64(h.Config.MaxBodySize))`（`:1701-1704`）。
 4. **gzip 分支覆盖 `body`**（`:1707-1715`）：截断器被丢弃。
    由于 `ContentLength=120` 且小于 25MB，预检通过；解压后如果膨胀到 1GB，
    两版都会照读不误。
@@ -1418,7 +1454,8 @@ sequenceDiagram
    `/write` 与 `/api/v1/prom/write`（`v1.12.3:services/httpd/handler.go:528-535`）。
    V2 写入与 V1 共用 `serveWrite`，因此这是纯粹的保护缺口。
 2. **`/debug/vars`、`/debug/requests` 的认证取决于开关组合**。
-   当 `AuthEnabled=false`，或 `PprofAuthEnabled=false` 时，
+   当 `AuthEnabled=false`、`PprofAuthEnabled=false` 或 `PprofEnabled=false` 时
+   （`/debug/vars`、`/debug/requests` 前缀分支不检查 `PprofEnabled`），
    `ServeHTTP` 的前缀分支直接分发（`handler.go:567-577`），
    新增的 `config`/`crypto` 板块也随之暴露。
 3. **`debug-pprof-enabled` 是第二个暴露面**。它会在 `localhost:6060`
@@ -1453,6 +1490,14 @@ sequenceDiagram
     （`service.go:297-318`），大文件或慢磁盘会短暂阻塞 `Addr()`/`Close()`。
 13. **`https-enabled` 运行中不可改**。这是有意为之，但错误信息只在
     重载日志里出现，容易被忽略。
+14. **`/api/v2/query` 请求体不受 `max-body-size` 限制**。`decodeQueryRequest`
+    对 Flux 直接 `io.ReadAll`、对 JSON 直接 `json.Decoder`（`handler.go:2186`、
+    `flux.go:25-54`），`MaxBodySize` 只在 `/write`、`/api/v1/prom/write` 与
+    V2 delete/buckets 使用（`handler.go:1006/1162/1330/1702/1931`）。
+    Flux 端点应在外层加 `http.MaxBytesReader`。
+15. **Flux 控制器的关停未接线**。`query/control.Controller.Shutdown`
+    （`controller.go:516-560`）无生产调用方；`Server.Close` 只关服务/执行器，
+    队列中的查询与 worker goroutine 依赖进程退出消失。
 
 ---
 

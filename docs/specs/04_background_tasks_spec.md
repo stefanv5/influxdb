@@ -1022,7 +1022,7 @@ func (s *scheduler) limits() (int, int) {
 > **关键设计**: 调度器不是简单的优先级扫描，而是使用**加权优先级**。
 > `queues[i] * weights[i]` 最大的 level 被选中。这意味着即使 Level 1 有任务，
 > 如果 Level 4 有大量积压（queues[3] 很大），Level 4 也可能被选中执行。
-> loLimit/hiLimit 机制确保低优先级不会完全饿死。
+> 注意：当前实现中 `hiLimit` 未被使用（`loLimit, _ := s.limits()` 将其丢弃），`loLimit` 只用于不可达的 `end=2` 分支（上文已说明）；因此它是死代码，不构成对低优先级的实际保护。是否饿死只由加权分数决定。
 
 ### 3.3 优先级抢占
 
@@ -1820,9 +1820,9 @@ MaxTSMFileSize = uint32(2048 * 1024 * 1024) // 2GB
 当输出文件超过 2GB 时，Compactor 会创建新的 TSM 文件继续写入。
 compaction 路径中通过 `tsdb.MaxTSMFileSize` 引用该常量 (如 compact.go 中 `w.Size() > tsdb.MaxTSMFileSize`)。
 
-### 5.4 FileStore.Replace — 原子替换
+### 5.4 FileStore.Replace — 两阶段替换（非原子）
 
-Compaction 完成后，新文件通过 `FileStore.Replace()` 原子替换旧文件。
+Compaction 完成后，新文件通过 `FileStore.Replace()` 替换旧文件。过程分两阶段（锁外准备新 reader、写锁内替换文件列表），但**不是原子操作**：锁内任一步失败即返回，已处理/已关闭的旧文件不回滚，磁盘与内存列表可能短暂不一致。
 
 ```mermaid
 sequenceDiagram
@@ -1856,11 +1856,13 @@ sequenceDiagram
         end
     end
 
-    Note over FS: 步骤 3: 清理和排序
-    FS->>FS: f.lastFileStats = nil (清空缓存)
-    FS->>FS: sort.Sort(tsmReaders(f.files))
-    FS->>FS: 重新计算 DiskBytes
+    Note over FS: 步骤 3: 同步、清理和排序
+    FS->>FS: SyncDir(f.dir) — 失败则返回
     FS->>FS: purger.add(inuse) — 延迟清理 in-use 文件
+    FS->>FS: f.lastFileStats = nil (清空缓存)
+    FS->>FS: f.files = active
+    FS->>FS: sort.Sort(tsmReaders(f.files))
+    FS->>FS: 更新 FileCount / DiskBytes
 ```
 
 ```go
@@ -1877,7 +1879,11 @@ func (f *FileStore) replace(oldFiles, newFiles []string, updatedFn func(r []TSMF
     updated := make([]TSMFile, 0, len(newFiles))
 
     // 步骤 1: 处理新文件
+    tsmTmpExt := fmt.Sprintf("%s.%s", TSMFileExtension, TmpTSMFileExtension)
     for _, file := range newFiles {
+        if !strings.HasSuffix(file, tsmTmpExt) && !strings.HasSuffix(file, TSMFileExtension) {
+            continue
+        }
         // observer 回调: FileFinishing
         if err := f.obs.FileFinishing(file); err != nil {
             return err
@@ -1885,19 +1891,22 @@ func (f *FileStore) replace(oldFiles, newFiles []string, updatedFn func(r []TSMF
 
         // 重命名 .tsm.tmp → .tsm
         var oldName, newName = file, file
-        if strings.HasSuffix(oldName, ".tsm.tmp") {
+        if strings.HasSuffix(oldName, tsmTmpExt) {
             newName = file[:len(file)-4]
             if err := os.Rename(oldName, newName); err != nil {
-                return err
+                return fmt.Errorf("failed renaming %s to %s: %w", oldName, newName, err)
             }
         }
 
         // 打开新文件 (带 WithMadviseWillNeed 选项)
         fd, err := os.Open(newName)
         if err != nil {
-            // 错误回滚: 重命名回原名
+            err = fmt.Errorf("failed opening %s: %w", newName, err)
+            // 错误回滚: 重命名回原名；回滚也失败时用 errors.Join 保留两个错误
             if newName != oldName {
-                os.Rename(newName, oldName)
+                if err1 := os.Rename(newName, oldName); err1 != nil {
+                    return errors.Join(err, fmt.Errorf("failed renaming %s to %s: %w", oldName, newName, err1))
+                }
             }
             return err
         }
@@ -1911,8 +1920,11 @@ func (f *FileStore) replace(oldFiles, newFiles []string, updatedFn func(r []TSMF
 
         tsm, err := NewTSMReader(fd, f.readerOptions...)
         if err != nil {
+            err = fmt.Errorf("failed creating TSMReader for %s: %w", newName, err)
             if newName != oldName {
-                os.Rename(newName, oldName)
+                if err1 := os.Rename(newName, oldName); err1 != nil {
+                    return errors.Join(err, fmt.Errorf("failed renaming %s to %s: %w", oldName, newName, err1))
+                }
             }
             return err
         }
@@ -1933,25 +1945,49 @@ func (f *FileStore) replace(oldFiles, newFiles []string, updatedFn func(r []TSMF
                 keep = false
 
                 // observer 回调: FileUnlinking
-                f.obs.FileUnlinking(file.Path())
+                if err := f.obs.FileUnlinking(file.Path()); err != nil {
+                    return err
+                }
+                if ts := file.TombstoneStats(); ts.TombstoneExists {
+                    if err := f.obs.FileUnlinking(ts.Path); err != nil {
+                        return err
+                    }
+                }
 
                 // 处理正在被查询使用的文件
                 if file.InUse() {
                     // 重命名为临时路径，延迟清理
-                    tempPath := file.Path() + ".tmp"
-                    file.Rename(tempPath)
+                    tempPath := fmt.Sprintf("%s.%s", file.Path(), TmpTSMFileExtension)
+                    if err := file.Rename(tempPath); err != nil {
+                        return fmt.Errorf("failed renaming open TSM file to %s: %w", tempPath, err)
+                    }
+                    // tombstone 立即删除（不能走 TSMReader.Remove：reader 已指向临时路径）
+                    if ts := file.TombstoneStats(); ts.TombstoneExists {
+                        if err := os.Remove(ts.Path); err != nil {
+                            return fmt.Errorf("failed removing old file %s: %w", ts.Path, err)
+                        }
+                    }
                     inuse = append(inuse, file)
                     continue
                 }
 
-                file.Close()
-                file.Remove()
+                if err := file.Close(); err != nil {
+                    return fmt.Errorf("failed to close TSM file %s: %w", file.Path(), err)
+                }
+                if err := file.Remove(); err != nil {
+                    return fmt.Errorf("failed to remove TSM file %s: %w", file.Path(), err)
+                }
                 break
             }
         }
         if keep {
             active = append(active, file)
         }
+    }
+
+    // 同步目录；失败会在 f.files=active 之前返回（file 是 pkg/file 包，不是循环变量）
+    if err := file.SyncDir(f.dir); err != nil {
+        return fmt.Errorf("failed to sync directory %s: %w", f.dir, err)
     }
 
     // 告诉 purger 延迟清理 in-use 文件
@@ -1967,9 +2003,22 @@ func (f *FileStore) replace(oldFiles, newFiles []string, updatedFn func(r []TSMF
     f.lastFileStats = nil
     f.files = active
     sort.Sort(tsmReaders(f.files))
+    atomic.StoreInt64(&f.stats.FileCount, int64(len(f.files)))
+
     // 重新计算磁盘大小统计
+    var totalSize int64
+    for _, file := range f.files {
+        totalSize += int64(file.Size())
+        if ts := file.TombstoneStats(); ts.TombstoneExists {
+            totalSize += int64(ts.Size)
+        }
+    }
+    atomic.StoreInt64(&f.stats.DiskBytes, totalSize)
+    return nil
 }
 ```
+
+**失败语义**：锁内任一步（`FileUnlinking`、in-use `Rename`、tombstone `Remove`、`Close`、`Remove`、`SyncDir`）返回错误即直接退出，**已关闭/删除/改名的旧文件不会回滚**，`f.files = active`、`FileCount`/`DiskBytes` 更新均未执行；内存列表保持旧值（其中部分 reader 可能已被 `Close/Remove`，`ReadBytes` 返回 `ErrTSMClosed`），磁盘上可能留下孤儿 `.tsm`，需重启重扫目录。这与主 16 §2.6 一致，也是 04 diff §3.15 的结论；两阶段中只有“新文件准备”在锁外。
 
 ## 6. 时间线数据合并 — tsmBatchKeyIterator 从原始 block 到归并输出
 

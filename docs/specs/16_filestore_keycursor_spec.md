@@ -447,15 +447,16 @@ sequenceDiagram
         FS->>FS: obs.FileUnlinking(file.Path())
         alt file.InUse() — 有查询正在使用
             FS->>Old: Rename(file → file.tmp)
-            FS->>Purger: add(old) — 延迟清理
+            FS->>FS: 加入 inuse 切片
         else 无查询使用
             FS->>Old: Close() + Remove()
         end
     end
 
-    FS->>FS: files = active
+    FS->>FS: SyncDir(f.dir)
+    FS->>Purger: add(inuse) — 整批延迟清理
+    FS->>FS: lastModified / lastFileStats=nil / files = active / FileCount / DiskBytes
     FS->>FS: sort.Sort(files)
-    FS->>FS: lastFileStats = nil
     FS->>FS: mu.Unlock()
 ```
 
@@ -506,7 +507,7 @@ func (p *purger) purge(fileNames []string) {
     p.running = true
 
     go func() {
-        // hasFiles() 在加锁状态下检查 files.Len()；若为空则把 running 置回 false
+        // hasFiles() 在加锁状态下用 Range 探测 files 是否非空；若为空则把 running 置回 false
         // 再返回。这保证了 add() 检查 running 与 goroutine 退出之间没有竞态。
         for p.hasFiles() {
             // 通过 Range 遍历并发安全 map
@@ -531,7 +532,7 @@ func (p *purger) purge(fileNames []string) {
 >   `add()` 写入和后台 goroutine 遍历/删除可以并发进行，无需持锁遍历。
 > - `mu sync.Mutex` 只保护 `running` 标志，不保护 `files`。`purge()` 持锁检查并设置
 >   `running`，然后释放锁启动 goroutine；goroutine 内部不再持有 `mu`。
-> - `hasFiles()` 实现了 running-flag 协议：它在加锁状态下检查 `files.Len()`，若为空
+> - `hasFiles()` 实现了 running-flag 协议：它在加锁状态下用 `Range` 探测 map 是否非空（避免 `Len()` 全量遍历），若为空
 >   则先把 `running` 置回 `false` 再返回，避免 `add()` 在 goroutine 退出瞬间漏掉新文件。
 > - Close/Remove 失败的文件也会被 `Delete(k)` 移除——文件已被关闭或遇到 OS 问题，
 >   重试无益。
@@ -1366,7 +1367,7 @@ LOOP:
 }
 ```
 
-**metrics 计数**: 每解码一个数组 block，同样增加 `float_blocks_decoded` 和 `float_blocks_size_bytes`；发生归并时统计 `float_blocks_merge_duration`、`float_blocks_merge_count`、`float_blocks_merge_values_count`，当单次读取归并次数超过 4 时增加 `float_blocks_merge_over4_count`。
+**metrics 计数**: 每解码一个数组 block，同样增加 `float_blocks_decoded` 和 `float_blocks_size_bytes`；发生归并时统计 `float_blocks_merge_duration`、`float_blocks_merge_count`、`float_blocks_merge_values_count`，当单次读取归并次数超过 4 时增加 `float_blocks_merge_over4_count`。这些 merge 指标通过 tracing span/`pkg/metrics.Timer` 记录，**不在 `/debug/vars` 暴露**。
 
 #### 3.9.1 数组变体的原地修改语义与 `*values = *v` 指针交换
 

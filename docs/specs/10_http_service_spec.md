@@ -323,8 +323,9 @@ h.AddRoutes([]Route{
 
 > **注**: bucket 路由族用 `:dbrp` 路径参数承载 `database/retentionPolicy` 映射；
 > labels/members/owners 系列在 OSS 单机版统一返回 "not allowed"，仅用于 V2 API 形态兼容。
-> `OPTIONS /health` 与 `OPTIONS /query`、`OPTIONS /write` 一样走 `serveOptions`，
-> 不经过 `authWrapper`，由 CORS 中间件直接短路返回。
+> `OPTIONS /health` 与 `OPTIONS /query`、`OPTIONS /write` 的路由注册为 `serveOptions`，
+> 但 `cors` 在 `r.Method == "OPTIONS"` 时直接 `return`（handler.go:2966-2968），`serveOptions` 实际不可达；
+> 响应由 `cors` 短路产生（隐式 200，不经过 `authWrapper`）。
 
 > `Route` 的两个布尔字段只控制 gzip 和访问日志。认证不能从这两个布尔值推断，
 > 而是由 handler 签名、全局 auth 配置、endpoint-specific auth 配置和包装器共同决定。
@@ -744,11 +745,11 @@ func NewResponseWriter(w http.ResponseWriter, r *http.Request) ResponseWriter {
 | `text/csv` | `text/csv` | `csvFormatter` | CSV 格式 |
 | `application/x-msgpack` | `application/x-msgpack` | `msgpackFormatter` | MessagePack 二进制格式 |
 
-#### 3.3.8 writeThrottler — 写入限流 (handler.go:2086)
+#### 3.3.8 writeThrottler — 写入限流 (handler.go:3151)
 
 （详见第 7 节）
 
-#### 3.3.9 authenticate — 认证中间件 (handler.go:1776)
+#### 3.3.9 authenticate — 认证中间件 (handler.go:2837)
 
 （详见第 6 节）
 
@@ -1023,7 +1024,9 @@ flowchart TD
     G2 --> G3["200 + JSON"]
 
     L["GET /api/v2/buckets"] --> L1{"id/name 互斥?"}
-    L1 --> L2{"after 与 offset 互斥?"}
+    L1 -->|"指定 id/name"| L5["oneBucket<br/>（仅 user != nil，无 AuthorizeDatabase）"]
+    L5 --> L6["sendBuckets → 200 / 404"]
+    L1 -->|"未指定"| L2{"after 与 offset 互斥?"}
     L2 --> L3["逐 db AuthorizeDatabase 过滤"]
     L3 --> L4["sendBuckets → 200"]
 ```
@@ -1043,15 +1046,22 @@ flowchart TD
 
 **列表分支**（`handler.go:1445-1528`）: `limit` 默认 100，`limit <= 0` 视为 `math.MaxInt`；
 `after` 与 `offset` 互斥；`id` 与 `name` 同时给出且不同 → 400；`after` 找不到 → 404；
-输出前逐个 db 做 `ReadPrivilege` 过滤，无权限的 db 整段跳过。
+输出前逐个 db 做 `ReadPrivilege` 过滤，无权限的 db 整段跳过。**例外**：`?id=` / `?name=`
+走 `oneBucket` 快速路径（`handler.go:1439-1452`），只校验 `user != nil`，没有
+`AuthorizeDatabase`——这是已知授权缺口，与普通遍历的逐库过滤不同。
 
 > **易错点**: `:dbrp` 是 **pat** 风格路径参数，源码用 `r.URL.Query().Get(":dbrp")` 读取
 > （`handler.go:1280/1313/1390`），不是 Go 1.22 的 `r.PathValue`。
 
 **错误码总表**: 200（删除/更新/检索/列表成功）、201（创建成功）、400（JSON、dbrp 格式、
-RP 冲突、非法名字、body 超限以外的读错误、meta 操作失败）、403（认证开启时无用户或无权限）、
+RP 冲突、非法名字、body 超限以外的读错误、meta 操作失败）、401（认证开启且已有管理员时无凭据/凭据错误）、
+403（认证开启但无权限；引导模式下 handler 内 `user==nil` 的 403）、
 404（删除时的库/RP 不存在、`oneBucket` 找不到、`after` 不存在）、405（labels/members/owners）、
 413（ContentLength 超限）。
+
+> **无 OPTIONS 路由**：14 条 `/api/v2/buckets*` 路由（`handler.go:218-273`）只注册了 POST/DELETE/GET/PATCH。
+> `pat` 对未命中的 OPTIONS 直接返回 405（`Allow` 列出其他 method），不会进入路由级 `cors`，
+> 因此浏览器预检拿不到 `Access-Control-Allow-*`，`PATCH /api/v2/buckets/:dbrp` 的跨域预检不可用。
 
 ## 5. 查询请求全链路
 
@@ -1420,6 +1430,11 @@ sequenceDiagram
     Del-->>Client: 200 空体
 ```
 
+> **删除范围**：RP 只用于 404 校验，不进入删除谓词。`srcs` 里的 `Measurement` 不带 `RetentionPolicy`
+> （`c31e99574f`），`TSDBStore.DeleteSeries` 只按 database 过滤 shard；因此 `bucket=db/rp` +
+> `_measurement='cpu'` 会删除 `db` 下所有 RP 的 `cpu`，predicate 不含 `_measurement` 时 `srcs=nil`
+> 会删除 `db` 内所有 measurement（`tsdb/store.go:1697-1714/1738-1748`）。
+
 **谓词白名单**（`handler.go:1064-1097`）:
 
 | 谓词形态 | 处理 |
@@ -1438,7 +1453,8 @@ sequenceDiagram
 | `stop` | body | 必填，RFC3339Nano |
 | `predicate` | body | 可选；只允许等值与 AND |
 
-**错误码**: 400（JSON/时间格式/谓词解析/`Store.Delete` 失败）、403（无用户或无写权限）、
+**错误码**: 400（JSON/时间格式/谓词解析/`Store.Delete` 失败）、401（认证开启且已有管理员时无凭据/凭据错误）、
+403（认证开启但无写权限；引导模式下 handler 内 `user==nil` 的 403）、
 404（bucket 格式、库或 RP 不存在）、413（body 超限）、200（成功且无响应体）。
 
 > **易错点**: `_measurement = 'x'` 不是普通标签条件，而是被提升为 source；因此同一个
@@ -1714,7 +1730,7 @@ func (t *Throttler) Handler(h http.Handler) http.Handler {
 ### 7.4 限流器应用范围
 
 ```go
-// services/httpd/handler.go:429 — 仅对写入端点限流
+// services/httpd/handler.go:528-535 — 仅对写入端点限流
 if r.Method == http.MethodPost {
     switch r.Pattern {
     case "/write", "/api/v1/prom/write":
@@ -2354,7 +2370,7 @@ current channel (容量 = concurrent)
 ### 14.1 /api/v2/write 未被限流
 
 ```go
-// handler.go:429 — 仅对 /write 和 /api/v1/prom/write 限流
+// handler.go:528-535 — 仅对 /write 和 /api/v1/prom/write 限流
 if r.Method == http.MethodPost {
     switch r.Pattern {
     case "/write", "/api/v1/prom/write":

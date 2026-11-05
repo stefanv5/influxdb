@@ -158,7 +158,7 @@ sequenceDiagram
         Watcher->>Client: 13 WaitForDataChanged()
         Note over Watcher: 阻塞在 changed channel 上
         Note over Client: commit() 中 close(changed) 唤醒
-        Watcher->>Client: 14 重新读取最新 cacheData
+        Watcher->>Client: 14 updateSubs() 重建订阅路由
     end
 ```
 
@@ -240,27 +240,27 @@ func (c *Client) CreateDatabase(name string) (*DatabaseInfo, error) {
 
 | 方法 | 行号 | 操作 | 幂等性 |
 |------|------|------|--------|
-| `CreateDatabase` | 171 | 添加 DatabaseInfo | 已存在返回已有 DatabaseInfo |
-| `DropDatabase` | 270 | 移除 DB + 清理用户权限 | 不存在返回 nil (无 error) |
-| `CreateRetentionPolicy` | 288 | 添加 RP 到 DB | 同名且 `ReplicaN/Duration/ShardGroupDuration` 全等 → nil；否则 `ErrRetentionPolicyExists`；`makeDefault=true` 且当前默认 RP 不是它 → `ErrRetentionPolicyConflict` |
-| `DropRetentionPolicy` | 324 | 移除 RP | 不存在返回 nil (无 error) |
-| `UpdateRetentionPolicy` | 342 | 更新 RP 字段 | 使用指针的零值判断 |
-| `CreateShardGroup` | 708 | 创建 ShardGroup + Shard | 已存在返回 nil |
-| `DeleteShardGroup` | 760 | 设置 DeletedAt (软删除) | 不存在返回 error |
-| `DropShard` | 662 | 移除 Shard | Data 层 `DropShard(id)` 无返回值；找不到 shard 静默成功，最后一个 Shard 时标记组删除 |
-| `CreateContinuousQuery` | 860 | 添加 CQ 到 DB | 查询相同时幂等 (忽略大小写)，不同查询返回 ErrContinuousQueryExists |
-| `DropContinuousQuery` | 878 | 移除 CQ | 不存在返回 nil (无 error) |
-| `CreateSubscription` | 896 | 添加 Subscription 到 RP | 已存在返回 ErrSubscriptionExists |
-| `DropSubscription` | 914 | 移除 Subscription | 不存在返回 error |
-| `CreateUser` | 409 | 添加 UserInfo | 同名且密码/admin 相同才返回已有用户；同名但密码或 admin 不同返回 `ErrUserExists` |
-| `DropUser` | 465 | 移除 User + 更新 adminUserExists | 不存在返回 error |
-| `UpdateUser` | 443 | 更新密码 hash | 不存在返回 error |
-| `SetPrivilege` | 483 | 设置 per-DB 权限 | — |
-| `SetAdminPrivilege` | 501 | 切换 admin 标志 | — |
-| `TruncateShardGroups` | 672 | 设置 TruncatedAt | — |
-| `PruneShardGroups` | 682 | 移除已过期且 `Shards` 为空的软删除 ShardGroup | 无变更时跳过 commit |
-| `PrecreateShardGroups` | 781 | 预创建即将到期的 ShardGroup | 避免写入时创建延迟 |
-| `CreateDatabaseWithRetentionPolicy` | 214 | 创建 DB + 指定 RP | RP 冲突返回 error |
+| `CreateDatabase` | 170 | 添加 DatabaseInfo | 已存在返回已有 DatabaseInfo |
+| `DropDatabase` | 268 | 移除 DB + 清理用户权限 | 不存在返回 nil (无 error) |
+| `CreateRetentionPolicy` | 286 | 添加 RP 到 DB | 同名且 `ReplicaN/Duration/ShardGroupDuration` 全等 → nil；否则 `ErrRetentionPolicyExists`；`makeDefault=true` 且当前默认 RP 不是它 → `ErrRetentionPolicyConflict` |
+| `DropRetentionPolicy` | 322 | 移除 RP | 不存在返回 nil (无 error) |
+| `UpdateRetentionPolicy` | 340 | 更新 RP 字段 | 使用指针的零值判断 |
+| `CreateShardGroup` | 693 | 创建 ShardGroup + Shard | 已存在返回 nil |
+| `DeleteShardGroup` | 745 | 设置 DeletedAt (软删除) | 不存在返回 error |
+| `DropShard` | 660 | 移除 Shard | Data 层 `DropShard(id)` 无返回值；找不到 shard 静默成功，最后一个 Shard 时标记组删除 |
+| `CreateContinuousQuery` | 845 | 添加 CQ 到 DB | 查询相同时幂等 (忽略大小写)，不同查询返回 ErrContinuousQueryExists |
+| `DropContinuousQuery` | 863 | 移除 CQ | 不存在返回 nil (无 error) |
+| `CreateSubscription` | 881 | 添加 Subscription 到 RP | 已存在返回 ErrSubscriptionExists |
+| `DropSubscription` | 899 | 移除 Subscription | 不存在返回 error |
+| `CreateUser` | 407 | 添加 UserInfo | 同名且密码/admin 相同才返回已有用户；同名但密码或 admin 不同返回 `ErrUserExists` |
+| `DropUser` | 463 | 移除 User + 更新 adminUserExists | 不存在返回 error |
+| `UpdateUser` | 441 | 更新密码 hash | 不存在返回 error |
+| `SetPrivilege` | 481 | 设置 per-DB 权限 | — |
+| `SetAdminPrivilege` | 499 | 切换 admin 标志 | — |
+| `TruncateShardGroups` | 670 | 设置 TruncatedAt | — |
+| `PruneShardGroups` | 680 | 移除已过期且 `Shards` 为空的软删除 ShardGroup | 无变更时跳过 commit |
+| `PrecreateShardGroups` | 766 | 预创建即将到期的 ShardGroup | 避免写入时创建延迟 |
+| `CreateDatabaseWithRetentionPolicy` | 212 | 创建 DB + 指定 RP | RP 冲突返回 error |
 
 **Client commit 语义注意**: 上表中的“Data 层不存在返回 nil”不等于 Client 层一定跳过提交。例如 `Client.DropRetentionPolicy` 和 `Client.DropContinuousQuery` 会先 `data := c.cacheData.Clone()`，调用对应 `data.Drop...()`；只要没有错误，随后仍会执行 `c.commit(data)`。因此即使目标 RP/CQ 不存在、Data 内容没有实际变化，`commit()` 仍会递增 `Data.Index`、写入 `meta.db` 并广播 `changed`。
 
@@ -588,18 +588,18 @@ func (rpi RetentionPolicyInfo) clone() RetentionPolicyInfo {
 **深拷贝层级**:
 
 ```
-Data.Clone()  [data.go:683, 导出, 指针接收者]
-├── CloneDatabases() → DatabaseInfo.clone() × N  [data.go:965, 非导出, 值接收者]
-│   ├── RetentionPolicyInfo.clone() × M  [data.go:1237, 非导出, 值接收者]
-│   │   ├── ShardGroupInfo.clone() × K  [data.go:1352, 非导出, 值接收者]
+Data.Clone()  [data.go:759, 导出, 指针接收者]
+├── CloneDatabases() → DatabaseInfo.clone() × N  [data.go:1041, 非导出, 值接收者]
+│   ├── RetentionPolicyInfo.clone() × M  [data.go:1347, 非导出, 值接收者]
+│   │   ├── ShardGroupInfo.clone() × K  [data.go:1462, 非导出, 值接收者]
 │   │   │   └── ShardInfo.clone() (深拷贝 Owners)
 │   │   └── SubscriptionInfo (浅拷贝 — 值拷贝 struct)
-│   └── ContinuousQueryInfo.clone() [data.go:1560, 非导出, 值接收者, 仅有 string 字段]
-└── CloneUsers() → UserInfo.clone() × N  [data.go:1635, 非导出, 值接收者]
+│   └── ContinuousQueryInfo.clone() [data.go:1670, 非导出, 值接收者, 仅有 string 字段]
+└── CloneUsers() → UserInfo.clone() × N  [data.go:1755, 非导出, 值接收者]
     └── Privileges map (深拷贝)
 ```
 
-**为什么需要深拷贝？** 写操作在副本上修改，不影响已经拿到旧版本 `cacheData` 的 goroutine。注意这不是“无锁读”：Client 的读方法仍会 `RLock()`，Copy-on-Write 的作用是让读锁内取到的快照在写方 commit/swap 之后仍然稳定。
+**为什么需要深拷贝？** 写操作在副本上修改，不影响已经拿到旧版本 `cacheData` 的 goroutine。注意这不是“无锁读”：Client 的读方法仍会 `RLock()`，Copy-on-Write 的作用是让读锁内取到的快照在写方 commit/swap 之后仍然稳定。**例外是 `Subscriptions`**：`RetentionPolicyInfo.clone()` 只深拷贝 `ShardGroups`，`DropSubscription` 用 `append(s[:i], s[i+1:]...)` 原地搬移共享底层数组，因此 `DROP SUBSCRIPTION` 会改动旧快照，且 `snapshot` 失败时内存与磁盘会分叉（详见 [v1.8.10-vs-v1.12.3/05](../v1.8.10-vs-v1.12.3/05_meta_background_diff.md) 7.13）。
 
 #### 步骤 6: Data 上的变更方法
 
@@ -1552,21 +1552,22 @@ sequenceDiagram
     Note over Client: 恢复流程 (MetaStoreUpdate)
 
     Client->>TCP: ⑨ 建立连接, 发送 RequestMetaStoreUpdate 类型字节
-    Client->>TCP: ⑩ 发送元数据 (protobuf Data) + JSON Request
-    TCP->>SnapSvc: 读取元数据
+    Client->>TCP: ⑩ 发送 JSON Request（json.Encoder，含 UploadSize）
+    Client->>TCP: ⑪ 发送元数据 payload（protobuf Data，UploadSize 字节）
+    TCP->>SnapSvc: readRequest 先解码 JSON，再按 UploadSize 读取 Data
 
     SnapSvc->>SnapSvc: md.UnmarshalBinary(bits)
-    SnapSvc->>Meta: ⑪ data.ImportData(md, ...) — 合并非替换!
+    SnapSvc->>Meta: ⑫ data.ImportData(md, ...) — 合并非替换!
     Note over Meta: ImportData 返回 IDMap + newDBs
-    SnapSvc->>Meta: ⑫ ossClient.SetData(&data) — Clone + commit
-    SnapSvc->>TSDB: ⑬ createNewDBShards — 为新 DB 创建 Shard
-    SnapSvc->>TCP: ⑭ respondIDMap(IDMap) — [MagicHeader, npairs, (old,new)*]
+    SnapSvc->>Meta: ⑬ ossClient.SetData(&data) — Clone + commit
+    SnapSvc->>TSDB: ⑭ createNewDBShards — 为新 DB 创建 Shard
+    SnapSvc->>TCP: ⑮ respondIDMap(IDMap) — [MagicHeader, npairs, (old,new)*]
 
     Note over Client: 客户端按 IDMap 把旧 shard ID 映射到新 ID
-    Client->>TCP: ⑮ 对每个旧 shard 发 RequestShardUpdate (sid + tar)
+    Client->>TCP: ⑯ 对每个旧 shard 发 RequestShardUpdate (sid + tar)
     TCP->>TSDB: updateShardsLive — SetShardEnabled(false) → RestoreShard → defer 启用
 
-    TSDB->>TSDB: ⑯ 重新打开受影响的 Shard
+    TSDB->>TSDB: ⑰ 重新打开受影响的 Shard
     Note over TSDB: Shard.Open() → 加载新 TSM 文件<br>重建内存索引
 ```
 
@@ -1696,6 +1697,9 @@ func (s *Service) updateMetaStore(conn net.Conn, bits []byte, ...) error {
 **恢复关键路径**:
 - 元数据恢复不是直接用备份覆盖当前 `cacheData`；`updateMetaStore` 先 `ossClient.Data()` 取得当前 Data，再通过 `ImportData` 合并备份元数据，最后 `SetData(&data)` 提交合并后的快照并由 `snapshot()` 持久化到 `meta.db`
 - 成功时 `updateMetaStore` 在 `SetData` + `createNewDBShards` 之后调用 `respondIDMap(IDMap)`（`services/snapshotter/service.go:219`）；反序列化失败（`:184-189`）、非 OSS（`:191-197`）、`ImportData` 失败（`:201-207`）这三个显式错误分支会先发空 map（npairs=0）。**注意**：`SetData` 失败（`:209-212`）与 `createNewDBShards` 失败（`:214-217`）直接 return，不发送 IDMap，客户端收到的是空响应，报 `updating metadata on influxd service failed`（`services/snapshotter/client.go:53-56`），而不是 `DB metadata not changed`
+- **半完成态**：`SetData` 成功即已 commit 到 `meta.db`，若随后 `createNewDBShards` 失败，服务端不发 IDMap；
+  客户端重试时 `ImportData → importOneDB` 会因目标库已存在返回 `database already exists`
+  （`services/meta/data.go:916`），只回空 IDMap，恢复流程卡死，只能人工清理已导入的库/元数据后重试
 - 已存在的 shard 走 `RequestShardUpdate → updateShardsLive`：`SetShardEnabled(false)` → `RestoreShard` → `defer SetShardEnabled(true)`（`service.go:166-179`），不需要新建 shard
 - Shard 数据恢复是文件级别的复制，将 TSM 文件写入对应的 Shard 目录
 - 恢复后需要重新打开 Shard 以加载新的 TSM 文件并重建内存索引

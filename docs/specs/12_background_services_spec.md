@@ -324,19 +324,19 @@ sequenceDiagram
         Ticker->>Run: ticker.C 触发
 
         Note over Run: === Phase 1: 识别过期 ShardGroup ===
-        Run->>Meta: Databases() → 获取所有数据库
-        loop 每个 Database
-            loop 每个 RetentionPolicy
-                Run->>Meta: r.DeletedShardGroups()
-                Meta-->>Run: 已软删除的 ShardGroup 列表
-                Note over Run: 收集已删除 ShardGroup 的 Shard ID
-
-                Run->>Meta: r.ExpiredShardGroups(now)
-                Meta-->>Run: 过期的 ShardGroup 列表
-                loop 每个过期 ShardGroup
-                    Run->>Meta: DeleteShardGroup(db, rp, g.ID)
-                    Note over Meta: 设置 DeletedAt = now<br/>这是软删除，不是物理删除
-                    Note over Run: 收集新删除 ShardGroup 的 Shard ID
+        Run->>Meta: Databases() → 获取所有数据库（内存快照）
+        Meta-->>Run: []DatabaseInfo
+        loop 每个 Database / RetentionPolicy
+            Note over Run: r.DeletedShardGroups()（本地内存方法，无 RPC）
+            Note over Run: 收集已软删除 ShardGroup 的 Shard ID
+            Note over Run: r.ExpiredShardGroups(now)（本地内存方法，无 RPC）
+            loop 每个过期 ShardGroup
+                Run->>Meta: DeleteShardGroup(db, rp, g.ID)
+                Note over Meta: 设置 DeletedAt = now<br/>这是软删除，不是物理删除
+                alt 失败
+                    Run->>Run: retryNeeded = true，不收集该组 shard
+                else 成功
+                    Run->>Run: 收集新删除 ShardGroup 的 Shard ID
                 end
             end
         end
@@ -347,25 +347,38 @@ sequenceDiagram
             alt Shard ID 在 deletedShardIDs 中
                 Run->>TSDB: SetShardNewReadersBlocked(id, true)
                 Run->>TSDB: ShardInUse(id)
-                alt 仍有 reader 使用
-                    Run->>TSDB: SetShardNewReadersBlocked(id, false)
+                alt 闸门 / InUse 自身失败（非 NotFound）
+                    Run->>TSDB: SetShardNewReadersBlocked(id, false)（defer）
+                    Run->>Run: retryNeeded = true，下轮重试
+                else 仍有 reader 使用
+                    Run->>TSDB: SetShardNewReadersBlocked(id, false)（defer）
                     Note over Run: 本轮跳过，等待下次检查
                 else 没有 reader 使用
                     Run->>TSDB: DeleteShard(id)
                     TSDB->>Disk: 删除 Shard 文件和 WAL
-                    Run->>Meta: DropShardMetaRef(id, owners)
+                    alt 返回 ErrShardNotFound（本地已无该 shard，含并发删除）
+                        Note over Run: 不算失败，继续摘 meta 引用
+                        Run->>Meta: DropShardMetaRef(id, owners)
+                    else 返回其他错误（非 NotFound）
+                        Run->>TSDB: SetShardNewReadersBlocked(id, false)（defer）
+                        Run->>Run: retryNeeded = true；下轮由 phantom 分支摘引用
+                    else 删除成功
+                        Run->>Meta: DropShardMetaRef(id, owners)
+                    end
                 end
             end
         end
         loop deletedShardIDs 中剩余的 shard
-            alt metadata 引用但本地不存在 (phantom shard)
-                Run->>Meta: DropShardMetaRef(id, owners)
+            alt 已软删除/已过期组里、本地 ShardIDs() 没有的 shard
+                alt isOSS() 或 owners 含本节点
+                    Run->>Meta: DropShardMetaRef(id, owners)
+                end
             end
         end
 
         Note over Run: === Phase 3: 修剪元数据 ===
         Run->>Meta: PruneShardGroups()
-        Note over Meta: 删除 DeletedAt > 14 天且 Shards 为空的 ShardGroup 元数据
+        Note over Meta: 删除 DeletedAt 早于 now-14 天且 Shards 为空的 ShardGroup 元数据
 
         Note over Run: === Phase 4: 错误处理 ===
         alt 有错误发生
@@ -575,7 +588,7 @@ for id, info := range deletedShardIDs {
 ```go
 // services/retention/service.go:302-309 — Phase 3
 if err := s.MetaClient.PruneShardGroups(); err != nil {
-    log.Info("Problem pruning shard groups", zap.Error(err))
+    log.Error("Error pruning shard groups", zap.Error(err))
     retryNeeded = true
 }
 ```
@@ -1250,8 +1263,8 @@ stateDiagram-v2
     Active --> SoftDeleted: DeleteShardGroup 设置 DeletedAt
     Expired --> SoftDeleted: DeleteShardGroup 设置 DeletedAt
     Active --> SoftDeleted: DropShard 删除组内最后一个 shard
-    SoftDeleted --> Created: 旧时间戳再次写入 / CreateShardGroup 新建组
-    SoftDeleted --> Pruned: 组内无 shard 且 DeletedAt 超过 14 天
+    SoftDeleted --> Created: 旧时间戳再次写入 → CreateShardGroup 新建另一个组（新 ID）
+    SoftDeleted --> Pruned: 组内无 shard 且 DeletedAt 早于 now-14 天
     Pruned --> [*]
 
     note right of Created
@@ -1263,6 +1276,8 @@ stateDiagram-v2
     note right of Active
         写路径按需命中（ShardGroupAt → Contains）
         OSS 每个组固定 1 个 Shard
+        TruncatedAt ≠ zero 时，ShardGroupByTimestamp 跳过该组
+        写路径 ShardGroupAt 仍按 Contains 命中，不是独立生命周期状态
     end note
 
     note right of Expired
@@ -1291,8 +1306,11 @@ stateDiagram-v2
 - `SoftDeleted` = `DeletedAt != zero`；物理文件可能仍在。`DropShard` 删除组内最后一个
   `ShardInfo` 时会副作用置 `DeletedAt`（`services/meta/data.go:313-321`）。
 - `Pruned` = `len(Shards)==0` **且** `DeletedAt` 早于 `now-14d`（`data.go:476-492`）。
-- `SoftDeleted → Created` 是回边：同一时间段再次写入会由 `CreateShardGroup` 新建一个组
-  （`ShardGroupByTimestamp` 会跳过已删除组）。
+- `TruncatedAt != zero` = 该组在 `TruncatedAt` 之后不再被 `ShardGroupByTimestamp` 路由
+  （`data.go:1263-1271`），写路径 `ShardGroupAt` 仍按 `Contains` 命中；`TruncateShardGroups`
+  只设置该字段（`data.go:835-858`），OSS 无生产调用方，不是独立生命周期状态。
+- `SoftDeleted → Created` 是回边，但不是同一对象复活：同一时间段再次写入会由 `CreateShardGroup`
+  新建**另一个组（新 ID）**（`ShardGroupByTimestamp` 跳过已删除组），旧组保留到 Prune 后消失。
 
 **Truncate 分支（Enterprise/运维路径）**:
 - 唯一业务写入点是 `Data.TruncateShardGroups`（`services/meta/data.go:835-858`）；
@@ -1988,7 +2006,7 @@ flowchart TD
     H -->|"是"| I["defer 解除 block<br/>本轮跳过"]
     H -->|"否"| J["DeleteShard(id)"]
     J -->|"nil 或 ErrShardNotFound"| K["DropShardMetaRef(id, owners)"]
-    J -->|"其他 error"| L["retryNeeded = true<br/>保留 meta ref"]
+    J -->|"其他 error"| L["retryNeeded = true<br/>本轮保留 meta ref；下轮 phantom 摘除"]
     K --> M["Phase 3: 遍历 deletedShardIDs 的剩余项"]
     L --> M
     M --> N["phantom: 只做 DropShardMetaRef<br/>不碰磁盘"]

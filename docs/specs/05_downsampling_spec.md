@@ -795,7 +795,8 @@ flowchart TD
 
 #### CQ 结果写回标准写入路径 — 详细序列图
 
-CQ 的 INTO 结果通过标准写入路径（与用户写入完全一致）写回存储引擎，保证数据一致性。
+CQ 的 INTO 结果通过标准 `PointsWriter` 路径写回存储引擎；但 RP 设置 `PAST/FUTURE LIMIT` 时，
+超出写窗口的补算点会被丢弃，并非无条件与用户写入等价。
 
 ```mermaid
 sequenceDiagram
@@ -825,6 +826,7 @@ sequenceDiagram
     PW->>PW: 解析默认 RP (downsampled 的 RP)
     PW->>Meta: RetentionPolicy("mydb", "autogen")
     PW->>PW: MapShards(points) → 路由到目标 Shard
+    Note over PW: RP 设 PAST/FUTURE LIMIT 时<br/>超出写窗口的补算点被丢弃（WriteDropped）
     PW->>Meta: CreateShardGroup(db, rp, timestamp) [按需]
 
     par 并行写入各目标 Shard
@@ -847,7 +849,10 @@ sequenceDiagram
 ```
 
 **关键设计点**:
-- CQ 写回路径与用户 `INSERT` 完全一致: `PointsWriter` → `MapShards` → `WriteToShard` → `Cache + WAL`
+- CQ 写回与用户 `INSERT` 共用 `PointsWriter` → `MapShards` → `WriteToShard` → `Cache + WAL`；但 `MapShards`
+  也施加 RP 写窗口：超出 `PAST/FUTURE LIMIT` 的补算点被丢弃并计 `WriteDropped`，`WritePoints` 返回
+  `PartialWriteError`（`coordinator/points_writer.go:211-245/346-352/511-521`），CQ 侧记 `QueryFail`
+  （`services/continuous_querier/service.go:271-273/390-394`）。
 - 降采样数据写入目标 measurement 的独立 Shard，不影响原始数据的 Shard
 - `BufferedPointsWriter` 批量 10,000 点减少锁竞争和 WAL 写入次数；每次 `Flush()` 是独立写入，已成功的批次不会因为后续批次失败而回滚
 - 写入目标可以是不同的 RP（如 `INTO "7d"."downsampled"`），实现多级降采样

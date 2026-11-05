@@ -7,7 +7,7 @@
 > - 区间：527 commits，602 files，+79,310 / −45,239
 > - 本文件覆盖目录（`query/`、`storage/reads/`、`storage/flux/`、`tsdb/cursors/`、`tsdb/engine/tsm1/array_cursor*`）：
 >   93 files，+30,372 / −9,998；涉及 69 个提交（含 array cursor 相关 tsm1 文件）。
-> - NEW 的当前工作树只额外包含 4 个 docs 提交，代码与 `f3d5cb68ab` 相同。
+> - NEW 的当前工作树只额外包含 docs 提交（当前 8 个），代码与 `f3d5cb68ab` 相同。
 >
 > 引用格式：旧 `v1.8.10:path:line`，新 `v1.12.3:path:line`（即当前工作树行号）。
 > 新版本行为的详细讲解见 [03 查询引擎](../03_query_engine_spec.md)、
@@ -23,7 +23,7 @@
 >    （`query/control`）整包搬进 1.x，并新增“窗口聚合下推”这一整层。
 > 2. **旧版 Flux 控制器是“裸奔”的**：`flux/control/controller.go` 只有 127 行，
 >    编译完直接 `program.Start`，内存分配器是 `&memory.Allocator{}`——不限内存、
->    不排队、不统计、不管理取消。新版 `query/control` 有 1108+157+111 行，
+>    不排队、没有控制器级配额/指标、不管理取消（但 flux 分配器仍统计每查询的 `MaxAllocated`/`TotalAllocated`，写入查询统计与日志）。新版 `query/control` 有 1108+157+111 行，
 >    维护 7 状态状态机、并发配额、单查询/全局内存池、队列和 11 组 Prometheus 指标。
 > 3. **查询从“拉取点”升级为“下推聚合”**：Flux 的 `window + mean/count/sum/min/max/first/last`
 >    以及裸聚合、`group + 聚合` 现在由存储层直接算完再上送。
@@ -86,18 +86,22 @@ flowchart TB
     end
 
     subgraph IQ["InfluxQL 点式迭代器路径（未重构）"]
-        I1["Executor.executeQuery"] --> I3["StatementExecutor.ExecuteStatement"]
-        I1 -. "错误结果" .-> I2["ExecutionContext.send / Send"]
+        I1["Executor.executeQuery"] --> I1b["RewriteStatement / NormalizeStatement"]
+        I1 -. "错误/系统 measurement 直接写 results" .-> I2["ExecutionContext.send / Send"]
+        I1b --> I3["StatementExecutor.ExecuteStatement"]
         I3 --> I4["query.Select"]
         I3 --> I2
         I4 --> I5["query.Prepare"]
         I4 --> I6["buildCursor"]
-        I6 --> I7["buildExprIterator / buildCallIterator"]
+        I6 --> I7["有 call：buildExprIterator / buildCallIterator"]
+        I6 -. "无 call" .-> I7b["buildAuxIterator"]
         I7 --> I8["NewCallIterator → ReduceIterator / StreamIterator"]
+        I7b --> I11
         I8 --> I9["MergeIterator.Next"]
         I9 --> I10["FillIterator.Next / IntervalIterator.Next"]
         I10 --> I11["Emitter.Emit"]
-        I11 --> I2
+        I11 -->|"非 SELECT INTO"| I2
+        I11 -. "SELECT ... INTO" .-> I12["writeInto → PointsWriter（不 Send）"]
     end
 
     subgraph FX["Flux 列式读取路径（新增控制层 + 下推层）"]
@@ -108,14 +112,18 @@ flowchart TB
         F3 --> F4b["storeReader.ReadFilter"]
         F4b --> F5b["Store.ReadFilter → ReadFilterLimit"]
         F5b --> F6b["reads.NewFilteredResultSet"]
+        F6b --> F9b["storageflux.new{Type}Table"]
         F3 --> F4c["storeReader.ReadGroup"]
         F4c --> F5c["Store.ReadGroup → ReadGroupLimit"]
         F5c --> F6c["reads.NewGroupResultSet"]
+        F6c --> F9c["storageflux.new{Type}GroupTable（聚合经 newAggregateArrayCursor）"]
         F5 --> F6["reads.NewWindowAggregateResultSet"]
         F6 --> F7["NewWindowAggregateArrayCursor"]
         F7 --> F8["newFloatWindowMeanArrayCursor 等"]
-        F8 --> F9["storageflux.newFloatWindowTable / newFloatWindowSelectorTable"]
-        F9 --> F10["table.do → colReader / splitWindows"]
+        F8 --> F9["storageflux.newFloatWindowTable / newFloatWindowSelectorTable（仅窗口路径）"]
+        F9 --> F10["table.do → colReader（窗口路径再 splitWindows）"]
+        F9b --> F10
+        F9c --> F10
     end
 
     H1 --> I1
@@ -146,25 +154,37 @@ sequenceDiagram
     participant Q as control.Query
     participant K as flux.Compiler
     participant P as flux.Program
+    participant W as worker goroutine
 
     H->>C: Query(ctx, compiler)
     C->>C: createQuery (context.WithCancel)
-    C->>Q: tryCompile → Compiling
-    C->>K: Compile(ctx, runtime.Default)
-    K-->>C: Program
-    C->>Q: tryQueue → Queueing
-    C->>C: enqueueQuery (queryQueue 或直接起 goroutine)
-    C->>Q: tryExec → Executing
-    C->>C: createAllocator(q)
-    C->>Q: recordUnusedMemory()
-    C->>P: program.Start(ctx, alloc)
-    loop pump
-        P-->>Q: Results()
-        Q-->>H: results channel
+    alt createQuery 失败（controller shutdown）
+        C-->>H: 返回错误（未创建 Query）
+    else compileQuery 失败
+        C-->>H: 返回错误（Compiling → Errored；父 ctx 取消则 Canceled）
+    else enqueueQuery 失败（队列满）
+        C-->>H: ResourceExhausted
+    else 成功
+        C->>Q: tryCompile → Compiling
+        C->>K: Compile(ctx, runtime.Default)
+        K-->>C: Program
+        C->>Q: tryQueue → Queueing
+        C->>C: enqueueQuery（queryQueue 或每查询一个 goroutine）
+        C-->>H: 立即返回 Query（异步执行）
+        W->>Q: tryExec → Executing
+        W->>W: createAllocator(q) / recordUnusedMemory()
+        W->>P: program.Start(ctx, alloc)
+        loop pump
+            P-->>Q: Results()
+            Q-->>H: results channel
+        end
+        H->>Q: Cancel()（defer 注册，函数返回时执行）
+        H->>Q: Done()
+        Q->>Q: transitionTo(Finished) → cancel()
+        Q->>Q: 排空 results 直到 close
+        Q->>Q: exec.Done() → stats → deps.Finish() → finish() → MemoryManager.Release()
     end
-    H->>Q: Done()
-    Q->>Q: transitionTo(Finished) / cancel / Release
-    Note over Q: ctx.Done() → exec.Cancel()；Shutdown() → 取消全部查询
+    Note over H,Q: Cancel/Done 由 Query() 成功后的 defer 注册；失败分支直接返回错误
 ```
 
 ### 2.3 storage/reads 接口的扩张
@@ -219,7 +239,7 @@ classDiagram
 
 ### 3.1 Flux 查询控制器：`flux/control` → `query/control`
 
-**旧版：编译完直接跑，没有任何资源账本。**
+**旧版：编译完直接跑，没有可执行的资源上限与控制器级账本。**
 
 ```go
 // v1.8.10:flux/control/controller.go:92 — Controller.Query
@@ -232,7 +252,7 @@ func (c *Controller) Query(ctx context.Context, compiler flux.Compiler) (flux.Qu
 	if err != nil {
 		return nil, err
 	}
-	alloc := &memory.Allocator{}      // 无限制、无统计
+	alloc := &memory.Allocator{}      // 无上限；但仍统计 Max/TotalAllocated
 	return p.Start(ctx, alloc)
 }
 ```
@@ -240,7 +260,7 @@ func (c *Controller) Query(ctx context.Context, compiler flux.Compiler) (flux.Qu
 整个文件 127 行，只有 `Controller`（`deps`、`logger` 两个字段）、`query` 包装器（只为补
 `CompileDuration`/`ExecuteDuration`）和 `program` 包装器。没有队列，没有 `Shutdown`，
 没有取消后的结果排空，也没有 Prometheus 指标（`PrometheusCollectors()` 返回 `nil`，
-`v1.8.10:flux/control/controller.go:125`）。
+`v1.8.10:flux/control/controller.go:125`）。但旧版的 `&memory.Allocator{}` 并非空壳：它维护 `MaxAllocated`/`TotalAllocated`，`lang.Query.Done` 写入 `flux.Statistics`，旧 HTTP handler 的 `logFluxQuery` 也输出 `stat_max_allocated`/`stat_total_allocated`（`v1.8.10:services/httpd/handler.go:1456-1475`）；缺的是限额、队列、全局池和控制器级指标。
 
 **新版：从 2.x 整包搬来的控制器**（commit `b9ee9e5b44` “pull in controller from 2.x”，
 `f1aa051787` 把参数做成配置）。
@@ -268,7 +288,7 @@ func (c *Controller) query(ctx context.Context, compiler flux.Compiler, deps *de
 
 | 机制 | 旧 | 新 | 证据 |
 |------|----|----|------|
-| 状态机 | 无 | `Created → Compiling → Queueing → Executing → Errored/Finished/Canceled` | `v1.12.3:query/control/controller.go:999`-`:1014`、`:1049` |
+| 状态机 | 无 | `Created → Compiling → Queueing → Executing → Errored/Finished/Canceled` | `v1.12.3:query/control/controller.go:999`-`:1023`（`isFinishedState` 在 `:1047`-`:1050`） |
 | 并发配额 | 无 | `ConcurrencyQuota` 个 `processQueryQueue` goroutine + `WaitGroup` | `:77`、`:219`-`:231`、`:427` |
 | 队列 | 无 | 有界 `chan *Query`；满则 `codes.ResourceExhausted` “queue length exceeded” | `:386`-`:424` |
 | 单查询内存 | `memory.Allocator{}` | `queryMemoryManager`：初始配额 + 硬上限 + 全局池 CAS 申请 | `query/control/memory.go:73`-`:116` |
@@ -312,7 +332,9 @@ for {
 1. 默认行为仍然“不限制”：`control.NewConfig()` 返回零值，`Config.complete()` 把
    `MemoryBytesQuotaPerQuery==0` 解释为 `math.MaxInt64`、`InitialMemoryBytesQuotaPerQuery==0`
    继承前者；`ConcurrencyQuota==0` 时 `queryQueue=nil`，来一个查询起一个 goroutine
-   （`controller.go:117`-`:131`、`:201`-`:203`、`:394`-`:415`）。所以**不配置就不会变慢/变严**。
+   （`controller.go:117`-`:131`、`:201`-`:203`、`:394`-`:415`）。所以**语义上不限额、不排队**；
+   但每个查询仍会安装 `memory.ResourceAllocator`（`Limit=MaxInt64`，分配计账走 CAS，
+   `memory.go:73`-`:116`），存在固定的计账开销，未做基准，不宣称零性能影响。
 2. 一旦配置了 `query-concurrency > 0`，`QueueSize` 必须为正，否则 `Config.validate` 直接报错
    （`controller.go:134`-`:150`）；服务起不来，而不是运行期降级。
 3. 取消语义变强：客户端断开后，`pump` 会显式 `exec.Cancel()` 并继续排空结果，
@@ -659,7 +681,7 @@ reader 少一次遍历。`storage/reads/flux_predicate.go` 整个文件（183 �
 | 能力 | 旧（v1.8.10） | 新（v1.12.3） |
 |------|---------------|---------------|
 | 基础 filter/multishard | 有 | 有（错误处理加强） |
-| filter 游标跨 series 条件复用 | `reset` 复用 `c.filter` 但不更新 `cond`；含 `or` 的谓词跨 series 会沿用上一条 series 的条件 | `else { c.filter.cond = cond }`（5 处生成代码）；丢点/多点，`5976e41d54` #23522 |
+| filter 游标跨 series 条件复用 | `reset` 复用 `c.filter` 但不更新 `cond`；含 `or` 的谓词跨 series 会沿用上一条 series 的条件 | `else { c.filter.cond = cond }`（5 处生成代码），修复旧代码因不更新 `cond` 导致的丢点/多点，`5976e41d54` #23522 |
 | 单聚合 sum/count | `floatArraySumCursor`、`integer*CountArrayCursor` | 能力保留，旧的非窗口实现被窗口化实现取代（`newWindowSumArrayCursor` 等，窗口为零值时即整段） |
 | limit（first/last 非窗口聚合） | 无 | `newLimitArrayCursor` / `floatLimitArrayCursor`（`:27`、`:367`） |
 | 窗口 first/last | 无 | `newWindowFirstArrayCursor` / `newWindowLastArrayCursor`（`:50`、`:76`） |
@@ -812,9 +834,11 @@ func (cr *colReader) Floats(j int) *array.Float { ... }   // CheckColType + 类�
    容许 stop 被 range 截断（注释详细解释了 `(start, stop]` 的判定）。
 3. `mergeValues`：把窗口内多个点压成一个值；整数 `count` 通过 `fillValue=0`
    把空窗口填 0（`table.go:272`-`:280`，`fillValue` 由 `reader.go:739`-`:744` 传入）。
-4. `WindowSelectorTable` 直接用游标返回的 `(timestamp, value)` 作为窗口边界，
-   selector 的 `_time` 就是数据点时间；`EmptyWindowSelectorTable` 在没有数据时
-   仍按窗口数产生空行。
+4. `WindowSelectorTable` 的窗口边界由 `window.GetLatestBounds(ts)` 计算；仅在
+   `timeColumn == ""`（非 `aggregateWindow`）时 selector 的 `_time` 取数据点时间，
+   `aggregateWindow` 下 `_time` 是窗口 `_start`/`_stop`。`EmptyWindowSelectorTable`
+   只在窗口内无数据时补空行；整表无数据时 `advance()` 直接返回 `false`，表被标记
+   为 empty，不会产生任何行（`table.gen.go:463-466`；`table.go:73-75`、`:77-101`）。
 
 **窗口切分**：当 spec 不带 `TimeColumn`（即不是 `aggregateWindow`）时，
 `windowAggregateIterator.handleRead` 用 `splitWindows` 把“一张表含多窗口”
@@ -926,7 +950,7 @@ type MeanCountArrayCursor interface {
 ```
 
 旧版没有这个类型（`v1.8.10:tsdb/cursors/arrayvalues.go` 只有 5 种数组的 `Size()`）。
-它的 `Size()` 单独实现（`arrayvalues.go:33`-`:37`），因为三列长度不同，无法用模板生成。
+它的 `Size()` 单独实现（`arrayvalues.go:33`-`:37`），因为它是三列数组，形状与模板生成的二元数组不同，模板不适用。
 
 另外：
 
@@ -955,7 +979,7 @@ if pos == 0 && c.tsm.pos == 0 && len(c.res.Timestamps) >= len(tvals.Timestamps) 
 
 **(b) 错误传播**
 
-`reset` 现在返回 `error`，`Read*ArrayBlock` 的错误不再被 `_` 丢弃：
+`reset` 现在返回 `error`，`reset()` 读首块的 `Read*ArrayBlock` 错误不再被 `_` 丢弃：
 
 ```go
 // v1.12.3:tsdb/engine/tsm1/array_cursor.gen.go:42
@@ -971,7 +995,7 @@ func (c *floatArrayAscendingCursor) reset(seek, end int64, cacheValues Values, t
 ```
 
 旧版 `c.tsm.values, _ = ...ReadFloatArrayBlock(...)`（`v1.8.10:tsdb/engine/tsm1/array_cursor.gen.go:49`），
-读块失败后继续用零值/旧缓冲。
+读块失败后继续用零值/旧缓冲。只有 `reset()` 读首块检查错误；`nextTSM()` 读后续块仍是 `c.tsm.values, _ = ...`（10 处），10 个游标的 `Err()` 仍 `return nil`。
 
 **(c) 降序 reset 重写**
 
@@ -1018,7 +1042,7 @@ func (c *floatArrayDescendingCursor) reset(seek, end int64, cacheValues Values, 
 | group + count/sum/first/last/min/max | 每组全量点 | 每组一个值 | 组内聚合在存储层完成 | `rules.go:866` |
 | mean + count | 两遍或上层组合 | 一次扫描输出 `MeanCountArray` | 少一次全量扫描 | `aggregate_resultset.go:50`-`:63`、`array_cursor.gen.go:199` |
 
-### 4.2 单窗口 selector 的 limit 快路径
+### 4.2 非窗口 first/last 的 limit 快路径
 
 `newAggregateArrayCursor` 对所有**非窗口聚合**中的 `first`/`last` 直接套 `newLimitArrayCursor`
 （`storage/reads/array_cursor.go:20`-`:25`，只按 `agg[0].Type` 分支，不判断窗口）。调用方有两处：
@@ -1102,7 +1126,7 @@ HLL sketch 的大小只与精度参数有关，与 series 数无关。对
 |------|--------|--------|----------|----------|
 | Flux 是否启用 | `flux-enabled=false` 默认 | 同左，默认仍关闭 | 不会 | 不开启 Flux 则本文件大半改动与运行时无关 |
 | Flux 控制器默认值 | 无限制 | 零值 = 无限制 | 不会 | 想限流才配 `[flux-controller]` |
-| `[flux-controller]` 配置 | 不存在 | 新增；`query-concurrency>0` 时 `query-queue-size` 必须 >0 | **配错会启动失败** | 两项一起配；`total-max-memory-bytes >= concurrency*initial` |
+| `[flux-controller]` 配置 | 不存在 | 新增；`query-concurrency>0` 时 `query-queue-size` 必须 >0；内存上限仅在 `total-max-memory-bytes>0` 时生效（0=不限，且绕过 `>= concurrency*initial` 校验） | **配错会启动失败**；0 值不会 | `query-concurrency`/`query-queue-size`/`total-max-memory-bytes`/`query-max-memory-bytes`（及 `query-initial-memory-bytes`）一起配 |
 | `ReadFilterSpec.Predicate` 类型 | `*semantic.FunctionExpression` | `*datatypes.Predicate` | **外部实现编译失败** | 改用 `ToStoragePredicate` 在计划期转换 |
 | `Reader` 接口 | 5 个方法（含 Close） | 6 个（+`ReadWindowAggregate`），alloc 变接口 | **编译失败** | 实现新方法；`memory.Allocator` 用接口值 |
 | `Store.GetSource` 返回类型 | gogo `proto.Message` | protobuf-go `proto.Message` | **编译失败** | 换 import；线格式不变 |
@@ -1116,7 +1140,7 @@ HLL sketch 的大小只与精度参数有关，与 series 数无关。对
 | `SHOW QUERIES` 列 | 5 列 | 6 列（+user） | 严格按列数解析的客户端会坏 | 按列名解析 |
 | `SHOW QUERIES` 可见性 | 非管理员可见他人库 | 只看有 READ 权限的库 | **行为收紧** | 预期之内 |
 | 多语句错误结果 | 数量/ID 错 | 每条剩余语句一条 | 客户端结果对齐逻辑变化 | 按 `StatementID` 对齐 |
-| `MergeIterator.Close` | 恒 nil | 返回合并错误 | 调用方开始收到 Close 错误 | 检查 `Close()` 返回值 |
+| `MergeIterator.Close` | 恒 nil | `errors.Join` 返回合并错误 | InfluxQL 内部调用点仍丢弃（`defer em.Close()`，`statement_executor.go:558`） | 直接使用 `query` 包的代码需检查 `Close()` 返回值 |
 | `Iterators.Close` | nil 元素 panic | 跳过 nil，返回首个错误 | 不会 | — |
 | 编译畸形语句 | panic（进程可能崩） | 返回错误 | 更好 | — |
 | `max-select-point` 错误文案 | `exceeed` | `exceeded` | 匹配旧文案的告警规则会失效 | 更新正则 |
@@ -1142,8 +1166,8 @@ HLL sketch 的大小只与精度参数有关，与 series 数无关。对
 4. **错误语义更“显式”，默认配置下没有性能回退的证据**：编译器 panic 变错误、
    窗口聚合结果集的错误会上抛（filter/group 路径仍会吞错，见 §7.1/§7.2）、Close 错误返回；
    控制器默认不限制、聚合下推是纯增量，
-   唯一可能是 `ReadGroup` 为 `last()` 反转 shard 顺序
-   （`services/storage/store.go:195`），对非 `last` 查询没有影响。
+   唯一可能是 `ReadGroup` 与 `WindowAggregate` 的 `last()` 单窗口路径反转 shard 顺序
+   （`services/storage/store.go:195`、`:252`），对非 `last` 查询没有影响。
 
 ---
 
@@ -1244,8 +1268,8 @@ from(bucket: "mydb/autogen")
 - 旧版：`ReadRange` + `filter` 下推，`window`/`mean` 在 Flux 层执行，存储返回全部原始点。
 - 新版：`PushDownWindowAggregateRule` 产出 `ReadWindowAggregate(mean, every=1m)`，
   `PushDownWindowAggregateByTimeRule` 设 `TimeColumn=_stop`；存储侧
-  `newFloatWindowMeanArrayCursor`（`array_cursor.gen.go:179`）→ `newFloatWindowTable`
-  （`table.gen.go:107`）。因为 `TimeColumn!=""`，**不** `splitWindows`。
+  `newFloatWindowMeanArrayCursor`（`array_cursor.gen.go:988`）→ `newFloatWindowTable`
+  （`table.gen.go:117`）。因为 `TimeColumn!=""`，**不** `splitWindows`。
 - 边界：游标 `EndTime=stop-1`，落在 stop 的点不参与；`_start/_stop` 裁剪到 range。
 
 **收益**：1 小时 1 分钟窗口、每 series 3600 点 → 上层只收 60 个 mean 值；
@@ -1281,9 +1305,9 @@ if cur == nil {
 }
 ```
 
-也就是说，**mean over string 之类的类型错误在 group 路径会被静默跳过整个 group**，
+也就是说，**sum over string 之类的类型错误在 group 路径不会暴露**：首个 series 建游标失败时整个 group 被跳过（`storage/flux/reader.go:324-329`）；后续 series 失败时 `advanceCursor` 提前结束，聚合只覆盖已读到的 series——是**截断**（`group_resultset.go:343-347`、`storage/flux/table.gen.go:963-983`）。
 `WriteGroupResultSet` 里新增的 `gc.Err()` 检查（`response_writer.go:116`）永远看不到错误。
-`writer` 只在 `ResultSet`（window/filter）路径能拿到错误。
+`writer` 只有在 **WindowAggregate** 路径能拿到错误；filter/group 的 `Err()` 均为 nil。
 
 ### 7.2 filter 结果集的 `Err()` 仍是 nil
 
@@ -1295,8 +1319,8 @@ func (r *resultSet) Err() error { return nil }
 而 `multiShardArrayCursors.createCursor` 在 `cur == nil || err != nil` 时返回 nil
 （`array_cursor.go:126`），`filterIterator` 把 nil 当“该 series 没数据”继续
 （`storage/flux/reader.go:183`-`:186`）。因此 filter 读路径的底层读块错误
-**不会出现在最终错误里**。这是 #24791 修了一半的地方：错误从 tsm1 传到了
-`createCursor`，但 `ResultSet.Err()` 没有接。
+**不会出现在最终错误里**。这是 #24791 修了一半的地方：`reset()` 首块的错误从 tsm1 传到了
+`createCursor`，但 `createCursor` 在 `cur == nil || err != nil` 时直接返回 nil，把错误折叠掉；即使接上 `ResultSet.Err()` 也没有错误可拿（主文档 09 §6.4 同口径）。
 
 ### 7.3 `min`/`max` 窗口游标对不支持的类型直接 panic
 
@@ -1320,7 +1344,7 @@ Flux v0.196.1 的 `builtin min/max` 也没有类型约束（`universe.flux:1822`
 
 兜底不在 InfluxQL 的 `Executor.recover`：panic 发生在 Flux source goroutine
 （`readWindowAggregateSource.run` → `processTables` → 建表/建游标），由 Flux `execute` 包的
-`(*executionState).recover`（`flux@v0.196.1/execute/recover.go:22`，`//go:build !debug`）接住并转成
+`(*executionState).recover`（`flux@v0.196.1/execute/recover.go:16`，`//go:build !debug`）接住并转成
 `codes.Internal`；`query/control` 的 `executeQuery` recover（`v1.12.3:query/control/controller.go:443`）
 只覆盖查询协程。注意 `execute/recover_debug.go` 在 `debug` 构建标签下把 recover 变成空实现——
 debug 构建里该 panic 会直接崩进程。
@@ -1338,22 +1362,33 @@ func (q *queryMemoryManager) FreeMemory(bytes int64) {
 }
 ```
 
+flux v0.196.1 的 `ResourceAllocator.Free` 只减 `bytesAllocated`、**不回调** `Manager.FreeMemory`（`flux@v0.196.1/memory/allocator.go:162-176`，全模块无 `FreeMemory(` 调用点），因此即使实现 `FreeMemory` 也不会退池。
 `ResourceAllocator` 在查询过程中释放的中间结果不会退还给全局池，
 只有 `Query.Done()` 里的 `Release()` 才一次性归还（`memory.go:151`-`:157`）。
 后果：多个长查询即使已经把大表释放，仍可能因为“曾经申请过”而把池子占满，
 新查询收到 `not enough capacity`。配置 `total-max-memory-bytes` 时要按
 “峰值 × 并发”估算，而不是按“活跃内存”。
 
-### 7.5 控制器配置不在示例配置里，且两个字段强耦合
+### 7.5 控制器配置不在示例配置里，且内存/并发/队列字段互相约束
 
 `[flux-controller]` 只出现在 `cmd/influxd/run/config.go:45`，
 `etc/config.sample.toml` 里没有这个 section（`git show v1.8.10:etc/config.sample.toml`
 和当前文件都没有）。运维只能从代码/文档得知字段名。
-另外 `ConcurrencyQuota > 0` 时 `QueueSize <= 0` 会让 `validate` 返回错误
-（`query/control/controller.go:145`-`:149`），`MaxMemoryBytes` 小于
-`ConcurrencyQuota * InitialMemoryBytesQuotaPerQuery` 也会拒绝启动（`:160`-`:164`）。
-`ConcurrencyQuota`/`QueueSize` 是 `int32`，注释自己承认极大值会导致 OOM
-（`controller.go:72`-`:76`、`:98`-`:108`）。
+校验边界（`query/control/controller.go`）：
+
+- `ConcurrencyQuota > 0` 只强制 `QueueSize > 0`（`:146`-`:150`）。
+- `MaxMemoryBytes` 的 `>= ConcurrencyQuota * InitialMemoryBytesQuotaPerQuery` 检查包在
+  `if c.MaxMemoryBytes != 0` 内（`:160`-`:164`）。**`total-max-memory-bytes=0` 会绕过该校验**，
+  `New()` 走 `unlimited=true`（`:195`-`:199`），内存仍不受限。
+- `query-max-memory-bytes=0` 时 `complete()` 令其等于 `math.MaxInt64`，`Initial` 继承之
+  （`:118`-`:126`）；若 `ConcurrencyQuota>0` 且 total 非零，`int64(ConcurrencyQuota)*Initial`
+  会溢出为负数，不等式校验放行；`RequestMemory` 的 `q.limit+want` 同样会溢出
+  （`memory.go:76`），单查询硬上限实际失效，只剩全局池约束。
+- 因此 0 值一律表示“不限制”，且不保证校验能发现危险组合；生产环境应把
+  `query-concurrency`、`query-queue-size`、`total-max-memory-bytes`、
+  `query-max-memory-bytes`（及 `query-initial-memory-bytes`）一起配置。
+- `ConcurrencyQuota`/`QueueSize` 是 `int32`，注释自己承认极大值会导致 OOM
+  （`controller.go:72`-`:76`、`:98`-`:108`）。
 
 ### 7.6 HLL 的误差与“吞错”
 
@@ -1383,7 +1418,7 @@ func (q *queryMemoryManager) FreeMemory(bytes int64) {
 `Compile` 的 `defer recover` 注册在 `c.compile` 之后
 （`query/compile.go:106`-`:128`，`defer` 在 `:118`）：`newCompiler`（`:107`）、`stmt.Clone()`（`:108`）、
 `c.preprocess`（`:109`）、`c.compile`（`:112`）里的 panic 仍然会向上冒。真正的兜底是
-`Executor.recover`（`query/executor.go:453`-`:461`），
+`Executor.recover`（`query/executor.go:453`-`:469`），
 它默认只记录并返回错误，只有 `INFLUXDB_PANIC_CRASH=true` 才 `os.Exit(1)`。
 
 ### 7.9 `ProfilerResults` 的类型断言

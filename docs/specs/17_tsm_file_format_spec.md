@@ -80,10 +80,10 @@ flowchart TD
 ### 2.2 常量
 
 ```go
-// tsdb/engine/tsm1/writer.go:81 — MagicNumber
+// tsdb/engine/tsm1/writer.go:82 — MagicNumber
 MagicNumber uint32 = 0x16D116D1
 
-// tsdb/engine/tsm1/writer.go:84 — Version
+// tsdb/engine/tsm1/writer.go:85 — Version
 Version byte = 1
 ```
 

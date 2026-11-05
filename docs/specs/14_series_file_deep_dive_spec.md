@@ -1637,7 +1637,7 @@ func (p *SeriesPartition) CreateSeriesListIfNotExists(keys [][]byte, keyPartitio
         newIDs[string(key)] = id
         newKeyRanges = append(newKeyRanges, keyRange{id, offset})
 
-        // 统计上报（tracker 可能为 nil 字段，必须判空）
+        // 统计上报（tracker 可能为 nil 字段，必须判空；多个分区可并行回调，实现须并发安全）
         if tracker.AddedMeasurementSeries != nil {
             _, remainder := ReadSeriesKeyLen(key)
             if len(remainder) > 0 {
@@ -1719,9 +1719,10 @@ flowchart TD
     K --> L["SSEG segment.Flush()"]
     L --> M["seriesKeyByOffset(offset)"]
     M --> N["p.index.Insert() 更新内存 RHH"]
-    N --> O{"InMemCount >= 128K?"}
-    O -->|"是"| P["异步触发压缩"]
-    O -->|"否"| Q["返回 ✓"]
+    N --> O{"compactionsEnabled && !compacting<br/>&& CompactThreshold != 0<br/>&& InMemCount >= 128K<br/>&& limiter.TryTake()"}
+    O -->|"全部满足"| P["compacting=true；go Compact()（异步）"]
+    O -->|"任一不满足"| Q["返回 ✓"]
+    P --> Q
 
     style I fill:#c8e6c9
     style Q fill:#c8e6c9
@@ -2284,10 +2285,14 @@ sequenceDiagram
     participant SSEG as SSEG Segment
     participant Index as SeriesIndex
 
-    Caller->>Part: DeleteSeriesID(27)
-    Part->>Part: IsDeleted(27)? → false
-    Part->>SSEG: 写入 Tombstone (0x02 + ID=27)
-    SSEG->>SSEG: Flush
+    Caller->>Part: DeleteSeriesID(27, flush)
+    Part->>Part: IsDeleted(27)? → 是则幂等早退
+    Part->>SSEG: 写入 Tombstone (0x02 + ID=27)（只进 bufio）
+    alt flush=true
+        SSEG->>SSEG: Flush（bufio + file.Sync）
+    else flush=false（生产批量路径）
+        Note over SSEG: 跳过，留待 FlushSegments
+    end
     Part->>Index: Delete(27)
     Index->>Index: tombstones[27] = struct{}{}
 
@@ -2295,6 +2300,10 @@ sequenceDiagram
 
     Note over Part: 下次压缩时<br/>27 的 Insert entry 被跳过<br/>Tombstone entry 也被跳过<br/>27 彻底从 SIDX 中消失
 ```
+
+**生产批量删除**：`DeleteSeriesID(id, NoFlush) ×N` 收集 `partitionIDs`，最后 `FlushSegments(partitionIDs)`
+对每个分区的 active segment fsync 一次（`v1.12.3:tsdb/engine/tsm1/engine.go:1858,1878`、`tsdb/store.go:1083,1108`、
+`tsdb/series_file.go:211-238`）；批内轮转出的旧 segment 无 fsync。
 
 ## 13. 具体案例 — 完整 Series 生命周期
 
@@ -2426,8 +2435,9 @@ sequenceDiagram
     Note over P0: Phase 2: Lock
     P0->>P0: insert(key)
     P0->>SSEG: WriteLogEntry(Insert, ID=1, key)
+    P0->>SSEG: segment.Flush()（bufio + file.Sync）
+    P0->>SSEG: seriesKeyByOffset(offset)
     P0->>IDX: Insert(key, 1, offset)
-    P0->>IDX: Flush
 
     Note over P0: ... 128K entries later ...
     P0->>P0: 触发压缩 (异步)

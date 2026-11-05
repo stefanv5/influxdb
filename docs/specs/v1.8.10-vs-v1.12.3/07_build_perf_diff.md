@@ -42,8 +42,8 @@
 | 21 | `/debug/vars` 的 `cq` | 有：`Statistics()` 早就以 `Name:"cq"` 发布，但输出是带 `name/tags/values` 包装的 Statistic | `serveExpvar` 对 `s.Name=="cq"` 只输出 `Values`；另注册 diagnostics 只服务 `SHOW DIAGNOSTICS`，与 `/debug/vars` 无关 | CQ 统计可直接被监控抓取，但采集端要改字段路径 | `v1.8.10:services/continuous_querier/service.go:161-170`、`services/httpd/handler.go:1532-1570` / `v1.12.3:services/httpd/handler.go:2451-2478`、`cmd/influxd/run/server.go:425-427` |
 | 22 | 每用户查询字节 | 无 | `userquerybytes` 统计（`user` tag），由 `user-query-bytes-enabled` 开关控制 | 可做按租户计量；默认关闭 | `v1.12.3:services/httpd/config.go:68`、`services/httpd/handler.go:484-511` |
 | 23 | TSM 文件合并指标 | 无 | 5 种类型 × 4 个指标（`*_blocks_merge_duration` / `_merge_count` / `_merge_values_count` / `_merge_over4_count`） | 可判断是否该换成树形归并 | `v1.12.3:tsdb/engine/tsm1/file_store.go:163-198` |
-| 24 | TSM 文件名解析 | `findGenerations()` 在文件集变化时对每个文件 `ParseFileName(f.Path)`；`FileStore.LastModified()` 未变则 `:620-625` 直接返回上次结果 | `FileStat.Generation/Sequence` 在 `TSMReader` 创建/重命名时解析一次并缓存 | planner tick 不再做文件名解析（每个 reader 一生一次） | `v1.8.10:tsdb/engine/tsm1/compact.go:616-644` / `v1.12.3:tsdb/engine/tsm1/compact.go:699-724`、`reader.go:450-460,679-680` |
-| 25 | TSI 缓存 key 分配 | `c.cache[string(name)]` 等每次转换 | `Put()` 里一次性 `nameStr/keyStr/valueStr`，复用同一份字符串 | 每次 Put 少 3~6 次分配 | `v1.8.10:tsdb/index/tsi1/cache.go:60,98-138` / `v1.12.3:tsdb/index/tsi1/cache.go:98-135` |
+| 24 | TSM 文件名解析 | `findGenerations()` 在文件集变化时对每个文件 `ParseFileName(f.Path)`；`LastModified()` 未变则 `:620-625` 早退，但缓存下来的 `tsmGeneration.level()` 每次调用都重新解析 `files[0].Path`，1s tick 的 `PlanLevel`/`Plan`/`PlanOptimize` 会反复调用它 | 缓存到 `TSMReader.generation/sequence`（经 `Stats()` 暴露为 `FileStat`），`level()` 直接读 | planner tick 不再做文件名解析（仅创建/重命名时各一次） | `v1.8.10:tsdb/engine/tsm1/compact.go:616-644` / `v1.12.3:tsdb/engine/tsm1/compact.go:699-724`、`reader.go:450-460,679-680` |
+| 25 | TSI 缓存 key 分配 | `c.cache[string(name)]` 等每次转换 | `Put()` 里一次性 `nameStr/keyStr/valueStr`，复用同一份字符串 | 插入路径少 1~3 次分配；`exists` 命中早退时新版反多 3 次 | `v1.8.10:tsdb/index/tsi1/cache.go:60,98-138` / `v1.12.3:tsdb/index/tsi1/cache.go:98-135` |
 | 26 | purger 并发 | `sync.RWMutex` + 普通 map，扫描/关闭/删除全程持锁 | `gensyncmap.Map[string, TSMFile]` + 极短临界区 | 不再阻塞 `FileStore` 的提交/查询路径 | `v1.8.10:tsdb/engine/tsm1/file_store.go:1376-1392` / `v1.12.3:tsdb/engine/tsm1/file_store.go:1599-1620` |
 | 27 | `stress/` 目录 | 存在（含 `stress/v2` 全套压测客户端） | **整体删除** | `influx_stress` 不再是仓库的一部分 | `v1.8.10:stress/run.go` / `v1.12.3`（`git ls-files stress` 为空，提交 `6b8ec8cfe0`） |
 | 28 | `kit/` 目录 | 不存在 | 34 个文件（check/errors/prom/signals/tracing/transport） | 2.x 的通用组件被 1.x 复用 | `v1.8.10`（`git ls-tree v1.8.10 kit` 为空） / `v1.12.3:kit/check/check.go:1`（提交 `78724e5c20`） |
@@ -54,6 +54,9 @@
 
 ```mermaid
 flowchart TB
+    %% release/on_push 节选：nightly 与 changelog -> publish_changelog 支线未画；箭头 = requires
+    %% sign_packages 与 test_pkgs_64bit 均只 requires build_packages，彼此并行
+    %% publish_packages 只 requires sign_packages；static_checks/fluxtest/unit_test 与 build 并行且不 gate 发布
     subgraph SRC["源码与依赖"]
         GM["go.mod<br/>go 1.24.0 / toolchain go1.24.13"]
         GS["go.sum<br/>1684 行"]
@@ -68,12 +71,15 @@ flowchart TB
         BP["build_packages<br/>packager"]
         SP["sign_packages<br/>rsign"]
         TP["test_pkgs_64bit<br/>releng/packages/spec/clean_install"]
+        PUB["publish_packages<br/>s3://.../releases/TAG/"]
+        SLACK["slack"]
         UT["unit_test<br/>inmem / tsi1 / race"]
         SC["static_code_checks<br/>checkfmt + generate + go vet"]
+        FT["fluxtest"]
     end
 
     subgraph RUST["Rust / CGO"]
-        IR["scripts/ci/install-rust.sh<br/>(cross-builder 镜像构建期用<br/>仓库内无调用点)"]
+        IR["scripts/ci/install-rust.sh<br/>(仓库内无调用点<br/>用途未在仓库内体现)"]
         RL["find_rustlib_path<br/>(cross-builder 镜像提供)"]
     end
 
@@ -82,14 +88,14 @@ flowchart TB
         ST["monitor.stats<br/>CompactThroughputUsage"]
         EXP["httpd.Handler.serveExpvar"]
         TMR["pkg/metrics.Timer.AddSince"]
-        FSM["tsm1.FileStore 归并指标"]
+        FSM["tsm1.FileStore 归并指标<br/>(仅 tracing span，不进 /debug/vars)"]
     end
 
     subgraph PERF["存储性能路径"]
+        FS["tsm1.FileStore"]
         PLAN["DefaultPlanner.findGenerations"]
         TSMREAD["TSMReader.parseAndCacheFileName"]
         PURGE["purger (gensyncmap.Map)"]
-        TSIC["tsi1.TagValueSeriesIDCache.Put"]
         RING["tsm1 cache ring<br/>xxhash.Sum64String"]
         CTRL["query/control.Controller"]
         ACR["tsm1 array_cursor Next()"]
@@ -103,13 +109,18 @@ flowchart TB
     BB --> BP
     BP --> SP
     BP --> TP
+    SP --> PUB
+    PUB --> SLACK
     XB --> UT
     XB --> SC
+    XB --> FT
     MON --> ST
     MON --> EXP
     ST --> EXP
     TMR --> FSM
-    PLAN --> TSMREAD
+    FS --> TSMREAD
+    TSMREAD -.->|缓存 gen/seq| PLAN
+    FS --> PURGE
     XXH --> RING
     CTRL -.->|配额/tracing| ACR
 ```
@@ -123,23 +134,35 @@ sequenceDiagram
     participant PK as ci-packager-next
     participant SG as rsign
     participant S3 as dl.influxdata.com
+    participant SL as slack
 
+    Note over Dev,CI: 节选：release / on_push 两条 workflow；nightly 与 changelog 支线见正文
     Dev->>CI: push commit / tag vX.Y.Z
-    CI->>XB: build_binaries (cache key = influxdb-cache-v2 + go.mod checksum)
+    CI->>XB: build_binaries（restore_cache；cache key = influxdb-cache-v2 + go.mod checksum）
     XB->>XB: .circleci/scripts/get-version (PREFIX=1.x)
     XB->>XB: (cd man && make build && gzip -9 ./*.1)
     XB->>XB: tar 源码包 influxdb-src-SHA.tar.gz
     loop darwin/amd64, windows/amd64, linux/amd64, linux/arm64
-        XB->>XB: go build -tags=... -buildmode=pie -ldflags=-s -w ... -L rustlib -Wl,-lunwind
+        XB->>XB: go build（按 GOOS 分支：tags、-buildmode、-ldflags；linux 追加 -L rustlib -Wl,-lunwind；示意）
         XB->>XB: tar + md5sum + sha256sum → artifacts/
     end
-    XB-->>CI: persist_to_workspace artifacts/
-    CI->>PK: build_packages
-    PK->>PK: packager .circleci/packages/config.yaml
-    PK-->>CI: packages/ (deb, rpm, tar.gz, zip)
-    CI->>SG: sign_packages (rsign + sha256sum digests)
-    CI->>CI: test_pkgs_64bit (clean_install/run.bash -D / -R)
-    CI->>S3: publish_packages to releases/TAG/
+    XB-->>CI: persist_to_workspace artifacts/ + save_cache
+    par release 与 on_push 都执行
+        CI->>PK: build_packages
+        PK->>PK: (cd man && make build && gzip -9 ./*.1)
+        PK->>PK: packager .circleci/packages/config.yaml
+        PK-->>CI: packages/ (deb, rpm, tar.gz, zip)
+    and 与 build 并行、不 gate 发布
+        CI->>CI: static_code_checks / fluxtest / unit_test_{inmem,tsi1,race}
+    end
+    Note over CI: 以下仅 release workflow；on_push 到 test_pkgs_64bit 结束，无 sign/publish
+    par 两个 job 均只 requires build_packages，彼此并行
+        CI->>SG: sign_packages (rsign + sha256sum digests)
+        CI->>CI: test_pkgs_64bit (clean_install/run.bash -D / -R)
+    end
+    CI->>S3: publish_packages（只 requires sign_packages）→ releases/TAG/
+    CI->>SL: slack（requires publish_packages）
+    Note over CI: 另有独立支线 changelog → publish_changelog（requires changelog）
 ```
 
 ## 3. 逐项差异
@@ -193,8 +216,8 @@ require (
 
 注意两点容易踩的细节：
 
-1. **`f8635640cc` 是第一次引入 `toolchain` 指令**，同一提交里还把 `go 1.23` 改成了 `go 1.23.0`（补零）。Go 1.21+ 对 `go` 指令的格式校验更严格，`go 1.23` 这种写法会被规范化。
-2. **CI 镜像 tag 与 `go.mod` 的 `toolchain` 不是严格同步的，但每次都是“CI 先动、go.mod 随后补齐”**：`0a4c903b47` 先把 CI 拉到 1.23.12，10 天后 `55b7fb5e1b` 把 go.mod 的 toolchain 从 1.23.8 补到 1.23.12；`56a3f970e4`（"update go to 1.24.11"）只改 `.circleci/config.yml`、没有动 `go.mod`，次日 `1a6880b283` 才把 go.mod 从 1.24.9 补到 1.24.11；`d65673b1f5` 则是一次性把 CI 与 go.mod 一起升到 1.24.13。也就是说存在过“CI 用 1.24.11 编译、开发者本地仍是 1.24.9”的窗口。
+1. **`f8635640cc` 是第一次引入 `toolchain` 指令**，同一提交里还把 `go 1.23` 改成了 `go 1.23.0`（补零）。这是提交作者的选择：`go 1.23` 与 `go 1.23.0` 都是合法写法，工具链不会自动补零。
+2. **CI 镜像 tag 与 `go.mod` 的 `toolchain` 不是严格同步的，多数情况下“CI 先动、go.mod 随后补齐”**：`0a4c903b47` 先把 CI 拉到 1.23.12，18 天后 `55b7fb5e1b` 把 go.mod 的 toolchain 从 1.23.8 补到 1.23.12；`56a3f970e4`（"update go to 1.24.11"）只改 `.circleci/config.yml`、没有动 `go.mod`，次日 `1a6880b283` 才把 go.mod 从 1.24.9 补到 1.24.11；`542ce7f684`、`d65673b1f5` 则在同一提交里把 CI 与 go.mod 一起升级。也就是说存在过“CI 用 1.24.11 编译、开发者本地仍是 1.24.9”的窗口。
 
 ### 3.2 依赖规模与关键依赖
 
@@ -212,7 +235,7 @@ wc -l go.sum                                                 # 1684
 |------|---------|---------|------|
 | `github.com/influxdata/flux` | `v0.65.1` | `v0.196.1` | 提交 `03b6ed2bed`；一次提交改动 `go.mod` 146 行、`go.sum` 376 行 |
 | `github.com/influxdata/influxql` | `v1.1.1-0.20200828144457-65d3ef77d385` | `v1.4.1` | 路径上经过 `v1.2.0`（`8648298012`）→ `v1.4.0` → `v1.4.1`（`77d6f20894`） |
-| `github.com/golang-jwt/jwt/v4` | 无（用 `dgrijalva/jwt-go/v4 v4.0.0-preview1`） | `v4.5.2` | 提交 `f8635640cc`；同提交把 `golang.org/x/net` 拉到 `v0.38.0` |
+| `github.com/golang-jwt/jwt/v4` | 无（用 `dgrijalva/jwt-go/v4 v4.0.0-preview1`） | `v4.5.2` | 提交 `f8635640cc`；同提交把 `golang.org/x/net` 拉到 `v0.38.0`（该提交时；最终 v1.12.3 为 `v0.46.0`，`go.mod:181`） |
 | `github.com/cespare/xxhash/v2` | `cespare/xxhash v1.1.0` | `v2.3.0` | 提交 `45a8227ad6` |
 | `github.com/prometheus/client_golang` | `v1.0.0` | `v1.19.1` | 配套 `client_model v0.6.1` / `common v0.53.0` / `procfs v0.15.0` |
 | `go.uber.org/zap` | `v1.9.1` | `v1.16.0` | 见 §3.7 的动态日志级别 |
@@ -273,7 +296,7 @@ echo "${OUR_RUSTUP_SHA} rustup-init.sh" | sha256sum --check -- \
     || { echo "Checksum problem!"; exit 1; }
 ```
 
-**这意味着 Rust 版本是被 Flux 版本间接钉住的**：升级 Flux 可能悄悄改变 Rust 工具链版本；而 `install-rust.sh` 里 rustup 的 SHA256 是人工审计后硬编码的，两者需要人工同步。`RUST_LATEST_VERSION` 的兜底值是 `1.53`（2021 年 6 月的版本），如果 Flux 的 `Dockerfile_build` 格式变化导致 grep 失败，会静默回落到一个极旧的 Rust。
+**但 CI 不调用这个脚本**：仓库内没有 `install-rust` 调用点，`.circleci/config.yml` 的 `build_binaries` 直接用 cross-builder 镜像，Rust 版本由镜像 tag 决定。因此“Flux 版本间接钉住 Rust”只在**重建镜像或手动执行该脚本**时成立；届时升级 Flux 可能悄悄改变 Rust 工具链版本，而脚本里 rustup 的 SHA256 是人工审计后硬编码的，两者需要人工同步。`RUST_LATEST_VERSION` 的兜底值是 `1.53`（2021 年 6 月的版本），执行脚本时如果 Flux 的 `Dockerfile_build` 格式变化导致 grep 失败，会静默回落到一个极旧的 Rust。
 
 对比旧版：`v1.8.10` 的构建容器是 `Dockerfile_build_ubuntu64`（`FROM ubuntu:focal` + `ruby` + `fpm` + `python2.7`（`build.py` 运行时）+ `python3`），链路上**没有 Rust 相关步骤**，`scripts/ci/` 下也没有 `install-rust.sh`——`git ls-tree v1.8.10 -- scripts/ci/install-rust.sh` 无输出，`git cat-file -e` 对 `v1.8.10` 中的 `scripts/ci/install-rust.sh` 返回非 0（该版本无此文件），与引文一致。
 
@@ -331,10 +354,10 @@ echo "${OUR_RUSTUP_SHA} rustup-init.sh" | sha256sum --check -- \
       GORACE: halt_on_error=1
 ```
 
-工作流同样是 3 条，但内容换了：旧版是 `on_push` + 两个 AWS 清理 workflow（`aws_destroy_daily` / `aws_destroy_callback`），新版是 `release` / `on_push` / `nightly`，旧版的 `perf_test`、`pkg_run_test` job 与两个 aws 清理 workflow 全部消失：
+工作流同样是 3 条，但内容换了：旧版是 `on_push` + 两个 AWS 清理 workflow（`aws_destroy_daily` / `aws_destroy_callback`），新版是 `release` / `on_push` / `nightly`；旧版的 `perf_test` job 与两个 aws 清理 workflow 消失，`pkg_run_test`（AWS EC2 + terraform + ssh `apt-get install` deb）的功能由 `test_pkgs_64bit`（machine executor + `clean_install/run.bash -D/-R`，覆盖 deb/rpm）承接：
 
 ```yaml
-# v1.12.3:.circleci/config.yml:456-528（节选）
+# v1.12.3:.circleci/config.yml:456-567（节选；release/on_push 见下，nightly 见 :529-567）
 workflows:
   version: 2.1
   release:
@@ -368,7 +391,9 @@ workflows:
       - unit_test: {name: unit_test_race,  race: true}
 ```
 
-`static_code_checks` 三件套（`v1.12.3:.circleci/config.yml:281-290`）与旧版 `build.py` 里的 `go vet` 等价，但新增了 `generate.sh` 的**幂等性校验**：
+> 本节未展开的 `nightly`（`:529-567`）由定时触发：`changelog`/`static_code_checks`/`fluxtest`/`unit_test*` 先跑，`build_binaries` requires 它们全部通过，再跑 `build_packages` → `test_pkgs_64bit`；不签名也不发布。
+
+`static_code_checks` 三件套（`v1.12.3:.circleci/config.yml:281-290`）在旧版 `build.py` 的 amd64 测试路径上已有对应：`go fmt ./...` + `./generate.sh` + `go vet ./...`（`v1.8.10:build.py:190-209`，`run_gen = args.arch == "amd64"`，CI 宿主即 amd64）。新版把它们拆成独立 job，格式检查换成 `checkfmt.sh`（goimports）；`generate.sh` 的**幂等性校验**（跑前跑后各查一次 `git status`）旧版也已存在（`v1.8.10:generate.sh:10-23`）：
 
 ```bash
 # v1.12.3:generate.sh:8-21
@@ -521,7 +546,7 @@ PID=$!
 echo $PID > /var/lib/influxdb/influxd.pid
 ```
 
-触发条件是 `influxd config` 解析出的 `data dir` 与 `wal-dir` **两个目录都存在**（`if [[ ( -d "${DATA_DIR}" ) && ( -d "${WAL_DIR}" ) ]]`），不是“配置非空”。语义影响：**每次 `systemctl start influxdb` 都会先跑一次 `influx_inspect buildtsi -compact-series-file`**。好处是 TSI 索引在服务对外可用前已整理完毕，避免上线后第一波查询打在碎片化的 index 上；代价是启动时间与 series 数量正相关，且 `Type=forking` + 前台 `yes |` 管道在有大量 series 时会拉长 unit 的启动超时。相关修复 `70543bed1d`（#26699）把 buildtsi 改成以 `influxdb` 用户运行，`fe1bc357b1`（#26890）修了 host 探测里的判断运算符。
+触发条件是 `influxd config` 解析出的 `data dir` 与 `wal-dir` **两个目录都存在**（`if [[ ( -d "${DATA_DIR}" ) && ( -d "${WAL_DIR}" ) ]]`），不是“配置非空”。语义影响：**每次 `systemctl start influxdb` 都会先跑一次 `influx_inspect buildtsi -compact-series-file`**。好处是 TSI 索引在服务对外可用前已整理完毕，避免上线后第一波查询打在碎片化的 index 上；代价是启动时间与 series 数量正相关，且 `Type=forking` + 前台 `yes |` 管道在有大量 series 时会拉长 unit 的启动超时。相关修复 `70543bed1d`（#26699）把 SysV `init.sh` 的 buildtsi 改成以 `influxdb` 用户运行（systemd 路径本就由 unit 的 `User=influxdb` 保证），`fe1bc357b1`（#26890）修了 host 探测里的判断运算符。
 
 安装脚本方面，`post-install` 的 systemd 分支现在只做两件事：
 
@@ -557,7 +582,7 @@ function install_systemd {
 	}
 ```
 
-新版插入 `config` 段，并专门处理 `toml.Size` / `toml.Duration` 这两种不能直接 `json.Marshal` 的类型：
+新版插入 `config` 段，并显式处理 `toml.Size` / `toml.Duration` 两种包装类型：前者转成 `uint64`，后者转成可读字符串（如 `48m0s`）。二者其实都能直接 `json.Marshal`，这里是为统一数值类型与可读性：
 
 ```go
 // v1.12.3:services/httpd/handler.go:2356-2382
@@ -660,7 +685,7 @@ type Rate interface {
 }
 ```
 
-**注意语义**：`1 - Tokens/Limit` 衡量的是**令牌桶的瞬时占用**，不是「过去一分钟平均吞吐」。`limiter.NewRate` 在创建时会先 `AllowN(now, burstLimit)` 把初始 burst 花掉（`pkg/limiter/writer.go:27`），所以新启动的实例在第一次补充令牌前会读到接近 100%。且当 `compact-throughput` 未配置（无限流）时 `Limiter == nil`，整个 `stats` 诊断项根本不会注册。
+**注意语义**：`1 - Tokens/Limit` 衡量的是**令牌桶的瞬时占用**，不是「过去一分钟平均吞吐」。`limiter.NewRate` 在创建时会先 `AllowN(now, burstLimit)` 把初始 burst 花掉（`pkg/limiter/writer.go:27`），所以新启动的实例在第一次补充令牌前会读到接近 100%。且 `compact-throughput` 的默认值是 48 MiB/s（`tsdb/config.go:44,213`），此时 `store.loadShards` 因 `throughput > 0` 创建 limiter（`tsdb/store.go:527-539`），`stats` 诊断项默认就会注册（`monitor/service.go:156-162`）；只有把它**显式设为 0** 才走 `unlimited` 分支、`Limiter == nil`，`stats` 不注册。
 
 #### 3.7.3 `cq`：CQ 统计扁平化
 
@@ -731,7 +756,7 @@ type Map[K comparable, V any] struct {
 func (m *Map[K, V]) LoadOrStore(key K, value V) (actual V, loaded bool) {
 ```
 
-四个累加点（`handler.go:821`、`:913`、`:2094`、`:2259`）分别覆盖 chunked query、非 chunked query、Flux 与 `/api/v2/query` 路径。开关：
+四个累加点（`handler.go:821`、`:913`、`:2094`、`:2259`）分别覆盖 chunked query、非 chunked query、Prometheus remote read（`POST /api/v1/prom/read`）与 Flux（`POST /api/v2/query`）路径。开关：
 
 ```go
 // v1.12.3:services/httpd/config.go:68
@@ -797,7 +822,7 @@ var (
 	floatBlocksMergeValuesCount    = metrics.MustRegisterCounter("float_blocks_"+TsmGroupMergeValuesCountSuffix, metrics.WithGroup(tsmGroup))
 ```
 
-埋点在生成的 KeyCursor 代码里（`file_store.gen.go.tmpl` 模板 + `.gen.go` 产物），每次 `Read*Block` 统计归并次数与值个数：
+埋点在生成的 KeyCursor 代码里（`file_store.gen.go.tmpl` 模板 + `.gen.go` 产物），仅当查询带 tracing span、`c.col != nil` 时，每次 `Read*Block` 才统计归并次数与值个数：
 
 ```go
 // v1.12.3:tsdb/engine/tsm1/file_store.gen.go（ReadFloatBlock 尾部，提交 133c290fc2）
@@ -814,7 +839,7 @@ var (
 	}
 ```
 
-`> 4` 这个阈值直接把「是否值得换成树形归并」这个判断写进了指标语义：当前实现是顺序归并，k 个 block 合并是 O(n·k) 级别；如果 `merge_over4_count` 持续增长，说明大量读请求在付平方级代价。
+`> 4` 这个阈值直接把「是否值得换成树形归并」这个判断写进了指标语义：当前实现是顺序归并，k 个 block 合并是 O(n·k) 级别；如果某个请求的 tracing span 里 `merge_over4_count` 偏高，说明该请求在付平方级代价。注意输出路径：指标挂在查询的 tsm1 `metrics.Group` 上，只有查询启用 tracing 时才创建（`Engine.CreateIterator`），最终在 instrumented iterator 的 `Close()` 里 `span.SetFields`，只进 tracing span；`pkg/metrics` 没有 Gather/expvar 导出路径，因此它们不进入 `/debug/vars`/`SHOW STATS`，也没有跨请求聚合。
 
 配套的 `pkg/metrics.Timer` 增加了累加语义（旧版只有 `Update`，是覆盖不是累加）：
 
@@ -896,7 +921,7 @@ func CheckedClose(t require.TestingT, c io.Closer) func() {
 | race | `test.sh 1`，`GORACE=halt_on_error=1` | `unit_test` + `race: true`，`taskset -c 0-7` 限制到 8 核 |
 | 32bit | `test.sh 2`（`--arch=i386`） | **无** |
 | TSI | `test.sh 3` | `unit_test` + `data: tsi1` |
-| Flux 一致性 | 无独立 job | `fluxtest` → `./test-flux.sh`（按 go.mod 的 flux revision 下载测试集） |
+| Flux 一致性 | 无独立 job | `fluxtest` → `./test-flux.sh`（按 go.mod 的 flux 模块版本下载测试集；仅伪版本 `v0.0.0-...-<rev>` 时取 revision） |
 | 结果格式 | `go-junit-report`（build.py 内） | `gotestsum --junitfile` + `store_test_results` |
 
 `taskset` 那段注释值得抄一下，它解释了一个诡异的 CI 波动：
@@ -974,24 +999,24 @@ go install google.golang.org/protobuf/cmd/protoc-gen-go
 
 | # | 优化点 | 旧（v1.8.10） | 新（v1.12.3） | 机制 | commit | 影响子系统 |
 |---|--------|---------------|---------------|------|--------|-----------|
-| 1 | TSM 文件名解析 | `findGenerations()` 在文件集变化时对每个文件 `ParseFileName(f.Path)` 做字符串切分；`LastModified` 未变则 `:620-625` 早退 | `TSMReader` 在创建/重命名时解析一次，结果存进 `FileStat.Generation/Sequence` | 把「按文件集变化」的解析降为每个 reader 一次 | `f0d5c73253` (#26905) | tsm1 planner |
-| 2 | compaction planner 的 CPU 占用 | 仅在世代 >2GB 时调用 `BlockCount(files[0],1)` 读盘解码（阈值 1000；v1.8.10 没有 aggressive 概念） | `blockCountCache` 缓存 `FirstBlockCount`，失败才回退 | 把「每次规划都解压超大世代首块」变成「每个 reader 一生一次」（aggressive 判定由 `f04105bede` #25594 在 v1.12.0 引入、`d8bcbd894c` #26100 把默认值调为 10000；首块缓存由 v1.12.1 的 `2a0353ffd2` 引入） | `2a0353ffd2` (#26432) | tsm1 / engine |
+| 1 | TSM 文件名解析 | `findGenerations()` 在文件集变化时对每个文件 `ParseFileName(f.Path)`；`LastModified` 未变则 `:620-625` 早退，但缓存世代的 `level()` 每次都重新解析 `files[0]`，1s tick 的 `PlanLevel`/`Plan`/`PlanOptimize` 会反复调用 | `TSMReader` 在创建/重命名时各解析一次，缓存到 `TSMReader.generation/sequence`，经 `Stats()` 暴露为 `FileStat`；`level()` 直接读 | 规划期解析从「每世代每次 `level()` 一次」降为 0（仅创建/重命名时各一次） | `f0d5c73253` (#26905) | tsm1 planner |
+| 2 | compaction planner 的 CPU 占用 | 仅在世代 >2GB 时调用 `BlockCount(files[0],1)` 读盘解码（阈值 1000；v1.8.10 没有 aggressive 概念） | 首次 `ExtStats()` 读盘一次，并把 `count` 与 `err` 一起以 `valid=true` 缓存（失败不重试）；失败时 `FirstBlockCount=0`，`FileStore.Stats()` 记 warning，planner 按「未优化」处理 | 把「每次规划都解压超大世代首块」变成「每个 reader 首次 `ExtStats()` 时一次」；`FileStore.Stats()` 另有 `lastFileStats` 二级缓存（aggressive 判定由 `f04105bede` #25594 在 v1.12.0 引入、`d8bcbd894c` #26100 把默认值调为 10000；首块缓存由 v1.12.1 的 `2a0353ffd2` 引入） | `2a0353ffd2` (#26432) | tsm1 / engine |
 | 3 | compaction 分组结构 | `tsmGeneration` 持有 `parseFileName` 闭包 | 结构体减为 `{id, files}` | 去掉间接调用，planner 更易推理 | `f0d5c73253` | tsm1 |
 | 4 | compaction 级别回退 | `maxSequence` 只看最大 generation，混级合并会把 L4 数据写回 L2 | 额外记录每代最小 sequence，推出 `maxInputLevel`，必要时抬升 `maxSequence` | 输出级别不下降，「已压实」的数据不会被重新稀释 | `5e9d85c972` (#27233) | tsm1 compact |
 | 5 | 低级别文件嵌套 | planner 假设低级别文件一定排在前面 | 重写 planner 处理「低级别文件出现在高级别之后」 | 改善嵌套低层文件的调度（#26911，1.12 线回归修复；v1.8.10 由 `PlanOptimize` 兜底，见 [04 存储与 Compaction 差异](04_storage_compaction_diff.md) §6.4） | `d1d68d656d` (#26911) | tsm1 planner |
 | 6 | full compaction 不被调度 | v1.8.10 无 `PlanType`/`PT_*` 机制（`git grep` 零命中）；1.12.1 由 `2a0353ffd2` 引入的 `PT_SmartOptimize` / `PT_NoOptimize` 特例把文件标成 in-use 却不再释放 | 删除这两个特例，hold-off 全部移到 `Engine.compact` | 修复「磁盘无限增长」（#26670） | `95e86be3f4` | tsm1 engine |
 | 7 | 优化 compaction holdoff | v1.8.10 无 optimize holdoff（`optHoldoff*` 零命中）；1.12 线开发期（`2a0353ffd2`→`0fdb6adcb2`）的 `StartOptHoldOff` 按值传参，`optHoldoffStart/Duration` 永远不被修改，该 bug 未进入任何 release | 闭包捕获局部变量，按引用生效 | holdoff 真正生效，级别 5 不再被反复触发 | `0fdb6adcb2` (#26488) | tsm1 engine |
-| 8 | TSI 缓存 key 分配 | `Put()` 内 `string(name)`/`string(key)`/`string(value)` 各出现 3~6 次 | 一次性转换并在 evictor 元素与 map key 间共享 | 每次 Put 少多次堆分配 | `f3d5cb68ab` (#27255) | tsi1 |
-| 9 | 缓存分区哈希 | `xxhash v1`，key 以 `[]byte` 传递 | `xxhash/v2` + `Sum64String`，并用 `purego` 版本让编译器省掉 `string→[]byte` | commit message 原文：观测到 "converting string keys to byte slices taking between 3-5% of cpu usage" | `45a8227ad6` (#578/#25622) | tsm1 cache ring、tsi1、series_file、bloom、hll、rhh |
+| 8 | TSI 缓存 key 分配 | `Put()` 内 `string(name)`/`string(key)`/`string(value)` 共做 3~6 次转换（用作 map 查找时可被编译器优化为零分配） | 一次性转换并在 evictor 元素与 map key 间共享 | 插入路径少 1~3 次分配；`exists` 命中早退时新版反多 3 次 | `f3d5cb68ab` (#27255) | tsi1 |
+| 9 | 缓存分区哈希 | `xxhash v1`，key 以 `[]byte` 传递 | `xxhash/v2` + `Sum64String`，直接以 string 读取，避免 `string→[]byte` 转换（最终保留汇编实现） | commit message 原文：观测到 "converting string keys to byte slices taking between 3-5% of cpu usage" | `45a8227ad6` (#578/#25622) | tsm1 cache ring、tsi1、series_file、bloom、hll、rhh |
 | 10 | purger 锁竞争 | `sync.RWMutex`，扫描+Close+Remove 全程持锁 | `gensyncmap.Map` + `mu` 只保护 `running` 标志 | 删除路径不再阻塞 `FileStore` 主锁 | `d5a48e0662` (#27146) | tsm1 file_store |
-| 11 | purger 空转 | `add(nil)` 也会拿锁、起 goroutine、打日志 | 开头 `if len(files) == 0 { return }` | 降低无意义操作与日志噪音 | `e883e8bec3` (#26762) | tsm1 file_store |
-| 12 | array cursor 优化判定 | `pos == 0 && len(res) >= len(tvals)` | 增加 `c.tsm.pos == 0` 前置条件 | 修复「整块直出」优化在错误位置触发导致的错值 | `31cb61f556` (#26691) | tsm1 array_cursor |
-| 13 | 查询并发/内存上限 | 无显式控制器 | `query/control.Config`：`query-concurrency`、`query-initial-memory-bytes`、`query-max-memory-bytes`、`total-max-memory-bytes`、`query-queue-size` | 从「无上限 + OOM」变成「排队 + 配额」 | `b9ee9e5b44`、`f1aa051787` | query/control |
+| 11 | purger 空转 | `add(nil)` 也会拿锁、起一个空转 goroutine（v1.8.10 无 `added` 日志） | 开头 `if len(files) == 0 { return }` | 降低无意义操作；日志噪声是 1.12 线 `purge()` 重构（`logger.Info("added", ...)`）新增的，不是旧版成本 | `e883e8bec3` (#26762) | tsm1 file_store |
+| 12 | array cursor 优化判定 | `pos == 0 && len(res) >= len(tvals)` | 增加 `c.tsm.pos == 0` 前置条件 | 修复「整块直出」优化在错误位置触发、cache+TSM 混合时重复拷贝点（时间戳重复或缺失） | `31cb61f556` (#26691) | tsm1 array_cursor |
+| 13 | 查询并发/内存上限 | `flux/control` 薄壳（`Controller{deps, logger}`），无队列/并发/内存配额 | `query/control.Config`：`query-concurrency`、`query-initial-memory-bytes`、`query-max-memory-bytes`、`total-max-memory-bytes`、`query-queue-size` | 默认仍不限制：`query-concurrency=0` 时 `queryQueue=nil`、内存配额取 `MaxInt64`；显式设置后才启用队列/并发与内存配额，且只作用于 `[flux-controller]` 的 Flux 查询 | `b9ee9e5b44`、`f1aa051787` | query/control |
 | 14 | 写窗口检查 | v1.8.10 无 RP 写入窗口：循环外算一次 `min`，循环内只做 `p.Time().Before(min)` | `NewWriteWindow(rp)` 每批（`MapShards`）只算一次边界 | 写窗口是 v1.12.0 新增能力（`07c261a21a`）；同日的 `19f65f50b7` 把每点两次 `time.Now()` 降为每批一次。v1.8.10 无此功能，因此这不是相对 v1.8.10 的性能优化 | `19f65f50b7` (#25558) | coordinator |
 | 15 | 大小写不敏感比较 | `strings.ToLower(a) == strings.ToLower(b)` | `strings.EqualFold(a, b)` | 消除两侧临时字符串分配 | `2529799abb` (#18147) | services/meta 等 |
 | 16 | `SHOW FIELD KEY CARDINALITY` | 走通用路径 | 走 `_fieldKeys` 系统迭代器 | 避免全量 series 扫描 | `f5da0f50f4` (#23871) | query |
 | 17 | 备份 tar 拷贝窗口 | `io.Copy` 默认 32KB 窗口 | `Stream(..., bufSize, ...)` 可配置，默认 1MB | 减少 syscall 次数 | `bac5cedb3c` (#26964) | pkg/tar、tsm1 backup |
-| 18 | retention 删除的 fsync | 每条 series 一次 `Flush()` | `DeleteSeriesID(id, NoFlush)` + 每分区一次 `FlushSegments` | 把 N 次 fsync 降到 ≤ `SeriesFilePartitionN` 次 | `1420aaf2bc` (#27114) | tsdb/series_file（详见 05 篇） |
+| 18 | retention 删除的 fsync | `DeleteSeriesID` 每条 series 一次 `Flush()`，但只刷 `bufio` 缓冲、**不调用 `file.Sync()`**（0 次 fsync） | `DeleteSeriesID(id, NoFlush)` + 每分区一次 `FlushSegments`；此时 `SeriesSegment.Flush` 已含 `file.Sync()` | v1.8.10→v1.12.3 是 **0 → ≤ `SeriesFilePartitionN` 次 fsync**（新增持久化保障，删除延迟可能变大）；只有相对 v1.10.0–v1.12.2「每条 series 一次 fsync」的中间版本才是减少：`b4e781eff6` 引入每条 fsync，`1420aaf2bc` 改为按分区批量 | `b4e781eff6`、`1420aaf2bc` (#27114) | tsdb/series_file（详见 05 篇） |
 
 > 说明：原表另有两行在 v1.8.10 中**已经是现在的代码**，对 v1.8.10→v1.12.3 无净变化，故不再列为优化项——“单 shard 组的 meta 查询”（`5d922e9d0e`，2020-11；`v1.8.10:services/meta/data.go:1370-1375` 与 `v1.12.3:services/meta/data.go:1480-1485` 逐字相同）与“tag index 缓冲按需增长”（`f646cbc540`，2021-04；`v1.8.10:models/points.go:650-660` 已有 grow 分支）。
 
@@ -1014,7 +1039,7 @@ go install google.golang.org/protobuf/cmd/protoc-gen-go
 		group := generations[gen]
 ```
 
-`ParseFileName` 要做 `filepath.Base` + 两次 `strings.Index`（先 `.` 后 `-`）+ 两次 `strconv.ParseUint(..., 10, 32)`。但旧版并非每秒都解析：`:620-625` 用 `FileStore.LastModified()` 短路，文件集没变就直接返回上次结果。真实代价是「每次文件集变化（增删/轮转）时 N 个文件各 2 次 `ParseUint`」，而不是「每秒 400 次」——200 个文件的 shard 只在变化那一拍付这笔钱。新版把结果挂到 `FileStat`：
+`ParseFileName` 要做 `filepath.Base` + 两次 `strings.Index`（先 `.` 后 `-`）+ 两次 `strconv.ParseUint(..., 10, 32)`。旧版有两条解析路径：`findGenerations` 本身在 `LastModified` 未变时短路（`:620-625`），所以文件集稳定时不会重新遍历 N 个文件；但缓存下来的 `tsmGeneration` 仍持有 `parseFileName` 闭包，`level()` 每次调用都重新解析 `t.files[0].Path`（`:177-188`）。1s tick 的 `PlanLevel`/`Plan`/`PlanOptimize` 会反复调用 `level()`（`v1.8.10:tsdb/engine/tsm1/compact.go:254-286,494,549`；`tsmGenerations.level()` 还会遍历组内每个世代），因此旧版规划期仍在按「世代数 × 调用次数」持续解析，而不是只在文件集变化那一拍付钱。新版把结果挂到 `FileStat`：
 
 ```go
 // v1.12.3:tsdb/engine/tsm1/file_store.go:236-246
@@ -1069,7 +1094,7 @@ type blockCountCache struct {
 }
 ```
 
-v1.8.10 **没有** aggressive points-per-block 判定；它只用 `BlockCount(files[0],1)` 判断“>2GB 且满块则跳过”，阈值是 `DefaultMaxPointsPerBlock`(1000)。首块缓存（`2a0353ffd2` #26432，v1.12.1）与 aggressive 判定（`f04105bede` #25594 在 v1.12.0 引入，默认值由 `d8bcbd894c` #26100 调为 10000）都是 v1.12 线新增的机制，不是 v1.8.10 的行为。新版把这个值缓存在 `TSMReader` 上，通过 `ExtStats()` 暴露：
+v1.8.10 **没有** aggressive points-per-block 判定；它只用 `BlockCount(files[0],1)` 判断“>2GB 且满块则跳过”，阈值是 `DefaultMaxPointsPerBlock`(1000)、谓词是 `==`；新版各规划点改为 `FirstBlockCount >= DefaultMaxPointsPerBlock`（`compact.go:513,592,643`），这是 10000 点的 aggressive 块也能被识别为满块的前提。首块缓存（`2a0353ffd2` #26432，v1.12.1）与 aggressive 判定（`f04105bede` #25594 在 v1.12.0 引入，默认值由 `d8bcbd894c` #26100 调为 10000）都是 v1.12 线新增的机制，不是 v1.8.10 的行为。新版把这个值缓存在 `TSMReader` 上，通过 `ExtStats()` 暴露：
 
 ```go
 // v1.12.3:tsdb/engine/tsm1/reader.go:687-698
@@ -1087,7 +1112,7 @@ func (t *TSMReader) ExtStats() (ExtFileStat, error) {
 }
 ```
 
-`errors.Join` 是 Go 1.20 引入的——这也解释了为什么这个改动必须建立在 Go ≥ 1.20 的前提上。
+`errors.Join` 是 Go 1.20 引入的——这也解释了为什么这个改动必须建立在 Go ≥ 1.20 的前提上。缓存语义是：首次调用 `firstBlockCount()` 时读盘一次，并把 `count` 与 `err` 一起以 `valid=true` 写入缓存，之后不重试、也没有回退路径；失败时 `ExtStats()` 返回 joined error，`FileStore.Stats()` 只 `logger.Warn`，该文件的 `FirstBlockCount` 保持 0，planner 因而不跳过 >2GB 世代（`compact.go:592,643`），`isFileOptimized` 也判为未优化。`FileStore.Stats()` 自身另有 `lastFileStats` 缓存，在 `replace`、`Apply`、`DeleteRange`、`Close` 时置 nil，下次 `Stats()` 惰性重建。代价是 `Stats()` 对每个文件调用 `ExtStats()`，每个 reader 首次 `Stats()` 都会解一次首块（旧版仅 >2GB 世代）；收益是这些解码只发生一次，而非每次规划。
 
 **（3）purger 的「锁外做重活」**
 
@@ -1145,7 +1170,7 @@ func (p *purger) hasFiles() bool {
 }
 ```
 
-注释里「避免调用 `Len()`（会遍历整个 map）」是另一半优化：`sync.Map` 没有 O(1) 的 `Len()`，所以用「找到第一个就停」的 `Range` 代替。
+注释里「避免调用 `Len()`（会遍历整个 map）」是另一半优化：`sync.Map` 没有 O(1) 的 `Len()`，所以用「找到第一个就停」的 `Range` 代替。两个分支也要注意：`InUse` 的文件留在 map 里，goroutine 每秒重试直到引用释放；`Close`/`Remove` 失败的文件也会 `Delete(k)`，不再重试（可能留下 `.tsm.tmp` 直到下次启动清理），见 [04 存储与 Compaction 差异](04_storage_compaction_diff.md) §6.5。
 
 **（4）array cursor 的条件修正**
 
@@ -1168,7 +1193,7 @@ func (p *purger) hasFiles() bool {
 | 变更 | 升级会不会坏 | 说明 |
 |------|--------------|------|
 | Go 1.13 → 1.24 | **会（构建侧）** | 本地必须装 Go ≥ 1.24.0；CI 必须用新 cross-builder 镜像。用旧 Go 编译会直接报 "go.mod requires go >= 1.24.0" |
-| `toolchain go1.24.13` | 一般不会 | Go 1.21+ 会自动下载 1.24.13；离线/受限网络环境需要预置该工具链或设 `GOTOOLCHAIN=local`（此时必须本机就是 1.24.13+） |
+| `toolchain go1.24.13` | 一般不会 | Go 1.21+ 会自动下载 1.24.13；离线/受限网络环境需要预置该工具链或设 `GOTOOLCHAIN=local`（此时用本机工具链，只需满足 `go 1.24.0` 指令；`toolchain` 行不再强制） |
 | 依赖 51 → 181 | 间接风险 | `go.sum` 变大、`go mod download` 变慢；企业私有代理需要放行 `cloud.google.com`、`github.com/Azure`、`github.com/aws` 等一大批域名 |
 | `Dockerfile` | **会** | 仍在用 `dep ensure` + `golang:1.15.10`，与新 go.mod 不兼容。**不要用它构建 1.12.3** |
 | `appveyor.yml` | **会** | 仍指向 `C:\go112` 与 `dep`；新版 Windows 构建走 CircleCI 的 `xcc windows` |
@@ -1180,7 +1205,7 @@ func (p *purger) hasFiles() bool {
 | `/debug/vars` 新增 `config` | 监控侧可能坏 | 多了一个大对象；如果采集端把整个 JSON 存成一条记录，体积会涨 |
 | `/debug/vars` 的 `cq` 扁平化 | **会** | 结构从 `{name,tags,values}` 变成裸 `values` |
 | `userquerybytes` | 不会（默认关） | 打开后每个用户多一条 statistic，采集端要能处理动态 tag |
-| `merge_*` 指标 | 不会 | 纯新增 |
+| `merge_*` 指标 | 不会（但无法从 `/debug/vars` 采集） | 纯新增；仅查询启用 tracing 时写入 span（单请求、无跨请求聚合），不进 `/debug/vars`/`SHOW STATS`（§3.7.6） |
 | `compact-throughput` 日志键改名 | **会（告警规则）** | `throughput_bytes_per_second` → `compact-throughput`（`82729cf8ff`）。按旧键做 grep/告警的规则会静默失效 |
 | `logger.Level` 类型变化 | 一般不会 | toml 里仍是 `level = "info"`；但如果代码里有 `cfg.Level == zapcore.InfoLevel` 这样的比较，编译期就会失败（类型不同） |
 | `stress/` 删除 | **会** | 依赖 `go run ./stress` 或 `influx_stress` 的流程要另找工具 |
@@ -1188,12 +1213,12 @@ func (p *purger) hasFiles() bool {
 
 ### 5.2 二进制 / 包体积 / 启动行为
 
-- **二进制体积**：新版 Linux 产物是 `static-pie` + `-linkmode=external` + Rust `libunwind` 静态链入，且 `-w -s` 去符号。旧版 `build.py` 的 `ldflags` 只有 `-s`（`v1.8.10:build.py:560`），没有 `-w`，也没有 external linkmode。因此两版的体积不具备直接可比性——本文不给具体数字，需要实测。
+- **二进制体积**：新版 Linux 产物是 `static-pie` + `-linkmode=external` + Rust `libunwind` 静态链入，且 `-w -s` 去符号。旧版 `build.py` 只有 static 分支的 `ldflags` 带 `-s`（`v1.8.10:build.py:558-566`；非 static 连 `-s` 都没有），都没有 `-w`，也没有 external linkmode。因此两版的体积不具备直接可比性——本文不给具体数字，需要实测。
 - **包体积**：新版包内 8 个 man page（`config.yaml:51-73` 列出 `influx.1.gz` 到 `influxd-version.1.gz`），旧版 9 个（多一个 `influx_stress.1`，因为 `stress/` 被删）；变化点是改用 `config.yaml` 的 `extras` 显式列出，而不是 `build.py` 的 `package_man_files()`。源码包在 CI 里预先生成 man page（`.circleci/config.yml:44-46`）。
 - **启动行为**：
   1. `systemd` 路径下先跑 `buildtsi`（见 §3.6），`Type=forking` 的语义依赖启动脚本自己写 PID 文件，这段逻辑未变。
   2. `influxd config` 的输出内容变了：`http` 段现在会打印 `access-log-status-filters = []`（因为 `NewConfig` 里从 `nil` 改成 `make([]StatusFilter, 0)`，`services/httpd/config.go:96`）。旧版 `nil` slice 会被 TOML 编码器省略。
-  3. `influxd config` 还可能多出 `[flux-controller]` 段（`query/control.Config`），取决于该段是否被写入 toml 模板。
+  3. `influxd config` 总会输出 `[flux-controller]` 段：`Config.FluxController` 是普通 struct 字段、无 `omitempty`，零值也会被编码（默认全 0，即不限制）；`etc/config.sample.toml` 未收录该段。
 
 ## 6. 具体案例
 
@@ -1208,9 +1233,10 @@ func (p *purger) hasFiles() bool {
 #    ├─ docker build -f Dockerfile_build_ubuntu64 ...   (ubuntu:focal + ruby + fpm + python2.7（build.py）+ python3 + gcc)
 #    └─ 容器内执行：
 #         python build.py --test --junit-report --package
-#           ├─ go vet ./...
-#           ├─ 对 supported_builds 里每个 (platform, arch) 执行 go build
-#           ├─ go-junit-report 汇总测试结果
+#           ├─ go mod download → go fmt ./... → ./generate.sh（仅 amd64）→ go vet ./...
+#           ├─ go test ./...，再经 go-junit-report 汇总
+#           ├─ 对 supported_builds 里当前 (platform, arch) 执行 go build
+#           │    （test.sh 0 不传 --arch/--platform，默认宿主平台/架构，不是全平台矩阵）
 #           └─ fpm -s dir -t deb / -t rpm ...
 ```
 
@@ -1285,7 +1311,7 @@ packager .circleci/packages/config.yaml
 | 符号 | `-s` | `-s -w` |
 | 打包 | fpm（`deb`/`rpm`），自写 tar/zip | `packager` 一份 YAML |
 | 签名 | build.py 内 `gpg` | 独立 `sign_packages` job + `rsign` |
-| 包安装测试 | 容器内 | `test_pkgs_64bit`：起 `ubuntu-2204` machine，跑 `releng/packages/spec/clean_install/run.bash -D/-R` |
+| 包安装测试 | AWS EC2（terraform + ssh + `apt-get install` deb） | `test_pkgs_64bit`：起 `ubuntu-2204` machine，跑 `releng/packages/spec/clean_install/run.bash -D/-R`（deb/rpm） |
 
 ### 6.2 案例：同一台机器上 `/debug/vars` 的输出差异
 
@@ -1312,6 +1338,7 @@ packager .circleci/packages/config.yaml
   "build":   { ... },
   "cmdline": [ ... ],
   "config":  {
+    ...,
     "compact-throughput": 50331648,
     "compact-throughput-burst": 50331648,
     "aggressive-points-per-block": 10000
@@ -1326,7 +1353,7 @@ packager .circleci/packages/config.yaml
 }
 ```
 
-要点：`"config"` 只包含 `[data]` 段（`monitor/service.go:164-166` 注册的是 `m.TSDBConfig`），`"stats"` 里的百分比是**令牌桶瞬时占用**，`"cq"` 旧版是带 `{name,tags,values}` 包装的 Statistic、新版只输出 `values`（键名 `queryOk`/`queryFail`），`userquerybytes` 需要显式开启才会出现。
+要点：`"config"` 是 `tsdb.Config.Diagnostics()` 的 17 个键（`tsdb/config.go:288-308`，示例省略其余 14 个），只包含 `[data]` 段（`monitor/service.go:164-166` 注册的是 `m.TSDBConfig`），但已含 `dir`/`wal-dir` 绝对路径；`"stats"` 里的百分比是**令牌桶瞬时占用**，`"cq"` 旧版是带 `{name,tags,values}` 包装的 Statistic、新版只输出 `values`（键名 `queryOk`/`queryFail`），`userquerybytes` 需要显式开启才会出现。
 
 ### 6.3 案例：依赖图结构的一次真实差异
 
@@ -1348,10 +1375,10 @@ $ go mod download && du -sh "$(go env GOMODCACHE)"
 
 1. **依赖膨胀与供应链面**。131 个间接依赖里包含 4 个云厂商 SDK、3 个 SQL 驱动、Kafka、Snowflake、SAP HANA、Vertica。这些代码大部分不会被链接进 `influxd`，但会进入 `go.sum`、构建缓存和 SBOM。对「必须能离线构建」的环境，预热模块缓存的成本显著上升。
 2. **CGO + Rust 让构建从「纯 Go」变成「多语言工具链」**。`find_rustlib_path` 没有在仓库里定义（`grep -rn --include=config.yml "find_rustlib_path" .circleci` 只命中 `.circleci/config.yml:94,97`），完全依赖 `quay.io/influxdb/cross-builder` 镜像。任何想脱离该镜像自建 CI 的人都要自己复刻 `xcc`、`find_rustlib_path` 和 musl 交叉工具链——这是 1.12.3 最难自建的部分。
-3. **`install-rust.sh` 的版本回落是静默的**。`RUST_LATEST_VERSION=${FLUX_RUST_VERSION:-1.53}`（`scripts/ci/install-rust.sh:7`）在 `grep 'FROM rust:'` 失败时会回落到 Rust 1.53。由于 `set -ex` 不会因为 grep 无匹配而失败（管道里 `cut` 成功退出），失败是静默的，只会在编译 Rust 依赖时报出难以定位的错误。
+3. **`install-rust.sh` 的版本回落是静默的（仅在使用该脚本/重建镜像时）**。该脚本在 CI 中没有调用点；若手动执行，`RUST_LATEST_VERSION=${FLUX_RUST_VERSION:-1.53}`（`scripts/ci/install-rust.sh:7`）在 `grep 'FROM rust:'` 失败时会回落到 Rust 1.53。由于 `set -ex` 不会因为 grep 无匹配而失败（管道里 `cut` 成功退出），失败是静默的，只会在编译 Rust 依赖时报出难以定位的错误。
 4. **`Dockerfile` 与 `appveyor.yml` 是彻底的死代码**。前者 `FROM golang:1.15.10` + `dep ensure`（`Dockerfile:1-5`），后者 `GOROOT: C:\go112` + `dep`（`appveyor.yml:15,27-29`）。新贡献者若照这两个文件构建必然失败，且失败信息（`Gopkg.toml` 不存在、Go 版本过低）与真实原因（应使用 go modules）相距很远。
-5. **CI 复杂度**。567 行配置、3 条常驻 workflow、多种执行器（docker / machine / 带 GCS 认证的私有镜像）、`circleci_ip_ranges: true` 的签名 job。任何一处 tag 或镜像 digest 变更（如 `ci-packager-next@sha256:c92ea43...`）都可能在不同 workflow 上表现不一致——`56a3f970e4` 只改 CI 不改 `go.mod` 就是这种不一致的实例。
-6. **`/debug/vars` 输出 `config` 的信息暴露面**。`config` 段来自 `tsdb.Config.Diagnostics()`，当前只覆盖 `[data]`；一旦将来扩展到 `[http]`/`[tls]`，`/debug/vars` 就会把 `https-certificate` 等路径甚至凭据类配置吐出来。该端点虽然要求 admin 权限（`services/httpd/handler.go:357-358` 注册为 `true, true`），但仍是需要盯住的扩张点。
+5. **CI 复杂度与发布门禁**。567 行配置、3 条常驻 workflow、多种执行器（docker / machine / 带 GCS 认证的私有镜像）、`circleci_ip_ranges: true` 的签名 job。任何一处 tag 或镜像 digest 变更（如 `ci-packager-next@sha256:c92ea43...`）都可能在不同 workflow 上表现不一致——`56a3f970e4` 只改 CI 不改 `go.mod` 就是这种不一致的实例。另外 `build_binaries` 的 cross-builder 用的是可变 `-latest` tag（`:10`），只有 packager 镜像按 digest 固定（`:195`），构建环境不可复现；且 `publish_packages` 只 `requires sign_packages`，`test_pkgs_64bit` 是并行 sibling，安装测试失败**不阻塞发布**——发布前需人工确认安装测试为绿，或把 publish 改为同时 requires 两者。
+6. **`/debug/vars` 输出 `config` 的信息暴露面**。`config` 段来自 `tsdb.Config.Diagnostics()` 的 17 个键，当前只覆盖 `[data]`，但已包含 `dir`/`wal-dir` 绝对路径；一旦将来扩展到 `[http]`/`[tls]`，`/debug/vars` 就会把 `https-certificate` 等路径甚至凭据类配置吐出来。该端点只在 `AuthEnabled && PprofEnabled && PprofAuthEnabled` 三者同时为真时才注册带 admin 校验的副本（`handler.go:322,357-358`）；默认 `PprofAuthEnabled=false` 时 `ServeHTTP` 直接走 `serveExpvar`（`handler.go:571-572`），**没有认证**。`Route` 的两个 `true` 是 `Gzipped`/`LoggingEnabled`，不是认证。
 7. **`compact-throughput-usage-percentage` 的语义容易被误读**。`NewRate` 创建时 `AllowN(now, burstLimit)` 会立刻耗尽初始 burst（`pkg/limiter/writer.go:27`），所以进程刚启动、第一次补充令牌之前，该值接近 100%。把它做成告警阈值会在每次重启时误报。
 8. **构建目标收窄是不可逆的**。1.12.3 只产出 linux amd64/arm64、darwin amd64、windows amd64。若下游需要 386/armhf，只能回退到旧版本或自行交叉编译，而自行交叉编译又撞上 §7.2 的 Rust 工具链问题。
 9. **启动期 `buildtsi` 失败会让服务起不来**。`influxd-systemd-start.sh` 是 `#!/bin/bash -e`（`:1`），`yes | influx_inspect buildtsi …`（`:47-49`）不在条件位、也没有 `|| true`；脚本没有 `set -o pipefail`，此时管道退出码取**最后一条**命令（`influx_inspect`），失败会触发 `set -e`，脚本以非 0 退出，`influxdb.service`（`Type=forking`、`Restart=on-failure`）报启动失败并按 on-failure 重试。真正需要盯的风险不是“带旧索引上线”，而是**启动时间随 series 数增长**，可能撞上 systemd 默认的 `TimeoutStartSec`（90s），形成“重启—超时—再重启”。
@@ -1448,7 +1475,7 @@ $ go mod download && du -sh "$(go env GOMODCACHE)"
 | CheckedClose | `v1.12.3:pkg/testing/helper/helpers.go:10-25` | `defer CheckedClose(t, c)()` | `0f3436d10d` |
 | 使用点 | `v1.12.3:services/httpd/service_test.go:53,103,176,205,261` | 5 处 | `0f3436d10d` |
 | fluxtest job | `v1.12.3:.circleci/config.yml:359-367` | `./test-flux.sh` | — |
-| fluxtest 脚本 | `v1.12.3:test-flux.sh:11-31` | 按 go.mod 的 flux revision 下载 | — |
+| fluxtest 脚本 | `v1.12.3:test-flux.sh:11-31` | 按 flux 模块版本下载；仅伪版本 `v0.0.0-...-<rev>` 时取 revision | — |
 | CI 测试参数化 | `v1.12.3:.circleci/config.yml:292-306` | `INFLUXDB_DATA_INDEX_VERSION` | `59e84cc48b` |
 
 ### 8.6 性能优化 commit 索引

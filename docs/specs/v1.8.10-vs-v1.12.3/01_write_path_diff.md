@@ -3,7 +3,7 @@
 > **基线**
 > - OLD：`v1.8.10` = commit `688e697c51`（2021-10-11）
 > - NEW：`v1.12.3` = commit `f3d5cb68ab`（`docs/specs/` 这批文档的代码基准）
-> - 区间：527 commits，602 files，+79,310 / −45,239；NEW 工作树只额外包含 7 个 docs 提交，代码与 `f3d5cb68ab` 相同。
+> - 区间：527 commits，602 files，+79,310 / −45,239；NEW 工作树只额外包含若干 docs 提交（数量随文档演进），代码与 `f3d5cb68ab` 相同。
 >
 > **本文范围**：`coordinator/points_writer.go`、`tsdb/store.go`、`tsdb/shard.go`、`tsdb/field_validator.go`、
 > `tsdb/engine/tsm1/{engine,cache,ring,wal,reader,file_store,compact}.go`、`tsdb/internal/fieldsindex.*`、
@@ -35,7 +35,7 @@
 
 | # | 变更点 | v1.8.10 | v1.12.3 | 影响 | 证据 |
 |---|--------|---------|---------|------|------|
-| 1 | 写入 API 形态 | `WriteToShard(shardID, points)` + `WriteToShardWithContext(ctx,…)`；`Shard.WritePointsWithContext(ctx,…)`；`Engine.WritePointsWithContext(ctx,…)` | `Store.WriteToShard(writeCtx tsdb.WriteContext, shardID, points)`；`Shard.WritePoints(points, tracker)`；`Engine.WritePoints(points, tracker)` | Go API 破坏性变更（企业版/嵌入式调用方必须改）；HTTP 状态码另有 §5.1 所列变化 | `v1.8.10:tsdb/store.go:1412`；`v1.12.3:tsdb/store.go:1861` |
+| 1 | 写入 API 形态 | `WriteToShard(shardID, points)` + `WriteToShardWithContext(ctx,…)`；`Shard.WritePointsWithContext(ctx,…)`；`Engine.WritePointsWithContext(ctx,…)`；`PointsWriter.WritePointsWithContext` / `WritePointsPrivilegedWithContext` | `Store.WriteToShard(writeCtx tsdb.WriteContext, shardID, points)`；`Shard.WritePoints(points, tracker)`；`Engine.WritePoints(points, tracker)`；`PointsWriter.WritePointsPrivileged(writeCtx,…)` | Go API 破坏性变更（企业版/嵌入式调用方必须改）；HTTP 状态码另有 §5.1 所列变化 | `v1.8.10:tsdb/store.go:1412`；`v1.12.3:tsdb/store.go:1861` |
 | 2 | 写统计传递方式 | `context.WithValue` + `Int64` 指针（`tsdb.ConetextKey`） | `tsdb.StatsTracker` 四个回调；`Store.statsTracker(db, rp, login)` | 去掉 context value 反模式；支持按 measurement / 按登录名计量 | `v1.8.10:tsdb/shard.go:504-516`；`v1.12.3:tsdb/shard.go:549-554`、`v1.12.3:tsdb/store.go:1796` |
 | 3 | 请求身份 | `meta.User` 参数（OSS 不使用） | `tsdb.WriteContext{UserId}`；内置 `_systemuser_*` 假用户 | 新增 `ingress-metric-by-login-enabled` 指标维度 | `v1.8.10:coordinator/points_writer.go:357`；`v1.12.3:coordinator/points_writer.go:463-471`；`tsdb/store.go:1842-1858` |
 | 4 | 字段元数据落盘 | 每个**含新字段的写请求**调用一次 `Save()`（一次请求内多字段合并为一次全量重写：tmp + fsync + rename + SyncDir） | 追加写 `fields.idxl` 变更日志（`O_APPEND|O_SYNC`），批量合并；`fields.idx` 只在 Close / ApplyChanges / LoadMetadataIndex 重建 / Restore·Import 时全量写 | 新字段密集写入时 IO 放大显著下降 | `v1.8.10:tsdb/shard.go:1786-1864`；`v1.12.3:tsdb/shard.go:1834`、`:1915-2001`、`:1855-1913` |
@@ -64,19 +64,27 @@
 flowchart TD
     H1["HTTP serveWrite<br/>handler.go:887"] --> P1["PointsWriter.WritePointsWithContext<br/>points_writer.go:353"]
     P1 --> PP1["WritePointsPrivilegedWithContext<br/>points_writer.go:368"]
-    PP1 --> G1["每 shard 一个 goroutine<br/>ctx 里塞 Int64 指针 :388-391"]
+    PP1 --> M1["MapShards：RP/写窗口分类、建 shard group<br/>points_writer.go:191-241"]
+    M1 -->|"丢弃→PartialWriteError(400)；空组→panic"| EX1["写请求失败"]
+    M1 --> G1["每 shard 一个 goroutine<br/>ctx 里塞 Int64 指针 :388-391"]
     G1 --> W1["writeToShardWithContext<br/>points_writer.go:461"]
-    W1 --> T1{"type switch<br/>shardWriterWithContext :467-479"}
+    W1 -->|"ErrShardNotFound→CreateShard→重试一次"| T1{"type switch<br/>shardWriterWithContext :467-479"}
     T1 --> S1["Store.WriteToShardWithContext<br/>store.go:1416"]
-    S1 --> E1["epoch.StartWrite / guard.Wait<br/>store.go:1437-1445"]
+    S1 --> E1["epoch.StartWrite / guard.Wait / 冷 shard 唤醒<br/>store.go:1437-1453"]
     E1 --> SH1["Shard.WritePointsWithContext<br/>shard.go:519"]
-    SH1 --> V1["validateSeriesAndFields<br/>shard.go:590 FieldValidator.Validate :691"]
-    SH1 --> CF1["createFieldsAndMeasurements<br/>shard.go:744 全量 fields.idx"]
-    SH1 --> T2{"type switch<br/>contextWriter :548-551"}
+    SH1 --> V1["validateSeriesAndFields<br/>shard.go:590（含 CreateSeriesListIfNotExists :645）"]
+    V1 -->|"非 Partial 错误→500"| EX1
+    V1 --> CF1["createFieldsAndMeasurements<br/>shard.go:744 全量 fields.idx"]
+    CF1 -->|"失败→500"| EX1
+    CF1 --> T2{"type switch<br/>contextWriter :548-551"}
     T2 --> EN1["Engine.WritePointsWithContext<br/>engine.go:1308"]
     EN1 --> C1["Cache.WriteMulti<br/>cache.go:320"]
+    C1 -->|"失败 return err"| EX1
     C1 -->|"成功"| L1["WAL.WriteMulti（仅 WALEnabled）<br/>wal.go:311"]
-    C1 -->|"失败 return err"| EX1["写请求失败（HTTP 500）"]
+    L1 -->|"失败 return err（Cache 已写入）"| EX1
+    PP1 --> SUB1["非阻塞投递 subPoints（原始 points）<br/>points_writer.go:410-431"]
+    SUB1 --> TM1["time.NewTimer(WriteTimeout) :437"]
+    TM1 --> R1["等待 shard 结果 :439-451<br/>timeout/closing→500；Partial→400"]
 ```
 
 ### 2.2 调用链：新版（v1.12.3）
@@ -85,20 +93,27 @@ flowchart TD
 flowchart TD
     H2["HTTP serveWrite<br/>handler.go:1670"] --> P2["PointsWriter.WritePoints<br/>points_writer.go:463 构造 WriteContext"]
     P2 --> PP2["WritePointsPrivileged<br/>points_writer.go:474"]
-    PP2 --> G2["每 shard 一个 goroutine<br/>传递 writeCtx :493-505"]
-    PP2 --> SUB["Subscriber.Send → NewWriteRequest<br/>points_writer.go:513 调用方 goroutine 同步"]
+    PP2 --> M2["MapShards：RP/写窗口分类、建 shard group<br/>points_writer.go:299-360"]
+    M2 -->|"丢弃→PartialWriteError(400)；空组→500"| EX2["写请求失败"]
+    M2 --> G2["每 shard 一个 goroutine<br/>传递 writeCtx :493-505"]
+    PP2 --> TM2["time.NewTimer(WriteTimeout) :508"]
+    TM2 --> SUB["Subscriber.Send（原始 points，调用方 goroutine 同步）<br/>points_writer.go:511-514；Send 不受超时约束"]
+    TM2 --> R2["等待 shard 结果 :524-537<br/>timeout/closing→500；Partial→400"]
     G2 --> W2["writeToShard<br/>points_writer.go:542"]
-    W2 --> S2["Store.WriteToShard(writeCtx,…)<br/>store.go:1861"]
-    S2 --> E2["epoch.StartWrite / guard.Wait<br/>store.go:1882-1890"]
+    W2 -->|"ErrShardNotFound→CreateShard→重试一次"| S2["Store.WriteToShard(writeCtx,…)<br/>store.go:1861"]
+    S2 --> E2["epoch.StartWrite / guard.Wait / 冷 shard 唤醒<br/>store.go:1882-1896"]
     E2 --> SH2["Shard.WritePoints(points, tracker)<br/>shard.go:562"]
-    SH2 --> V2["validateSeriesAndFields<br/>shard.go:613"]
+    SH2 --> V2["validateSeriesAndFields<br/>shard.go:613（含 CreateSeriesListIfNotExists :668）"]
     V2 --> VC2["ValidateAndCreateFields<br/>field_validator.go:17 校验中建字段"]
-    SH2 --> CF2["saveFieldsAndMeasurements<br/>shard.go:765"]
+    V2 -->|"非 Partial 错误→500"| EX2
+    V2 --> CF2["saveFieldsAndMeasurements<br/>shard.go:585"]
+    CF2 -->|"失败→500"| EX2
     CF2 --> CL2["MeasurementFieldSet.Save(changes)<br/>shard.go:1834 → fields.idxl"]
-    SH2 --> EN2["Engine.WritePoints(points, engineTracker)<br/>engine.go:1346"]
+    CL2 --> EN2["Engine.WritePoints(points, engineTracker)<br/>engine.go:1346"]
     EN2 --> C2["Cache.WriteMulti(string key)<br/>cache.go:319"]
+    C2 -->|"失败 return err"| EX2
     C2 -->|"成功"| L2["WAL.WriteMulti（仅 WALEnabled）<br/>wal.go:311"]
-    C2 -->|"失败 return err"| EX2["写请求失败（HTTP 500）"]
+    L2 -->|"失败 return err（Cache 已写入）"| EX2
 ```
 
 ### 2.3 字段元数据的"双文件"数据流（新增）
@@ -106,22 +121,29 @@ flowchart TD
 ```mermaid
 flowchart LR
     subgraph W["写请求"]
-      A["validateSeriesAndFields"] --> B["ValidateAndCreateFields<br/>LoadOrStore 内存生效"]
-      B --> C["saveFieldsAndMeasurements"]
+      A["Shard.WritePoints → validateSeriesAndFields"] --> B["ValidateAndCreateFields<br/>LoadOrStore 内存生效"]
+      B -.->|"返回 fieldsToCreate 后由 Shard.WritePoints 调用；失败跳过 engine"| C["saveFieldsAndMeasurements"]
       C --> D["MeasurementFieldSet.Save(changes)"]
       D --> E["RequestSave 阻塞等回执"]
     end
     subgraph S["SaveWriter 单 goroutine"]
-      E --> F["排空队列并合并"]
+      E --> TR["Truncate(changeFileSize) 丢弃半条记录 :1958-1965"]
+      TR --> F["排空队列并合并"]
       F --> G["marshalFieldChanges<br/>长度前缀 protobuf"]
       G --> H["fields.idxl O_APPEND + O_SYNC"]
       H --> I["回执所有等待方"]
     end
-    subgraph R["启动 / Close / ApplyChanges"]
-      J["load fields.idx"] --> K["重放 fields.idxl"]
+    subgraph R["启动：load + ApplyChanges"]
+      J["load fields.idx"] --> K["重放 fields.idxl（loadAllFieldChanges）"]
       K --> L["WriteToFile: tmp → rename → SyncDir"]
-      L --> M["删除 fields.idxl"]
+      L --> M["defer 删除 fields.idxl（成功/失败都删）"]
     end
+    subgraph C2["Close / LoadMetadataIndex 重建 / Restore·Import"]
+      CC["Close：changeMgr.Close()（关队列等 SaveWriter）→ WriteToFile"]
+      LM["LoadMetadataIndex 重建 / Restore·Import overlay：直接 WriteToFile（不关队列、不重放）"]
+    end
+    CC --> M
+    LM --> M
     H -.->|进程重启| K
 ```
 
@@ -135,7 +157,7 @@ flowchart LR
   新版 `AddedMeasurementPoints` 在逐点循环内、组完 key 后立即回调（Cache/WAL 之前，Cache 写失败也已计数），
   `AddedPoints` 才在 Cache/WAL 成功后回调（`v1.12.3:tsdb/engine/tsm1/engine.go:1435-1437,1454-1456`）。
 - **分片内的顺序没变**：仍然是 校验 → 保存字段元数据 → 写 Cache → 写 WAL
-  （`v1.8.10:tsdb/shard.go:543-585`、`v1.12.3:tsdb/shard.go:585-603`）。
+  （`v1.8.10:tsdb/shard.go:531-586`、`v1.12.3:tsdb/shard.go:574-609`）。
 
 ---
 
@@ -231,6 +253,15 @@ func (w *PointsWriter) WritePoints(database, retentionPolicy string, consistency
 }
 ```
 
+> **并发合同**：`StatsTracker` 的回调不是串行调用——一次 `PointsWriter` 请求内每个 shard 一个 goroutine
+> （`v1.12.3:coordinator/points_writer.go:493-495`）；TSI `CreateSeriesListIfNotExists` 按 `availableThreads()`
+> 分区 fan-out（`v1.12.3:tsdb/index/tsi1/index.go:665-679`）→ `SeriesFile` 固定 8 分区并行
+> （`v1.12.3:tsdb/series_file.go:187-193`）→ `SeriesPartition` 在分区写锁内逐 key 回调
+> `AddedMeasurementSeries`、最后回调 `AddedSeries`（`v1.12.3:tsdb/series_partition.go:265-291`）。
+> 因此同一 `StatsTracker` 实例的回调可能来自多个 goroutine，自定义/企业版实现必须并发安全；
+> `Store.statsTracker` 使用 `atomic.AddInt64` 与并发安全的 `ingressMetrics` 正是该合同的表现
+> （`v1.12.3:tsdb/store.go:1796-1836`）。
+
 #### 差异解释与语义影响
 
 1. **`context.Context` 不再是写路径的一部分**。旧版虽然一路传 `ctx`，但注释明确写着"未来才检查
@@ -242,12 +273,15 @@ func (w *PointsWriter) WritePoints(database, retentionPolicy string, consistency
    `WriteToShard(shardID, points)` 变为 `WriteToShard(ctx tsdb.WriteContext, shardID, points)`
    （`v1.8.10:coordinator/points_writer.go:59-62` → `v1.12.3:coordinator/points_writer.go:58-61`），
    `Engine` 接口的 `WritePoints` / `CreateSeries*` 也都增加了 `tracker` 参数
-   （`v1.8.10:tsdb/engine.go:54-57` → `v1.12.3:tsdb/engine.go:57-60`）。
+   （`v1.8.10:tsdb/engine.go:54-57` → `v1.12.3:tsdb/engine.go:57-60`）。coordinator 层同样破坏：`PointsWriter.WritePointsWithContext` / `WritePointsPrivilegedWithContext` 删除，`WritePointsPrivileged` 首参由 `database` 改为 `tsdb.WriteContext`（旧 `v1.8.10:coordinator/points_writer.go:353,357,368` → 新 `v1.12.3:coordinator/points_writer.go:474`）。
 3. **调用链层级没变**：`PointsWriter → Store → Shard → Engine → Cache/WAL` 与旧版一致；变了的是
    每层的参数与统计出口。`PointsWriter.writeToShard` 仍然保留 `ErrShardNotFound → CreateShard → 重试一次`
    的逻辑（`v1.12.3:coordinator/points_writer.go:545-562`，旧版 `:484-501`）。
-4. **写超时仍是"整体超时"**：`WritePointsPrivileged` 用 `time.NewTimer(w.WriteTimeout)` 与
-   `<-w.closing` 竞争（`v1.12.3:coordinator/points_writer.go:508-537`，旧版 `:437-452`），语义未变。
+4. **写超时仍是"整体超时"，但计时起点变了**：新版在启动 shard goroutine 后先 `time.NewTimer`
+   （`v1.12.3:coordinator/points_writer.go:508`），再在调用方 goroutine **同步**执行 `Subscriber.Send`
+   （`:511-514`），之后才进入 `<-timeout.C` / `<-closing` / `<-ch` 的等待（`:524-537`）；旧版先把请求非阻塞投递进
+   订阅 channel、再建 timer（`v1.8.10:coordinator/points_writer.go:410-437`）。因此新版把订阅序列化纳入计时窗口，
+   且 `Send` 不可取消：Send 超过 `WriteTimeout` 时会先做完再返回 `ErrTimeout`。
 
 ### 3.2 写统计与身份：`StatsTracker`、`WriteContext.UserId`、按 measurement/登录名计量
 
@@ -293,6 +327,8 @@ func (s *Store) statsTracker(db, rp, login string) StatsTracker {
 > → `NewWriteRequest`（`:42-67`），逐点 `ValidPointStrings` + `AppendString` 拼完整 line protocol；只有 router 尚未 ready 或该 db/rp 没有匹配 writer 时才提前返回（`service.go:612-621`）。
 > 旧版只把请求指针非阻塞投递进 channel（`v1.8.10:coordinator/points_writer.go:410-431`），序列化发生在 `chanWriter.Run` 自己的 goroutine
 > （`v1.8.10:services/subscriber/service.go:371-381`）。因此**有匹配订阅时，每个写请求增加一次全量序列化延迟**，不可打印/非 UTF-8 点也在这一步被丢弃并计入 `writeFailures`。
+另外两个易漏的时序/内容点：timer 在 `Send` 之前启动（`:508` vs `:513`），`Send` 在结果收集前完成且不受超时约束；
+发送的是 `MapShards` 之前的**原始 `points`**，请求因 RP/写窗口被全部丢弃时也照样发送。
 
 ### 3.3 `fields.idx` 持久化：从全量重写改为增量 change-log（含 protobuf 化）
 
@@ -389,7 +425,8 @@ fd.Write(b)
    `readSizePlusBuffer`（`:2003-2016`）。
 3. **半写保护**：`appendToChangesFile` 记录 `changeFileSize`，下次写之前若发现文件比记录的大，
    先 `Truncate` 掉上次的半条记录（`v1.12.3:tsdb/shard.go:1958-1965`）。
-4. **合并回主文件**：`ApplyChanges` 重放全部变更后调用 `WriteToFile` 并删除 `fields.idxl`
+4. **合并回主文件**：`WriteToFile` 用 `defer` 删除 `fields.idxl`（`v1.12.3:tsdb/shard.go:1863-1871`），
+   进入写阶段后**成功失败都删**（打开临时文件即失败时 defer 尚未注册，不会删）；失败时 `fields.idx` 仍是旧内容、变更只在内存。临时文件名固定为 `fields.idx.tmp` + `O_EXCL`（`:1856-1859`；旧版带 `memoryVersion`，见 §7.3），崩溃残留会让**同一进程内**后续全量写持续 EEXIST；重启时 `Engine.cleanup()→cleanupTempTSMFiles()` 会删除该文件，通常无需手工处理。`ApplyChanges` 重放全部变更后调用 `WriteToFile` 并删除 `fields.idxl`
    （`v1.12.3:tsdb/shard.go:2243-2268`），无变更时只删除 `fields.idxl`（`:2250-2252`）；`Close` 仅当 `fields.idxl` 存在时才 `WriteToFile`
    （`v1.12.3:tsdb/shard.go:1681-1694`）。`WriteToFile` 还有两个入口：`LoadMetadataIndex` 从 TSM 重建成功后
    （`v1.12.3:tsdb/engine/tsm1/engine.go:934`）与 Restore/Import 的 `overlay` 收尾（`:1245`）。口径统一为
@@ -456,11 +493,14 @@ O(1) 且天然并发安全。
 
 **这项改动连带修复了一个数据竞争**：旧版校验时通过 `mf.FieldBytes` 读 atomic 快照，建字段在之后单独进行，
 两者之间存在 TOCTOU 窗口：两个不同类型的写都通过校验后，先创建者成功，后创建者会在
-`CreateFieldIfNotExists` 的锁内二次检查（`v1.8.10:tsdb/shard.go:1611-1618`）拿到 `ErrFieldTypeConflict`，
+`CreateFieldIfNotExists` 的锁前检查或锁内复查（`v1.8.10:tsdb/shard.go:1601-1605`、`:1611-1618`）拿到 `ErrFieldTypeConflict`，
 该错误经 `createFieldsAndMeasurements` 上抛（`:757-758`）、`WritePointsWithContext` 原样返回（`:543-545`），
-导致**整请求 500**，而不是内存里出现类型冲突字段（issue #23756）。
-新版的"校验即建字段 + `LoadOrStore`"把判定与创建合成一个原子操作，把 500 变成确定性 partial write
-（commit `5a20a835a5` 先加锁，`b617eb24a7` 改为 `sync.Map`）。
+HTTP 入口命中 `influxdb.IsClientError`，返回 **400 裸 `field type conflict`**（`v1.8.10:errors.go:37-39`、
+`services/httpd/handler.go:1013-1016`）：建字段在 engine 写之前，该 shard 整批点都不写，而不是内存里出现类型冲突字段（issue #23756）。
+新版的"校验即建字段 + `LoadOrStore`"把判定与创建合成一个原子操作，类型冲突改为 `Dropped:1` 的 partial write：
+只丢冲突点、同请求其余点照写，HTTP 同样 400，但带 `partial write: ... dropped=1`
+（`v1.12.3:tsdb/field_validator.go:65-71`、`tsdb/shard.go:719-738`、`services/httpd/handler.go:1781-1787`）。
+（commit `5a20a835a5` 先加锁，`b617eb24a7` 改为 `sync.Map`）
 
 > `v1.8.10:tsdb/shard.go:1659-1662` 的 `FieldBytes` 注释说它"避免 string 分配"，但 map 查找本身就是
 > `string(name)`，新版直接删掉了这个易误解的 API（`v1.12.3:tsdb/shard.go:1610-1613` 只保留 `Field(name string)`）。
@@ -583,7 +623,7 @@ j++
 | 维度 | 旧（v1.8.10） | 新（v1.12.3） | 影响 |
 |------|----------------|----------------|------|
 | 可插拔校验器 | `EngineOptions.FieldValidator` 接口，Enterprise 可替换 | 固定函数，`EngineOptions` 中该字段被删除 | **API 破坏**；定制校验逻辑无处挂载 |
-| 字段创建时机 | 校验后、写 engine 前 | 校验中，逐个字段 `LoadOrStore` | 并发类型冲突从"竞态 + 整请求 500"变为"确定性 partial write" |
+| 字段创建时机 | 校验后、写 engine 前 | 校验中，逐个字段 `LoadOrStore` | 并发类型冲突从"竞态 + 该 shard 整批丢弃（400）"变为"只丢冲突点（400 partial write）" |
 | 被丢弃点的字段 | 冲突点的新字段**不会**创建 | `ValidateAndCreateFields` 返回的 `fieldsToCreate` **仍会保存**（注释见 `v1.12.3:tsdb/field_validator.go:23-25`），`v1.12.3:tsdb/shard.go:717` 无条件 append；**仅限排在冲突字段之前、已迭代到的新字段** | `SHOW FIELD KEYS` 可能出现"从未成功写入数据"的字段（既有设计，见 [06 §8.5](../06_cluster_communication_spec.md)） |
 | 字段长度 | 无限制 | >1 MiB 字符串字段 → `Dropped:1` | 行为变更，可用 `skip-field-size-validation` 关闭 |
 | `time` 字段 | 静默剥离，返回 nil | 返回 `Dropped:0` 的 `PartialWriteError`，点继续写 | **HTTP 从 204 变 400**；详见 §6.3 |
@@ -656,7 +696,7 @@ func (e PartialWriteError) Error() string {
 ```
 
 ```go
-// v1.12.3:coordinator/points_writer.go:156-191 — 丢弃原因与极值
+// v1.12.3:coordinator/points_writer.go:156-173 — 丢弃原因与计数（节选；SummariseDropped 见 175-200）
 func (s *ShardMapping) AddDropped(p models.Point, t time.Time, b BoundType) {
 	if s.MaxDropped.Point == nil || p.Time().After(s.MaxDropped.Point.Time()) { ... }
 	if s.MinDropped.Point == nil || p.Time().Before(s.MinDropped.Point.Time()) { ... }
@@ -743,8 +783,8 @@ if lastErr != nil && !l.force {
 }
 ```
 
-旧版 `Store.CreateShard` 每次都 `shard.Open()`；新版如果该 shard 曾打开失败，`CreateShard` 会直接返回
-缓存的 `ErrPreviousShardFail`（`v1.12.3:tsdb/store.go:100-120,892-929`）。因此
+旧版 `Store.CreateShard` 每次都 `shard.Open()`；新版如果该 shard 曾打开失败，`CreateShard` 会返回
+包装后的 `ErrPreviousShardFail`（`fmt.Errorf("...; %w", lastErr)`，`errors.Is` 可判定；`v1.12.3:tsdb/store.go:100-120,461-466,892-929`）。因此
 `PointsWriter` 的 `ErrShardNotFound → CreateShard → 重试` 逻辑（`v1.12.3:coordinator/points_writer.go:545-562`）在"坏 shard"
 场景下会**快速失败而不是反复重试打开**。恢复手段是内部方法 `ReopenShard(id, true)` / `ClearBadShardList()`
 （`v1.12.3:tsdb/store.go:784-798,833-847`），OSS 的 HTTP API 没有暴露它们。
@@ -806,6 +846,8 @@ func (p *partition) write(key string, values Values) (bool, error) {
 **Cache 的 snapshot 语义未变**：`Cache.Snapshot()`（`v1.8.10:tsdb/engine/tsm1/cache.go:376` / `v1.12.3:tsdb/engine/tsm1/cache.go:375`）
 两版实现一致；`WriteSnapshot` 里 `WAL.CloseSegment()` → `Cache.Snapshot()` → `snapshot.Deduplicate()`
 的顺序也一致（`v1.8.10:tsdb/engine/tsm1/engine.go:1904-1952` → `v1.12.3:tsdb/engine/tsm1/engine.go:1957-2005`）。
+空 snapshot 的早退（`snapshot.Size()==0 → ClearSnapshot(true); return nil`，`v1.12.3:tsdb/engine/tsm1/engine.go:2000-2003`）
+与失败后重试语义也未变，见主 01 §6.4。
 
 ### 3.9 WAL：编码与 fsync 未变，段大小配置开始生效
 
@@ -929,7 +971,7 @@ func (t *TSMReader) parseAndCacheFileName(path string) error {
 | 空 shard group 防御 | 返回错误而非 panic | `v1.12.3:coordinator/points_writer.go:351-354`（#25717） | 单点坏元数据不再拖垮进程 |
 | 坏 shard 记忆 | `badShards` 缓存打开错误 | `v1.12.3:tsdb/store.go:95-120,461-466`（#23437） | 避免每次写入反复尝试打开损坏 shard（旧版会反复 IO） |
 | `time` 字段报错上抛 | 让客户端知道字段被丢弃 | `v1.12.3:tsdb/field_validator.go:45-56`（#26998） | 可观测性提升；但改变了 HTTP 状态码，见 §5 |
-| SSEG 建 series fsync | `Flush()` 增加 `file.Sync()`（`b4e781eff6`） | **每个产生新 series 的写请求 ≤8 次 fsync**（每分区一次，见 [02 §3.9(c)](02_index_series_diff.md)）；v1.8.10 为 0 | 持久性增强；代价是写延迟，且发生在 `SeriesPartition` 写锁内 | `v1.12.3:tsdb/series_segment.go:219-227`、`tsdb/series_partition.go:219-222,232-238,278-283` |
+| SSEG 建 series fsync | `Flush()` 增加 `file.Sync()`（`b4e781eff6`） | **每个产生新 series 的写请求至多 64 次 fsync**（TSI 8 分区各自向 SeriesFile 8 分区 fan-out，每个 (TSI 分区, SeriesFile 分区) 组合至多一次；跨 shard 按 shard 数叠加；纯重复写为 0；见 [02 §3.9(c)](02_index_series_diff.md)）；v1.8.10 为 0 | 持久性增强；代价是写延迟，且发生在 `SeriesPartition` 写锁内 | `v1.12.3:tsdb/series_segment.go:219-227`、`tsdb/series_partition.go:219-222,232-238,278-283` |
 | 订阅序列化内联 | 序列化从订阅 goroutine 移到写请求 goroutine（`85abb3af36`） | 订阅侧少一次跨 goroutine 排队；`SubWriteOK` 变为每请求 +1 | 有匹配订阅时写延迟增加一次全量 line protocol 序列化 | `v1.12.3:coordinator/points_writer.go:511-514`；`services/subscriber/service.go:42-67,608-627` |
 
 > 没有找到可引用的基准数字（仓库内没有对应的 benchmark 结果文件）。上表的"收益"均来自代码机制或
@@ -958,7 +1000,8 @@ func (t *TSMReader) parseAndCacheFileName(path string) error {
    （`v1.12.3:tsdb/shard.go:562`）。
 3. `Engine.WritePoints(points)` → `WritePoints(points, tracker)`；
    `CreateSeriesIfNotExists` / `CreateSeriesListIfNotExists` 增加 `tracker`；
-   `WritePointsWithContext` 删除（`v1.12.3:tsdb/engine.go:57-60`）。
+   `WritePointsWithContext` 删除（`v1.12.3:tsdb/engine.go:57-60`）。tracker 回调可能被多 shard/分区
+   goroutine 并发调用，实现必须并发安全（见 §3.2）。
 4. `tsdb.ConetextKey`（官方拼写，旧 `v1.8.10:tsdb/shard.go:504`）/ `StatPointsWritten` / `StatValuesWritten` 删除；`coordinator.ContextKey`（`v1.8.10:coordinator/points_writer.go:344`）一并删除。
 5. `EngineOptions.FieldValidator` 删除（旧 `v1.8.10:tsdb/engine.go:192`）。
 6. `PointsWriter.AddWriteSubscriber` 删除，改为 `PointsWriter.Subscriber` 接口
@@ -970,6 +1013,7 @@ func (t *TSMReader) parseAndCacheFileName(path string) error {
    `NewMeasurementFieldSet(path)` → `NewMeasurementFieldSet(path, logger)`
    （旧 `v1.8.10:tsdb/shard.go:1696,1786`；新 `v1.12.3:tsdb/shard.go:1666,1834`）。
 9. `tsdb.Field.ID` 删除（`v1.8.10:tsdb/shard.go:1936-1941`）。
+10. `coordinator.PointsWriter.WritePointsWithContext` / `WritePointsPrivilegedWithContext` 删除；`WritePointsPrivileged` 首参改为 `tsdb.WriteContext`（旧 `v1.8.10:coordinator/points_writer.go:353,357,368` → 新 `v1.12.3:coordinator/points_writer.go:474`）。
 
 ### 5.3 数据与降级风险
 
@@ -989,8 +1033,10 @@ func (t *TSMReader) parseAndCacheFileName(path string) error {
 3. 旧版不认识也不会删除 `fields.idxl`；它会在下次 `Save()` 时重写 `fields.idx`，
    进一步固化"缺失字段"的状态。
 
-**建议**：降级前先正常 `SIGTERM` 关闭（触发 `MeasurementFieldSet.Close → WriteToFile`），
-或手工确认 `fields.idxl` 不存在/已合并。
+**建议**：降级前先正常 `SIGTERM` 关闭（触发 `MeasurementFieldSet.Close → WriteToFile`），并**确认 Close 返回 nil**。
+`WriteToFile` 的 `defer` 在序列化 / `fd.Write` / rename 任一失败时仍会执行 `os.RemoveAll(fields.idxl)`
+（`v1.12.3:tsdb/shard.go:1863-1871`，`err == nil` 只用于赋值错误），此时新字段只在内存，重启即丢；
+所以"干净关闭"这个动作本身不足以保证可安全降级。也可手工确认 `fields.idxl` 不存在/已合并且 `fields.idx` 含最新字段。
 
 ### 5.4 运维可见变化
 
@@ -1005,7 +1051,7 @@ func (t *TSMReader) parseAndCacheFileName(path string) error {
 | 空 shard group | 进程 panic | 500 + 明确错误 | 无需操作 |
 | 坏 shard | 每次写都重试打开 | 缓存失败直到重启 | 修复磁盘后需重启节点 |
 | series/values 上限错误 | 400，该 shard **零点写入**；旧文本 `max-series-per-database limit exceeded: (N)` | 400，**其余点写入**；新文本含 `database/limit/series/keys` | 检查按旧文本匹配的告警；限流场景确认"部分写"符合预期 |
-| 非法 unicode key | `key contains invalid unicode: "…"`（原样回显） | `key contains invalid unicode: %q`，不可打印字符最多 3 个 `?`（`tsdb/shard.go:648,747-763`，`0ae0bd6e2e`） | 错误文本不再原样回显不可打印字节 |
+| 非法 unicode key | `key contains invalid unicode: "…"`（原样回显） | `key contains invalid unicode: %q`，每段连续不可打印字符最多替换为 3 个 `?`（遇到可打印字符后计数重置；`tsdb/shard.go:648,747-763`，`0ae0bd6e2e`） | 错误文本不再原样回显不可打印字节 |
 
 ---
 
@@ -1030,15 +1076,16 @@ cpu,host=web01,region=us-east value=87.3 1704067200000000000
 | 4. 进入 coordinator | `coordinator/points_writer.go:353` → `:368` | `WritePointsWithContext` → `WritePointsPrivilegedWithContext` |
 | 5. 映射 shard | `points_writer.go:191-241` | `MapShards`：按 RP 找/建 shard group，`sg.ShardFor(p)` 得 shard ID；本批 1 个 shard |
 | 6. 并发写 shard | `points_writer.go:387-407` | 每 shard 一个 goroutine，把统计指针绑到 ctx |
-| 7. 进入 Store | `tsdb/store.go:1416-1453` | `epoch.StartWrite()` → `guard.Wait()` → 冷 shard 唤醒 → `Shard.WritePointsWithContext` |
-| 8. shard 校验 | `tsdb/shard.go:519-586` | `validateSeriesAndFields`：建 series（`CreateSeriesListIfNotExists`）、`FieldValidator.Validate` 检查 `value` 类型、收集 `fieldsToCreate` |
-| 9. 字段元数据 | `tsdb/shard.go:744-765` | `createFieldsAndMeasurements` 建字段 → **全量重写 `fields.idx`**（tmp+fsync+rename+SyncDir） |
-| 10. 进入 engine | `tsdb/shard.go:548-566` | type-switch 到 `Engine.WritePointsWithContext` |
-| 11. 组 key | `tsdb/engine/tsm1/engine.go:1322-1335` | `cpu,host=web01,region=us-east#!~#value`，`NewFloatValue(1704067200000000000, 87.3)` |
-| 12. 写 Cache | `engine.go:1407-1410` → `cache.go:320-343` | xxhash%16 选分区，`p.store[string(key)]` |
-| 13. 写 WAL | `engine.go:1412-1416` → `wal.go:311,398-462` | `WriteWALEntry` 编码 → snappy → 追加段文件 → `scheduleSync` 等 fsync |
-| 14. 统计回写 | `engine.go:1418-1425` | `*pointsWritten=1`、`*valuesWritten=1` |
-| 15. HTTP 响应 | `handler.go:1002,1039-1040` | `valuesWrittenOK += 1`，最终 204 |
+| 7. 订阅分发 | `points_writer.go:410-431` | 非阻塞投递 `subPoints`（原始 `points`，未按 shard/RP 过滤）；无订阅者时丢弃，不阻断主写 |
+| 8. 进入 Store | `tsdb/store.go:1416-1453` | `epoch.StartWrite()` → `guard.Wait()` → 冷 shard 唤醒 → `Shard.WritePointsWithContext` |
+| 9. shard 校验 | `tsdb/shard.go:519-586` | `validateSeriesAndFields`：建 series（`CreateSeriesListIfNotExists`）、`FieldValidator.Validate` 检查 `value` 类型、收集 `fieldsToCreate` |
+| 10. 字段元数据 | `tsdb/shard.go:744-765` | `createFieldsAndMeasurements` 建字段 → **全量重写 `fields.idx`**（tmp+fsync+rename+SyncDir） |
+| 11. 进入 engine | `tsdb/shard.go:548-566` | type-switch 到 `Engine.WritePointsWithContext` |
+| 12. 组 key | `tsdb/engine/tsm1/engine.go:1322-1335` | `cpu,host=web01,region=us-east#!~#value`，`NewFloatValue(1704067200000000000, 87.3)` |
+| 13. 写 Cache | `engine.go:1407-1410` → `cache.go:320-343` | xxhash%16 选分区，`p.store[string(key)]` |
+| 14. 写 WAL | `engine.go:1412-1416` → `wal.go:311,398-462` | `WriteWALEntry` 编码 → snappy → 追加段文件 → `scheduleSync` 等 fsync |
+| 15. 统计回写 | `engine.go:1418-1425` | `*pointsWritten=1`、`*valuesWritten=1` |
+| 16. HTTP 响应 | `handler.go:1002,1039-1040` | `valuesWrittenOK += 1`，最终 204 |
 
 #### 新版（v1.12.3）逐步推演
 
@@ -1050,15 +1097,16 @@ cpu,host=web01,region=us-east value=87.3 1704067200000000000
 | 4. 进入 coordinator | `points_writer.go:463-471` | **差异**：`meta.User` → `tsdb.WriteContext{UserId}`（匿名写为 `_systemuser_unknown`） |
 | 5. 映射 shard | `points_writer.go:299-360` | **差异**：额外做 `WriteWindow` 判定；空 shard group 返回错误；丢弃计数分类 |
 | 6. 并发写 shard | `points_writer.go:491-505` | **差异**：传 `writeCtx`，不再有 context 统计指针 |
-| 7. 进入 Store | `store.go:1861-1898` | **差异**：epoch/guard 相同；末尾传 `statsTracker(db, rp, login)` |
-| 8. shard 校验 | `shard.go:613-740` | **差异**：`ValidateAndCreateFields` 在校验中 `LoadOrStore` 创建 `value` 字段；`time`/超长/冲突返回 `PartialWriteError` |
-| 9. 字段元数据 | `shard.go:765-786` → `:1834` | **差异**：追加一条 `FieldChange{AddMeasurementField, cpu, value, Float}` 到 `fields.idxl`，`O_SYNC` 后回执；不再重写 `fields.idx` |
-| 10. 进入 engine | `shard.go:600` | **差异**：无 type-switch |
-| 11. 组 key | `engine.go:1346-1432` | **差异**：不再跳过 `time` 字段；`tracker.AddedMeasurementPoints` 按点回调 |
-| 12. 写 Cache | `engine.go:1440-1446` → `cache.go:319-342` | **差异**：`store.write(k, v)` 直接用 string，分区用 `Sum64String` |
-| 13. 写 WAL | `engine.go:1448-1452` → `wal.go:311,398-462` | **无差异**（编码、snappy、fsync 全部相同；仅段大小判定改用 `l.SegmentSize`） |
-| 14. 统计 | `engine.go:1454-1456` → `store.go:1796-1836` | **差异**：回调式；`localStore.pointsWritten/valuesWritten` 更新；可选按 measurement/登录名计量 |
-| 15. HTTP 响应 | `handler.go:1804-1805` | 204（成功路径相同）；失败时错误文本带 db/rp |
+| 7. 订阅分发 | `points_writer.go:508-514` | **差异**：先建 timer，再在调用方 goroutine 同步 `Subscriber.Send` 原始 `points`（全部丢弃仍发送）；Send 不受超时约束 |
+| 8. 进入 Store | `store.go:1861-1898` | **差异**：epoch/guard 相同；末尾传 `statsTracker(db, rp, login)` |
+| 9. shard 校验 | `shard.go:613-740` | **差异**：`ValidateAndCreateFields` 在校验中 `LoadOrStore` 创建 `value` 字段；`time`/超长/冲突返回 `PartialWriteError` |
+| 10. 字段元数据 | `shard.go:765-786` → `:1834` | **差异**：追加一条 `FieldChange{AddMeasurementField, cpu, value, Float}` 到 `fields.idxl`，`O_SYNC` 后回执；不再重写 `fields.idx` |
+| 11. 进入 engine | `shard.go:600` | **差异**：无 type-switch |
+| 12. 组 key | `engine.go:1346-1432` | **差异**：不再跳过 `time` 字段；`tracker.AddedMeasurementPoints` 按点回调 |
+| 13. 写 Cache | `engine.go:1440-1446` → `cache.go:319-342` | **差异**：`store.write(k, v)` 直接用 string，分区用 `Sum64String` |
+| 14. 写 WAL | `engine.go:1448-1452` → `wal.go:311,398-462` | **无差异**（编码、snappy、fsync 全部相同；仅段大小判定改用 `l.SegmentSize`） |
+| 15. 统计 | `engine.go:1454-1456` → `store.go:1796-1836` | **差异**：回调式；`localStore.pointsWritten/valuesWritten` 更新；可选按 measurement/登录名计量 |
+| 16. HTTP 响应 | `handler.go:1804-1805` | 204（成功路径相同）；失败时错误文本带 db/rp |
 
 **结论**：这条 happy path 上，磁盘产物（WAL entry 字节、TSM 块）两版一致；差异集中在
 "字段元数据怎么写盘"和"统计怎么回传"，以及 `WriteContext` 带来的用户维度。
@@ -1209,6 +1257,24 @@ cpu,host=web01 value=1.0,time=1704067200 1704067200000000000
 - 半写保护只在"下次追加"时生效（`:1958-1965`）；如果进程在 `fd.Write` 中途崩溃且**不再有新字段写入**，
   文件尾部会留下半条记录，直到下次追加或 `ApplyChanges` 的 `io.ErrUnexpectedEOF` 分支处理
   （`:2205-2208` 会告警并跳过）。
+- **固定临时文件名（v1.12.3 新引入）**：`WriteToFile` 的临时名从旧版 `fields.idx.<memoryVersion>.tmp`
+  （`v1.8.10:tsdb/shard.go:1819-1821`，下一次 `Save()` 换名可自愈）改为固定的 `fields.idx.tmp` +
+  `O_CREATE|O_RDWR|O_EXCL|O_SYNC`（`v1.12.3:tsdb/shard.go:1856-1862`）。进程若在"OpenFile 成功→rename 完成"
+  窗口崩溃/掉电，会留下该文件；**同一进程内**此后 `load→ApplyChanges`、`Close`、`LoadMetadataIndex` 重建、overlay 的
+  **每次** `WriteToFile` 都在打开阶段 EEXIST 失败且不注册清理 `defer`。但重启时 `Engine.cleanup()` 会调用
+  `cleanupTempTSMFiles()`，以 `*.tmp` glob 删除该文件（`v1.12.3:tsdb/engine/tsm1/engine.go:2768-2803`），
+  因此**重启即自愈，通常无需手工删除**。它与下一条叠加的风险限于**同一进程**：字段表非空 → 重建早退 →
+  `changeFileSize` 仍为 0 → 下一次追加截断整份 `fields.idxl`，未合并字段元数据丢失；不能重启时再手工删除
+  `<shard>/fields.idx.tmp`（先备份 `fields.idxl`）。上游建议改用 `os.CreateTemp`，或在打开失败时清理残留。
+- **恢复/回滚缺陷（P1）**：`WriteToFile` 的 `defer` 无条件 `os.RemoveAll(changeFilePath)`（`:1863-1871`）：
+  全量序列化、`fd.Write`、`rename` 任一失败后，`fields.idx` 仍是旧内容、变更日志已被删除，新字段只存在于内存，
+  进程重启或随后降级即丢失；触发场景包括 ENOSPC、写入失败、rename 失败（打开临时文件失败时 defer 尚未注册，不会删）。`Close`（`:1681-1694`）与启动
+  `ApplyChanges`（`:2243-2268`）都会走到这条路径。修复方向是把 `RemoveAll` 移入 `err == nil` 分支，并用 ENOSPC 或 rename 失败回归 `Close`。
+- **异常启动的边角**：`changeFileSize` 初值为 0（`:1818-1821`）。只有 `fields.idx` **读取成功**而
+  `ApplyChanges()` 失败（`loadAllFieldChanges` 读/解析错误或重放冲突）时，fieldset 非空、
+  `Engine.Open` 仅告警继续（`v1.12.3:tsdb/engine/tsm1/engine.go:783`）且 `LoadMetadataIndex` 早退（`:865`），
+  下一次追加会把整份遗留 `fields.idxl` 截断为 0。若 `fields.idx` 本身读取失败，fieldset 为空、
+  早退条件不成立，会扫描 TSM 重建并 `WriteToFile`，不会截断（源码推断，待运行时验证）。
 
 ### 7.4 降级丢失字段元数据（见 §5.3）
 
@@ -1324,4 +1390,4 @@ if pointSize > MaxFieldValueLength && iter.Type() == models.String {
 
 > **行号核对方式**：旧版全部来自 `git show v1.8.10:<path> | nl -ba`；新版来自当前工作树
 > `nl -ba <path>`。凡标"删除/无"的条目，均已用 `git show v1.8.10:<path>` 与当前文件对照确认。
-> 对无法从代码直接断言的结论（§7.1），已在正文标注"代码推断，建议回归验证"。
+> §7.1 已在源码中确认，并标注建议运行时回归验证。
