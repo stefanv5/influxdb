@@ -269,7 +269,7 @@ h.AddRoutes([]Route{
 
 ### 2.2 路由总览表
 
-> **规模**: 共 39 条路由 = 31 条基础路由（`handler.go:193-317`）+ 6 条条件 pprof 路由
+> **规模**: 共 39 条路由 = 31 条基础路由（`handler.go:193-318`）+ 6 条条件 pprof 路由
 > （`handler.go:339-360`，需 `AuthEnabled && PprofEnabled && PprofAuthEnabled`）
 > + 2 条 Flux 路由（`handler.go:367-373`，`FluxEnabled` 决定 handler 是
 > `serveFluxQuery` 还是 `serveFluxQueryDisabled`）。

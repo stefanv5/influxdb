@@ -12,7 +12,7 @@
 > **小白导读**
 > 1. **磁盘格式两年一个字节都没动。** TSI 索引文件（magic `TSI1`）、MANIFEST、SSEG、SIDX、`fields.idx` 的 magic 与 version 全部原地不变。升级 v1.12.3 不需要跑 `buildtsi`，不需要重建索引，旧文件直接打开。
 > 2. **变的是"别写坏、别 panic"。** MANIFEST 从"直接覆盖写"改成"临时文件 → fsync → rename"；压缩产物先 `Sync()` 再 `Close()`；manifest 写成功之后才把新文件集换进内存（失败可回滚）；损坏/截断的 series key 与段文件不再越界或 SIGBUS。
-> 3. **变的是"锁与分配"。** `.tsl` 日志文件轮转从"只看大小"变成"大小 **或** 年龄（默认 4h）"，空闲分区的旧日志也会被压缩；`LogFile.TagValueIterator` 提前放读锁；series 缓存每次 `Put` 少 1~3 次字符串分配；删 series 时把"每条一次 flush"合并成"每分区一次 fsync"。
+> 3. **变的是"锁与分配"。** `.tsl` 日志文件轮转从"只看大小"变成"大小 **或** 年龄（默认 4h）"，空闲分区的旧日志也会被压缩；`LogFile.TagValueIterator` 提前放读锁；series 缓存的插入路径每次 `Put` 少 1~3 次字符串分配；删 series 时 bufio flush 次数 N→≤8、fsync 0→≤8（新增持久性，代价是批末延迟）。
 > 4. **fields.idx 换了持久化策略。** 仍是同一个 protobuf（wire 兼容），但字段变更先追加到 `fields.idxl` 变更日志，启动/关闭时再合并回 `fields.idx`，不再每次字段变更都重写整份索引。
 > 5. **line protocol 解析器本身没改。** 改的是周边：`Tags.HashKey` 增加 `escapeTags` 参数、订阅侧新增 UTF-8 校验、CSV 输出不再二次转义、`Point` 接口新增 `ForEachField`。
 
@@ -42,13 +42,13 @@
 | 8 | 压缩并发计数 | `int currentCompactionN` + 手动 `++/--` | `atomic.Int32` + `defer` 释放 `levelCompacting` | 压缩 panic 不再永久占住 level | `v1.8.10:tsdb/index/tsi1/partition.go:905-960`、`v1.12.3:tsdb/index/tsi1/partition.go:1053-1073` |
 | 9 | TSI 打开失败清理 | 分区并行打开，遇错即返回，已打开分区的文件泄漏 | `errgroup` + `defer i.cleanUpFail(&rErr)` 统一关闭 | 打开失败不泄漏 mmap/fd | `v1.8.10:tsdb/index/tsi1/index.go:245`、`v1.12.3:tsdb/index/tsi1/index.go:255-313` |
 | 10 | `LogFile.TagValueIterator` 锁 | `defer f.mu.RUnlock()`，锁跨越整个函数 | 取到 `tk` 后立即 `RUnlock()`；但随后仍在锁外 range `tk.tagValues` | **不是安全优化**：外层查找放锁后仍遍历共享 map，与写路径并发会 fatal，见 §3.6/§7.7 | `v1.8.10:tsdb/index/tsi1/log_file.go:413-427`、`v1.12.3:tsdb/index/tsi1/log_file.go:422-437,1406-1412` |
-| 11 | series 缓存 `Put` 分配 | 每个 `name/key/value` 各 `string()` 两次（元素 + map key） | 各 `string()` 一次，元素与 map key 共享底层数组 | 每次 `Put` 少 1~3 次分配（新 measurement 分支最多 3 次） | `v1.8.10:tsdb/index/tsi1/cache.go:98-140`、`v1.12.3:tsdb/index/tsi1/cache.go:98-147` |
+| 11 | series 缓存 `Put` 分配 | 元素各 `string()` 1 次 + 0~3 处 map 赋值（新 measurement 分支多 3 次） | 各 `string()` 一次，元素与 map key 共享底层数组 | 插入路径少 1~3 次分配（新 measurement 分支最多 3 次；exists 命中早退时新版反多 3 次） | `v1.8.10:tsdb/index/tsi1/cache.go:98-140`、`v1.12.3:tsdb/index/tsi1/cache.go:98-147` |
 | 12 | 测量名迭代器生命周期 | 返回的 `[][]byte` 指向 mmap，迭代器已 `Close()` | 新增 `MeasurementSliceIterator`/`fileMeasurementSliceIterator`，拷贝完成前 pin 住文件 | 修掉 use-after-unmap 崩溃 | `v1.8.10:tsdb/index.go:1317-1335`、`v1.12.3:tsdb/index.go:1368-1417` |
 | 13 | 非法 series key | 直接切片越界 → panic | 各处 `len(name)==0` 跳过；`CompareSeriesKeys` 增加 `nilKeyHandler` | 损坏数据不再打挂进程 | `v1.8.10:tsdb/index.go:135-150`、`v1.12.3:tsdb/index.go:137-145` |
 | 14 | SSEG 读取边界 | 按 mmap 长度扫描（可能超过文件真实大小） | `os.Stat` 得真实 `s.size`，循环按 `s.size`；`ReadSeriesEntry` 增加长度检查 | 修掉非标准/截断段文件的 SIGBUS | `v1.8.10:tsdb/series_segment.go:93-135`、`v1.12.3:tsdb/series_segment.go:93-135,426` |
-| 15 | SSEG 落盘 | `Flush()` 只 flush bufio | `Flush()` 后 `file.Sync()` | 掉电不丢 series insert/tombstone | `v1.8.10:tsdb/series_segment.go:211`、`v1.12.3:tsdb/series_segment.go:219` |
+| 15 | SSEG 落盘 | `Flush()` 只 flush bufio | `Flush()` 后 `file.Sync()` | Flush 被调用后不丢；删除的 last batch 需等 FlushSegments | `v1.8.10:tsdb/series_segment.go:211`、`v1.12.3:tsdb/series_segment.go:219` |
 | 16 | SIDX 重建 | 单遍，`Count=seriesN`（含墓碑），容量按含墓碑数算 | 两遍：先算存活数，若与 `seriesN` 不同则按新容量重建 | SIDX `Count` 变准确；有墓碑时多一遍扫描 | `v1.8.10:tsdb/series_partition.go:568-660`、`v1.12.3:tsdb/series_partition.go:589-665` |
-| 17 | SeriesFile 删除落盘 | 每条 `DeleteSeriesID(id)` 都 flush 分段 | `DeleteSeriesID(id, NoFlush)` 批量 + `FlushSegments(partitionIDs)` | 删 shard/删 series 从 O(N) 次 flush 降到 O(分区数) 次 fsync | `v1.8.10:tsdb/store.go:786`、`v1.12.3:tsdb/store.go:1083,1108` |
+| 17 | SeriesFile 删除落盘 | 每条 `DeleteSeriesID(id)` 都 flush 分段 | `DeleteSeriesID(id, NoFlush)` 批量 + `FlushSegments(partitionIDs)` | bufio flush 次数 N→≤8；fsync 0→≤8（新增持久性，代价是批末延迟） | `v1.8.10:tsdb/store.go:786`、`v1.12.3:tsdb/store.go:1083,1108` |
 | 18 | fields.idx 持久化 | 每次 `Save()` 全量重写 `fields.idx` | 追加 `fields.idxl`（size 前缀 + `FieldChangeSet`），启动/关闭时合并 | 字段创建从"重写整份索引"变成"追加一条记录" | `v1.8.10:tsdb/shard.go:1786-1864`、`v1.12.3:tsdb/shard.go:1834-2000` |
 | 19 | fields protobuf | `gogo/protobuf` + `internal/meta.proto` | `google.golang.org/protobuf` + `internal/fieldsindex.proto`（新增 `ChangeType`/`MeasurementFieldChange`/`FieldChangeSet`） | 已有消息 wire 兼容；Go 类型生成器变了 | `v1.8.10:tsdb/internal/meta.pb.go:1`、`v1.12.3:tsdb/internal/fieldsindex.pb.go:1` |
 | 20 | `_seriesKey` 查询 | 走 `IndexSet.TagSets`，把每个 series 的 key 物化进 `[]*query.TagSet` | `MeasurementSeriesKeyByExprIterator` 流式迭代 | 大 measurement 的 `count(_seriesKey)` 不再一次性占内存 | `v1.8.10:tsdb/engine/tsm1/engine.go:2534`、`v1.12.3:tsdb/index.go:2397` |
@@ -66,10 +66,10 @@ flowchart TD
     A["Partition.Open()"] --> B["ReadManifestFile(MANIFEST)"]
     B -->|"os.IsNotExist"| C["NewManifest(ManifestPath)"]
     B -->|"解析失败"| X["ErrIncompatibleVersion / error"]
-    C --> V["m.Validate()"]
-    B -->|"读取成功"| V
-    V -->|"Version != 1"| X
-    V --> D["openLogFile / openIndexFile 按 m.Files"]
+    C --> MV["m.Validate()"]
+    B -->|"读取成功"| MV
+    MV -->|"Version != 1"| X
+    MV --> D["openLogFile / openIndexFile 按 m.Files"]
     D --> E["p.fileSet = NewFileSet(files)"]
     E --> SQ["p.seq = p.fileSet.MaxID()"]
     SQ --> F["deleteNonManifestFiles(m)"]
@@ -171,31 +171,16 @@ flowchart TB
 | SIDX | `SeriesIndexVersion = 1`、`SeriesIndexMagic = "SIDX"`、头 69 字节 | `v1.8.10:tsdb/series_index.go:16-17,24-30`；`v1.12.3:tsdb/series_index.go:16-17,24-30` |
 | fields.idx | magic `{0,6,1,3}` + `MeasurementFieldSet` protobuf | `v1.8.10:tsdb/shard.go:83,1909`；`v1.12.3:tsdb/shard.go:86,2156` |
 
-具体字节布局（两版一致）：
+具体字节布局（两版一致，常量见上表）：
 
 ```text
-TSI IndexFile (.tsi)
-┌────────────┬──────────────┬──────────────────┬───────────────┬──────────────────────┬──────────────┬─────────┐
-│ "TSI1" 4B  │ TagBlock × M │ MeasurementBlock │ SeriesIDSet   │ TombstoneSeriesIDSet │ Sketches     │ Trailer │
-│            │              │                  │ (roaring)     │ (roaring)            │ (HLL)        │ 82B     │
-└────────────┴──────────────┴──────────────────┴───────────────┴──────────────────────┴──────────────┴─────────┘
-                                                                                                        末 2B: Version=1
-
-TSI LogFile (.tsl) —— 无文件头，纯 entry 序列
-┌────────┬──────────────────┬────────────────┬───────────────┬────────────────┬──────────────┬───────────────┬──────────────┬──────────────┬───────────────┬─────────────────┐
-│ Flag 1B│ SeriesID uvarint │ Name len uvar │ Name          │ Key len uvar   │ Key          │ Value len uvar│ Value        │ CRC32 4B (BE) │ 下一条 entry…  │
-└────────┴──────────────────┴────────────────┴───────────────┴────────────────┴──────────────┴───────────────┴──────────────┴──────────────┴───────────────┴─────────────────┘
+TSI IndexFile: "TSI1" 4B | TagBlock × M | MeasurementBlock | SeriesIDSet | TombstoneSeriesIDSet | Sketches | Trailer 82B（末 2B Version）
+TSI LogFile:   无文件头；Flag 1B | SeriesID uvarint | Name/Key/Value（len uvar + bytes）| CRC32 4B
+SSEG:          "SSEG" 4B | Ver 1B | Entry（Flag 1B + ID 8B BE + [KeyLen uvar + Key]；tombstone 共 9B）
 Flag: 0x01 series tombstone / 0x02 measurement tombstone / 0x04 tag-key tombstone / 0x08 tag-value tombstone
-
-SSEG (series segment)
-┌──────────┬─────────┬──────────────────────┬──────────────────────┬─────┐
-│ "SSEG" 4B│ Ver 1B  │ Entry: Flag 1B       │ (insert) ID 8B BE    │ …   │
-│          │         │                      │ + KeyLen uvar + Key  │     │
-│          │         │ (tombstone) ID 8B BE │ 无 key（共 9B）      │     │
-└──────────┴─────────┴──────────────────────┴──────────────────────┴─────┘
 ```
 
-代码上唯一"看起来像格式变化"的，是 `IndexFile.UnmarshalBinary` 的两个错误从裸 `io.ErrShortBuffer` / `ErrInvalidIndexFile` 变成带路径的 `fmt.Errorf("%q: %w", f.path, err)`（`v1.8.10:tsdb/index/tsi1/index_file.go:170-213`；`v1.12.3:tsdb/index/tsi1/index_file.go:170-213`）；另外 `bytes()`/`Compacting()` 改用 `defer` 释放，避免中途 panic 漏 `Done`/`Unlock`（旧版已手动 `wg.Done()`，`v1.8.10:tsdb/index/tsi1/index_file.go:104`；新版 `v1.12.3:tsdb/index/tsi1/index_file.go:85-86`）。
+代码上唯一"看起来像格式变化"的是 `IndexFile.UnmarshalBinary` 的错误改为带路径的 `fmt.Errorf("%q: %w", f.path, err)`（`v1.8.10:tsdb/index/tsi1/index_file.go:170-213`、`v1.12.3:tsdb/index/tsi1/index_file.go:170-213`）；另 `bytes()`/`Compacting()` 改用 `defer` 释放，避免 panic 漏 `Done`/`Unlock`（旧版 `v1.8.10:tsdb/index/tsi1/index_file.go:104` 手动 `wg.Done()`，新版 `v1.12.3:tsdb/index/tsi1/index_file.go:85-86`）。
 
 > 结论：**升级不触发任何索引重建**。这也是 §5 兼容性结论的基础。
 
@@ -206,15 +191,9 @@ MANIFEST 是分区唯一的元数据文件。旧版用 `ioutil.WriteFile` 直接
 ```go
 // v1.8.10:tsdb/index/tsi1/partition.go:1296-1310 — (*Manifest).Write
 buf, err := json.MarshalIndent(m, "", "  ")
-if err != nil {
-    return 0, err
-}
+if err != nil { return 0, err }
 buf = append(buf, '\n')
-
-if err := ioutil.WriteFile(m.path, buf, 0666); err != nil {
-    return 0, err
-}
-
+if err := ioutil.WriteFile(m.path, buf, 0666); err != nil { return 0, err }
 return int64(len(buf)), nil
 ```
 
@@ -223,9 +202,7 @@ return int64(len(buf)), nil
 ```go
 // v1.12.3:tsdb/index/tsi1/partition.go:1482-1530 — (*Manifest).Write
 f, err := os.CreateTemp(filepath.Dir(m.path), ManifestFileName)
-if err != nil {
-    return 0, err
-}
+if err != nil { return 0, err }
 defer os.Remove(tmp)          // ← 注意：此处 tmp 仍为 ""，见 §7.1
 
 err = func() (rErr error) {
@@ -238,12 +215,8 @@ err = func() (rErr error) {
     if err = f.Sync(); err != nil { … }
     return nil
 }()
-if err != nil {
-    return 0, err
-}
-if err = os.Rename(tmp, m.path); err != nil {
-    return 0, err
-}
+if err != nil { return 0, err }
+if err = os.Rename(tmp, m.path); err != nil { return 0, err }
 ```
 
 要点：
@@ -332,9 +305,8 @@ if err = f.Sync(); err != nil {
 
 ```go
 // v1.8.10:tsdb/index/tsi1/partition.go:1072-1110 — CheckLogFile / checkLogFile
-// CheckLogFile：RLock 读 activeLogFile.Size()，size < p.MaxLogFileSize 即返回 nil（唯一条件）
-// checkLogFile（持 p.mu 写锁）：再次判大小 → prependActiveLogFile()
-//   → currentCompactionN++ → go func(){ compactLogFile(logFile); 计数-1; p.Compact() }()
+// 唯一条件：activeLogFile.Size() < MaxLogFileSize；checkLogFile 在写锁内重新判大小后
+// prependActiveLogFile() → currentCompactionN++ → go compactLogFile(logFile) → p.Compact()
 ```
 
 新版把判定抽成 `needsLogCompaction()`，条件变成"超过大小 **或** 文件非空且年龄超过阈值"：
@@ -376,11 +348,8 @@ p.compact()
 // v1.12.3:tsdb/index/tsi1/partition.go:262-265,979-1001,1008-1025
 p.opened = true
 go p.runPeriodicCompaction()   // 启动先 Compact()；之后每小时 t.C 时若 NeedsCompaction(true) 才 Compact()
-
-func (p *Partition) NeedsCompaction(checkRunning bool) bool {
-    if p.needsLogCompaction() { return true }        // 大小或年龄
-    // 否则：level <= len(p.levels)-2 && levelCount[level] > 1 && !(checkRunning && p.levelCompacting[level])
-}
+// NeedsCompaction: needsLogCompaction()（大小或年龄）
+//   || level <= len(levels)-2 && levelCount[level] > 1 && !(checkRunning && levelCompacting[level])
 ```
 
 配合 `compact()` 新增的 level-0 扫描，旧版"只有刚被轮转的那一个 log 文件会被压缩"变成"所有非 active 的 L0 文件都会被压缩"：
@@ -388,37 +357,22 @@ func (p *Partition) NeedsCompaction(checkRunning bool) bool {
 ```go
 // v1.12.3:tsdb/index/tsi1/partition.go:1043-1073 — compact() 的 L0 分支
 if p.needsLogCompaction() {
-    if err := p.prependActiveLogFile(); err != nil {
-        p.logger.Error("failed to retire active log file", zap.Error(err))
-    }
+    if err := p.prependActiveLogFile(); err != nil { p.logger.Error("failed to retire active log file", zap.Error(err)) }
 }
 for _, f := range p.fileSet.files {
-    if f.Level() == 0 {
-        logFile := f.(*LogFile)      // 不变式：level 0 ⟺ LogFile
-        if logFile == p.activeLogFile { continue }
-        if p.levelCompacting[0] { break }
-        p.levelCompacting[0] = true
-        p.currentCompactionN.Add(1)
+    if f.Level() == 0 && f != p.activeLogFile && !p.levelCompacting[0] {
+        p.levelCompacting[0] = true; p.currentCompactionN.Add(1)
         go func() {
-            defer func() {
-                p.mu.Lock()
-                p.currentCompactionN.Add(-1)
-                p.levelCompacting[0] = false
-                p.mu.Unlock()
-                p.Compact()
-            }()
-            p.compactLogFile(logFile)
+            defer func() { p.mu.Lock(); p.currentCompactionN.Add(-1); p.levelCompacting[0] = false; p.mu.Unlock(); p.Compact() }()
+            p.compactLogFile(f.(*LogFile))   // 不变式：level 0 ⟺ LogFile
         }()
     }
 }
 ```
 
-对应的两个 PR 分工不同：#21943（`b64c2c3dcf`）= 年龄/大小阈值 + 每小时巡检 + `needsLogCompaction` 里的 `size > 0`；#22006（`e62efaf751`，+8 行）= `compact()` 启动时也轮转 active log，并补 manifest 写失败日志。
+PR 分工：#21943（`b64c2c3dcf`）= 阈值 + 巡检 + `size > 0`；#22006（`e62efaf751`）= `compact()` 启动时轮转 active log + manifest 失败日志。
 
-**语义影响**：
-- 一个长时间没有写入的 shard，其 `.tsl` 最多 1 小时后（巡检周期）开始按 4h 冷阈值被压缩成 `.tsi`，查询不再需要合并越来越大的内存 LogFile。
-- 升级后短期内会看到一批"TSI level compaction"日志和磁盘写入，这是预期行为，不是损坏。
-- 反方向：`compact-full-write-cold-duration` 从此同时影响 TSM 与 TSI；把它调小会同时增加两类压缩压力。
+**语义影响**：空闲 shard 的 `.tsl` 最多 1 小时后按 4h 冷阈值压成 `.tsi`；升级初期会看到一批 TSI compaction 日志，属预期；该配置从此同时影响 TSM 与 TSI。
 
 ### 3.5 压缩记账：`atomic.Int32` + `defer` 释放（#26511）
 
@@ -568,7 +522,7 @@ if ssitr, ok := itr.(tsdb.SeriesIDSetIterator); ok {
 }
 ```
 
-**收益**：每次 `Put` 少 1~3 次 `string([]byte)` 分配（常见分支 measurement/tag key 已存在时旧版 4 次、新版 3 次，新 measurement 分支最多省 3 次；`exists` 与 map 查找的转换本就可被编译器优化掉），在"新 tag value 第一次被查询"的高基数场景里直接减少 GC 压力。没有改变缓存语义（容量、命中 clone、未命中 Merge 全部照旧，见 [02 索引系统 §2.1a](../02_index_system_spec.md)）。
+**收益**：插入路径每次 `Put` 少 1~3 次 `string([]byte)` 分配（常见分支 measurement/tag key 已存在时旧版 4 次、新版 3 次，新 measurement 分支最多省 3 次；`exists` 与 map 查找的转换本就可被编译器优化掉）；exists 命中早退时旧版 0 次、新版先做 3 次转换，反多 3 次。在"新 tag value 第一次被查询"的高基数场景里直接减少 GC 压力。没有改变缓存语义（容量、命中 clone、未命中 Merge 全部照旧，见 [02 索引系统 §2.1a](../02_index_system_spec.md)）。
 
 ### 3.8 测量名迭代器生命周期：修掉 use-after-unmap（#22040）
 
@@ -589,19 +543,7 @@ if expr != nil {
 }
 ```
 
-```go
-// v1.8.10:tsdb/index.go:1572-1697 — measurementNamesByTagFilter
-mitr, err := is.measurementIterator()
-...
-defer mitr.Close()           // ← 函数返回即 Unmap
-var names [][]byte
-for {
-    me, err := mitr.Next()
-    ...
-    names = append(names, me)   // me 指向 mmap
-}
-return names, nil
-```
+measurementNamesByTagFilter 里同样 `defer mitr.Close()`（`v1.8.10:tsdb/index.go:1572-1697`）。
 
 新版引入 `MeasurementSliceIterator` 与 `fileMeasurementSliceIterator`，把"底层文件迭代器"和"名字切片"绑在同一个对象上，**拷贝完成之后**才 `Close`：
 
@@ -634,7 +576,7 @@ defer func() {
 return slices.CopyChunkedByteSlices(itr.UnderlyingSlice(), 1000), nil
 ```
 
-细节：`return slices.CopyChunkedByteSlices(...)` 会先求值返回值，再执行 `defer`，所以拷贝一定发生在 `Close()`（Unmap）之前。同一修复覆盖 `MeasurementNamesByExpr`、`MeasurementNamesByPredicate`、`measurementNamesByNameFilter`、`measurementNamesByTagFilter`、`measurementNamesByTagPredicate`；`measurementNamesByTagFilter` 还加了 `failed` 标志，只有失败路径才提前 `Close`（`v1.12.3:tsdb/index.go:1648-1662`）。
+细节：`return slices.CopyChunkedByteSlices(...)` 先求值返回值、再执行 `defer`，所以拷贝发生在 `Close()`（Unmap）之前。修复覆盖 `MeasurementNamesByExpr`/`ByPredicate`、`measurementNamesByNameFilter`/`ByTagFilter`/`ByTagPredicate`；`ByTagFilter` 的 `failed` 标志仅失败路径提前 `Close`（`v1.12.3:tsdb/index.go:1648-1662`）。
 
 **触发场景**：`SHOW MEASUREMENTS WITH MEASUREMENT =~ /.../` 或 `SHOW MEASUREMENTS WHERE tag='v'` 命中一个正在被压缩/关闭的 shard 时，旧版可能读到已 `munmap` 的地址 → SIGSEGV 或读到垃圾名字。新版不会。
 
@@ -689,8 +631,6 @@ for s.size = uint32(SeriesSegmentHeaderSize); s.size < uint32(len(s.data)); {
     flag, _, _, sz := ReadSeriesEntry(s.data[s.size:])
     ...
 }
-// v1.8.10:tsdb/series_segment.go:243-250 — ForEachEntry
-for pos := uint32(SeriesSegmentHeaderSize); pos < uint32(len(s.data)); {
 ```
 
 新版先用 `os.Stat` 拿到真实大小，循环按 `s.size` 截断：
@@ -828,14 +768,8 @@ defer i.cleanUpFail(&rErr)     // 失败 → i.close() 关闭所有已打开分�
 旧版 `SeriesFile.DeleteSeriesID(id)` 没有 flush 参数，`SeriesPartition.DeleteSeriesID` 每次都会 `segment.Flush()`：
 
 ```go
-// v1.8.10:tsdb/series_file.go:198-204
-func (f *SeriesFile) DeleteSeriesID(id uint64) error {
-    p := f.SeriesIDPartition(id)
-    if p == nil { return ErrInvalidSeriesPartitionID }
-    return p.DeleteSeriesID(id)
-}
-
-// v1.8.10:tsdb/series_partition.go:317-345
+// v1.8.10:tsdb/series_file.go:198-204 — SeriesFile.DeleteSeriesID(id) 无 flush 参数，直接转调分区
+// v1.8.10:tsdb/series_partition.go:317-345 — 每次删除都 segment.Flush()
 if segment := p.activeSegment(); segment != nil {
     if err := segment.Flush(); err != nil { return err }
 }
@@ -1210,7 +1144,7 @@ valueExpr, remainingExpr, err := influxql.PartitionExpr(influxql.CloneExpr(expr)
 | L0 全量扫描压缩 | `compact()` 遍历非 active 的 L0 文件 | 历史遗留 `.tsl` 也会被回收；不再依赖"刚好又写了一次" | 同一分区 L0 串行（`levelCompacting[0]`） | `v1.12.3:tsdb/index/tsi1/partition.go:1043-1073` |
 | 压缩记账 defer 化 | `atomic.Int32` + `defer` 清 `levelCompacting` | panic 不再永久封印某个 level；`CurrentCompactionN()` 无锁 | 无 | `v1.12.3:tsdb/index/tsi1/partition.go:1102-1118` |
 | `TagValueIterator` 提前放锁 | 仅 `f.mms`/`tagSet` 两次外层查找提前放锁 | 缩短这两次查找的读锁持有时间 | **代价**：`tk.tagValues` 的 range 仍在锁外，与写路径并发会 `fatal error: concurrent map iteration and map write`，需上游修复（§3.6/§7.7） | `v1.12.3:tsdb/index/tsi1/log_file.go:422-437,1406-1412` |
-| series 缓存少分配 | `string()` 只做一次，map key 与 LRU 元素共享 | 每次 `Put` 少 1~3 次分配（新 measurement 分支最多 3 次） | 无 | `v1.12.3:tsdb/index/tsi1/cache.go:98-147` |
+| series 缓存少分配 | `string()` 只做一次，map key 与 LRU 元素共享 | 插入路径少 1~3 次分配（新 measurement 分支最多 3 次；exists 命中早退时新版反多 3 次） | 无 | `v1.12.3:tsdb/index/tsi1/cache.go:98-147` |
 | 测量名迭代器 pin 文件 | `fileMeasurementSliceIterator` 持有底层 `MeasurementIterators` | 修掉 use-after-unmap（正确性 > 性能） | 索引文件释放被推迟到拷贝之后 | `v1.12.3:tsdb/index.go:992-1015,1368-1417` |
 | 删除批量 fsync | `NoFlush` + `FlushSegments` | 旧版 0 次 fsync + N 次 bufio flush；新版 N 次写 + ≤8 次 fsync（每分区一次） | 持久性增强；批末同步延迟，崩溃窗口内可能丢最后一批 tombstone | `v1.12.3:tsdb/series_file.go:203-242`、`tsdb/store.go:1083-1113` |
 | 写路径 SSEG fsync | `Flush()` 增加 `file.Sync()`（`b4e781eff6`） | 建新 series 的持久性增强 | **每个产生新 series 的写请求 ≤8 次 fsync**，且在分区写锁内；v1.8.10 为 0 | `v1.12.3:tsdb/series_segment.go:219-227`、`tsdb/series_partition.go:219-222,232-238,278-283`、`tsdb/series_file.go:181-197` |
@@ -1318,12 +1252,12 @@ mem,host=web           used=1i   1700000000000000000
 SHOW MEASUREMENTS WITH MEASUREMENT =~ /^(cpu|mem)$/ AND host = 'web'
 ```
 
-1. `IndexSet.MeasurementNamesByExpr` → `measurementNamesByExpr` 处理 `AND`：左支 `measurementNamesByNameFilter` 正则命中 `{cpu, mem}`，右支 `measurementNamesByTagFilter` 查 `host=web` 也命中 `{cpu, mem}`，交集合 = `{cpu, mem}`。
-2. **旧版**：分支函数 `defer mitr.Close()` 在返回时就把 `IndexFile` mmap 关掉，外层再 `slices.CopyChunkedByteSlices` 读的是已 unmap 的内存（§3.8）。
-3. **新版**：各分支返回 `newFileMeasurementSliceIterator(..., MeasurementIterators{itr})` 把底层迭代器 pin 住，顶层 `defer itr.Close()` 在 `return slices.CopyChunkedByteSlices(...)` 的返回值求值之后才执行 → 拷贝时文件仍被 pin 住。
-4. 若同时有 `SHOW TAG VALUES ... WHERE host='web'`，第一次查询会把 `(cpu,host,web)` 的 `SeriesIDSet` 写进 `TagValueSeriesIDCache`；新版这次 `Put` 比旧版少 1~3 次字符串分配（§3.7）。第二次查询直接 `ss.Clone()` 命中。
+1. `IndexSet.MeasurementNamesByExpr` → `measurementNamesByExpr` 处理 `AND`：左支正则命中 `{cpu, mem}`，右支 `host=web` 也命中，交集 = `{cpu, mem}`。
+2. **旧版**：分支函数 `defer mitr.Close()` 返回时就关掉 `IndexFile` mmap，外层再 `slices.CopyChunkedByteSlices` 读的是已 unmap 内存（§3.8）。
+3. **新版**：分支返回 `newFileMeasurementSliceIterator(..., MeasurementIterators{itr})` pin 住底层迭代器，顶层 `defer itr.Close()` 在返回值求值后才执行 → 拷贝时文件仍被 pin 住。
+4. 若同时有 `SHOW TAG VALUES ... WHERE host='web'`，新版这次 `Put` 比旧版少 1~3 次字符串分配（§3.7）；第二次查询直接 `ss.Clone()` 命中。
 
-**可手工验证**：对同一个 shard 反复执行 `SHOW MEASUREMENTS WITH MEASUREMENT =~ /.*/` 同时触发 `influx_inspect buildtsi` 或重压，旧版有概率 panic（`fatal error: unexpected signal ...`），新版不会。
+**可手工验证**：反复执行 `SHOW MEASUREMENTS ...` 同时触发 `buildtsi` 或重压，旧版可能 panic，新版不会。
 
 ### 6.2 案例 B：`DROP SERIES` 删除 900 / 1000 条 series
 
@@ -1445,7 +1379,7 @@ if elapsed >= timeoutDuration {
 | `tsdb/index/tsi1/log_file.go` | 413-427 | 422-437, 1406-1412 | `TagValueIterator` 提前放锁，但 `tagValues` 的 range 在锁外（§7.7）；`ModTime()` 加 `RLock` | #26369、#26372、#26853、`1755b8f6d2`(#22338) |
 | `tsdb/index/tsi1/log_file.go` | 1076-1097 | 1090-1106 | `Writes` 写入与 flush 同锁 | #25182 |
 | `tsdb/index/tsi1/log_file.go` | 150-170 | 153-165 | 重放截断 + `errors.Is` | #23557 |
-| `tsdb/index/tsi1/cache.go` | 98-140 | 98-147 | series 缓存少分配 | #27255、#27257 |
+| `tsdb/index/tsi1/cache.go` | 98-140 | 98-147 | series 缓存少分配 | #27255、#27257、`45a8227ad6`(#25622，xxhash v1→v2 / cache string key) |
 | `tsdb/index/tsi1/index.go` | 245-300 | 255-313 | errgroup + `cleanUpFail` + `IsOpen` | #23430、#23552 |
 | `tsdb/index/tsi1/index.go` | 1054-1085 | 1066-1095 | `TagValueSeriesIDIterator` 错误时关闭迭代器 | #23462 |
 | `tsdb/index.go` | 1317-1335, 1572-1600 | 1368-1417, 1648-1662 | 测量名迭代器 pin 文件 | #22040 |

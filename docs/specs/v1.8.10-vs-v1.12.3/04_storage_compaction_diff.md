@@ -120,7 +120,7 @@ sequenceDiagram
         E->>E: compactHiPriorityLevel / compactLoPriorityLevel / compactFull
         E->>C: s.Apply() → CompactFull / CompactFast
     end
-    E->>P: ReleaseCompactionPlans 未启动的计划
+    E->>E: ReleaseCompactionPlans 未启动的计划
 ```
 
 ---
@@ -468,7 +468,7 @@ for j := 0; j < step && (j+i) < len(generations); j++ {
 
 - `end` 的语义从“从头开始连续 L4 的长度”变为“**最后一个** L4 的位置 + 1”。前者一旦遇到夹心低层文件就放弃后面的所有 L4；后者保证所有 L4 都在考察范围内。
 - 分组循环里 `isInUse` / 超大文件现在用 `break` 而不是 `continue`+`startIndex++`，分组更简单，也不会把超大文件悄悄跳过而留下一个跨越它的组。
-- 旧版“组里含 `level<=3` 就整组丢弃”的规则被删除：这些文件既然没被 level planner 拿走（`isInUse` 为 false），就应该在同一组里被卷掉——这是 #26911 的一部分（配合反向扫描，解决夹心低层文件导致的漏压缩）。
+- 旧版“组里含 `level<=3` 就整组丢弃”的规则被删除：这些文件既然没被 level planner 拿走（`isInUse` 为 false），就应该在同一组里被卷掉——这是 #26911 的一部分（配合反向扫描；它修的是 1.12 线热 shard 失去 `PlanOptimize` 兜底后的回归，v1.8.10 本身不存在该漏压）。
 
 ### 3.7 PlanOptimize / L5：从“凑够 4 代”到“冷 shard 就重整”
 
@@ -540,8 +540,8 @@ func (c *DefaultPlanner) PlanOptimize(lastWrite time.Time) (compactGroup []Compa
 差异解释（行为影响最大的几处）：
 
 1. **必须冷**：`time.Since(lastWrite) < compactFullWriteColdDuration` 直接返回空。默认 `compactFullWriteColdDuration = 4h`（`v1.8.10:tsdb/config.go:38` 与 `v1.12.3:tsdb/config.go:38` 相同）。旧版 optimize 完全不看写入时间，只靠“`Plan` 为空”间接限制。
-2. **不再要求 4 代**：旧版 `len(group) < 4 && !hasTombstones` 才跳过；新版对 `level==4` 的组**不设数量下限**。但要注意**谁先拿到文件**：`planCompactionsInner` 每 tick **无条件**依次调用 `Plan` 与 `PlanOptimize`（`v1.12.3:.../engine.go:2365-2366`），后者只跳过已被 `acquire` 的世代（`groupAdjacentGenerations` 遇 in-use 直接 `continue`，`:409-412`）。`Plan` 的 full 分支并不 `acquire` 全部世代：对 `>2GB + 满块 + 无 tombstone` 的世代直接 `continue`（`compact.go:513`），`genCount<=1` 时整轮返回 nil（`:539`）。因此只要 `Plan` 没接管某些 L4 世代，1–3 个 L4 世代就会在同一 tick 进入 L5 队列，**L4 与 L5 可同时非空**。
-3. **单世代特例**：`len(generations) == 1` 时不再按层级过滤，允许把同一世代的多个文件重整。旧版在 `len(generations) <= 1` 时直接返回 nil，**单世代多文件永远不会被 optimize**。
+2. **不再要求 4 代**：旧版 `len(group) < 4 && !hasTombstones` 才跳过；新版对 `level==4` 的组**不设数量下限**。但要注意**谁先拿到文件**：`planCompactionsInner` 每 tick **无条件**依次调用 `Plan` 与 `PlanOptimize`（`v1.12.3:.../engine.go:2365-2366`），后者只跳过已被 `acquire` 的世代（`groupAdjacentGenerations` 遇 in-use 直接 `continue`，`:409-412`）。`Plan` 的 full 分支并不 `acquire` 全部世代：对 `len(generations) > 2`、`>2GB`、满块、无 tombstone 的世代直接 `continue`（`compact.go:513`），`genCount<=1` 时整轮返回 nil（`:539`）。因此只要 `Plan` 没接管某些 L4 世代，1–3 个 L4 世代就会在同一 tick 进入 L5 队列，**L4 与 L5 可同时非空**。
+3. **单世代特例**：`len(generations) == 1` 时不再按层级过滤，允许把同一世代的多个文件重整。旧版在 `len(generations) <= 1 && !hasTombstones()` 时直接返回 nil；若该单世代带 tombstone，旧版仍会把 `level==4` 的组送去 optimize（`len(group) < 4` 的过滤因 tombstone 放行）。因此“单世代多文件永远不会被 optimize”只对无 tombstone 成立。
 4. **不再跳过超大文件**：旧版对 `count>2 && size>2GB && 满 block && 无 tombstone` 的世代 `continue`；新版没有这条，改由 `generationsFullyCompacted` 决定。
 5. **返回值带世代数**：`generationCount == 1` 时引擎对该 L5 组使用 aggressive points/block（`v1.12.3:.../engine.go:2402`）。
 
@@ -940,7 +940,7 @@ type blockCountCache struct {
 ```
 
 ```go
-// v1.12.3:tsdb/engine/tsm1/reader.go:638
+// v1.12.3:tsdb/engine/tsm1/reader.go:638-663（简化示意，语义等价）
 func (t *TSMReader) firstBlockCount() (int, error) {
 	t.mu.RLock()
 	cache := t.firstBlockCountCache
@@ -1196,7 +1196,7 @@ if rollToNext {
 | 四段布局 | header(5B)/blocks/index/footer(8B offset) | 同 | 未变 |
 | `IndexEntry` 编解码 | 固定 28B | 逐字节相同（`reader.go:1738-1816` vs 旧 `reader.go:1562-1637`） | 未变 |
 | mmap 初始化 | 读 footer 8B → `indexStart` → `UnmarshalBinary`（旧 `reader.go:1352-1361`） | 同（新 `reader.go:1528-1537`），仅多一次 `Seek(0,0)` 与 `MmapError` 包装 | 未变 |
-| `verifyVersion` | `writer.go:800` | 搬到 `reader.go:1440`（逻辑相同） | 位置变，行为不变 |
+| `verifyVersion` | `writer.go:802` | 搬到 `reader.go:1442`（逻辑相同） | 位置变，行为不变 |
 | KeyCursor | 结构、`seek`、`nextAscending/nextDescending`、`locations` | 同（只在 `Read*Block` 里加指标） | 未变 |
 | Tombstone 文件 | `<tsm>.tombstone`，v3 gzip / v4 增量（`tombstone.go:272/303`） | 同（`tombstone.go:271/302`），仅 `ioutil.TempFile` → `os.CreateTemp` | 未变 |
 | Digest | manifest + snappy block（`digest_writer.go:32`） | 同；仅错误返回方式改变（`digest.go:25` 具名返回值，`Close` 错误不再被 `defer` 吞掉） | 未变 |
@@ -1287,7 +1287,7 @@ var AdjacentFileProperty = CompactionProperty{
 
 - **L5 第一次运行最早在进程启动 1 小时后**；之后每次 L5 尝试后至少间隔 5 分钟。
 - **optimize 只对冷 shard 生效**（默认 `since(lastWrite) >= 4h`）。默认配置下热 shard 不会做 L5，即使有很多 L4 文件；这与旧版“`Plan` 为空就 optimize”不同。把 `compact-full-write-cold-duration` 调小会让 L5 更频繁（并放大 §7 第 6 条的重复重写风险）。
-- **单世代多文件会被重写一次**：旧版认为“1 个世代 = 完全压缩”，新版在“≥2 个文件、≥2 个文件小于 2GB、并非全部 aggressive”时会做一次 L5，把块大小抬到 10000。升级后首次空闲期可能看到一次额外的磁盘写入与短暂的磁盘占用上升（新文件写完、旧文件删除前）。
+- **单世代多文件会被重写一次**：旧版认为“1 个世代且无 tombstone = 完全压缩”，新版在“≥2 个文件、≥2 个文件小于 2GB、并非全部 aggressive”时会做一次 L5，把块大小抬到 10000。升级后首次空闲期可能看到一次额外的磁盘写入与短暂的磁盘占用上升（新文件写完、旧文件删除前）。
 - **`Engine.IsIdle` 更严格**：单世代多文件且未 aggressive 时不再算 idle，`influxd` 的 “shard idle” 判断与相关日志会变化。
 - **L4 段与 full 分支的边界变化**：非 full 的 L4 窗口不再丢弃含低层文件的组，也不再被夹心层截断；冷 shard 的 full 分支新增 `isInUse` 跳过与首块缓存判定。热 shard 上两版的分组边界可能不同（见 §6.4）。
 - **L4 数据不会再被压回 L2**，因此升级后 level 分布会整体偏高（L4 文件更多、L2 更少），依赖层级分布的容量模型需要重新校准。
@@ -1296,7 +1296,7 @@ var AdjacentFileProperty = CompactionProperty{
 
 | 资源 | 预期变化 | 原因 |
 |---|---|---|
-| 磁盘占用 | 升级后短期内可能**先升后降** | L5 重写产生新文件；旧文件在 `replace` 后被删除（被查询占用的延迟到 purger）。长期看 #26670/#26911 修复了漏压缩，碎片减少 |
+| 磁盘占用 | 升级后短期内可能**先升后降** | L5 重写产生新文件；旧文件在 `replace` 后被删除（被查询占用的延迟到 purger）。长期看 #26670 修复 1.12.1 引入的 in-use 泄漏、#26911 修复 1.12 线热 shard 的嵌套低层调度（相对 1.12.0–1.12.2；v1.8.10 由 `PlanOptimize` 兜底，跨版本改善有限） |
 | 磁盘写放大 | 冷 shard 上略增 | 多了一次 L5 aggressive 重写；但只发生一次（之后 `generationsFullyCompacted` 返回 true） |
 | CPU（规划） | 明显下降 | `FirstBlockCount` 缓存 + generation/sequence 缓存（#26432/#26905） |
 | CPU（压缩） | 冷 shard 上短时上升 | L5 会解码/重编码整组文件（`fast=false`） |
@@ -1307,7 +1307,7 @@ var AdjacentFileProperty = CompactionProperty{
 ### 5.6 回滚
 
 - 直接回滚到 v1.8.10 可读新版本写出的所有文件（格式 version 1）。
-- 回滚后 L5 留下的“单世代多文件、10000 points/block”文件会被旧版视为 `level=4` 的普通文件；旧版 `PlanOptimize` 在 `len(generations)<=1` 时不会碰它，因此**不会自动拆回 1000 points/block**——这是单向的优化，但不影响正确性。
+- 回滚后 L5 留下的“单世代多文件、10000 points/block”文件会被旧版视为 `level=4` 的普通文件；旧版 `PlanOptimize` 在 `len(generations)<=1 && !hasTombstones()` 时不会碰它（带 tombstone 的世代仍可能被重整），因此通常**不会自动拆回 1000 points/block**——这是单向的优化，但不影响正确性。
 - 若曾把 `aggressive-points-per-block` 调低，回滚后旧版没有该配置，行为回到 1000。
 
 ---
@@ -1390,15 +1390,15 @@ var AdjacentFileProperty = CompactionProperty{
 
 ---
 
-### 6.3 场景二：单世代多文件，旧版永不再压，新版 L5 重整
+### 6.3 场景二：单世代多文件（无 tombstone），旧版永不再压，新版 L5 重整
 
-状态：只有一个世代 500，含三个文件 `500-000000004.tsm`、`500-000000005.tsm`、`500-000000006.tsm`，每个约 700MB（历史上因单 key 索引上限 65535 触发 roll），每个 `FirstBlockCount=1000`，shard 已空闲 4h+。
+状态：只有一个世代 500，含三个文件 `500-000000004.tsm`、`500-000000005.tsm`、`500-000000006.tsm`，每个约 700MB（历史上因单 key 索引上限 65535 触发 roll），每个 `FirstBlockCount=1000`，shard 已空闲 4h+，且无 tombstone。
 
 | 步骤 | v1.8.10 | v1.12.3 |
 |---|---|---|
 | 世代/层级 | 1 个世代，`files[0].Sequence=4` → L4 | 同 |
-| `Plan` | `len(generations)<=1` → nil（`compact.go:485`） | `len(generations)<=1` → nil（`compact.go:559`） |
-| `PlanOptimize` | `len(generations)<=1` → nil（`compact.go:342`） | `generationsFullyCompacted`：1 世代、3 文件、均 <2GB、`FirstBlockCount=1000` 不大于 1000 → **false**；冷写满足 → 计划一个组（`group.level()==4`） |
+| `Plan` | `len(generations)<=1 && !hasTombstones()` → nil（`compact.go:485`） | `len(generations)<=1 && !hasTombstones()` → nil（`compact.go:559`） |
+| `PlanOptimize` | `len(generations)<=1 && !hasTombstones()` → nil（`compact.go:342`） | `generationsFullyCompacted`：1 世代、3 文件、均 <2GB、`FirstBlockCount=1000` 不大于 1000 → **false**；冷写满足 → 计划一个组（`group.level()==4`） |
 | `generationCount` | — | 1 → 触发 aggressive（`engine.go:2402`） |
 | 调度 | 无 | L5 权重 0.01，L1–L4 队列为空 → 选中；holdoff：启动 1h 后或上次尝试 5m 后 |
 | 限流 | — | 先拿 `compactionLimiter`，再拿 `optimizedCompactionLimiter`（默认容量 1） |
@@ -1522,7 +1522,7 @@ sequenceDiagram
 | purger | `tsdb/engine/tsm1/file_store.go:1376-1436` | `tsdb/engine/tsm1/file_store.go:1599-1698` | `d5a48e0662` #27146、`e883e8bec3` #26762 |
 | 文件名格式 | `tsdb/engine/tsm1/file_store.go:1123,1131` | `tsdb/engine/tsm1/file_store.go:1344,1352` | — |
 | 文件格式常量 | `tsdb/engine/tsm1/writer.go:81-96` | `tsdb/engine/tsm1/writer.go:82-97` | 未变 |
-| `verifyVersion` | `tsdb/engine/tsm1/writer.go:800` | `tsdb/engine/tsm1/reader.go:1440` | `2a0353ffd2` |
+| `verifyVersion` | `tsdb/engine/tsm1/writer.go:802` | `tsdb/engine/tsm1/reader.go:1442` | `2a0353ffd2` |
 | mmap init | `tsdb/engine/tsm1/reader.go:1316-1368` | `tsdb/engine/tsm1/reader.go:1486-1544` | `2a0353ffd2` |
 | `indexEntries` 编解码 | `tsdb/engine/tsm1/reader.go:1562-1637` | `tsdb/engine/tsm1/reader.go:1738-1816` | 未变 |
 | KeyCursor | `tsdb/engine/tsm1/file_store.go:1159+` | `tsdb/engine/tsm1/file_store.go:1380+` | 仅加指标 |

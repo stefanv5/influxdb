@@ -3,7 +3,7 @@
 > **基线**
 > - OLD：`v1.8.10` = commit `688e697c51`（2021-10-11）
 > - NEW：`v1.12.3` = commit `f3d5cb68ab`（`docs/specs/` 这批文档的代码基准）
-> - 区间：527 commits，602 files，+79,310 / −45,239；NEW 工作树只额外包含 4 个 docs 提交，代码与 `f3d5cb68ab` 相同。
+> - 区间：527 commits，602 files，+79,310 / −45,239；NEW 工作树只额外包含 7 个 docs 提交，代码与 `f3d5cb68ab` 相同。
 >
 > **本文范围**：`coordinator/points_writer.go`、`tsdb/store.go`、`tsdb/shard.go`、`tsdb/field_validator.go`、
 > `tsdb/engine/tsm1/{engine,cache,ring,wal,reader,file_store,compact}.go`、`tsdb/internal/fieldsindex.*`、
@@ -21,7 +21,7 @@
 >    序列化、写临时文件、fsync、rename 一次；新版只在 `fields.idxl` 末尾追加一条 protobuf 变更记录，
 >    重启/关闭时再合并回 `fields.idx`。
 > 3. **类型冲突的判定位置提前了**：旧版先校验、后建字段；新版在**校验过程中就原子地创建字段**
->    （`LoadOrStore`），并发写同一字段不同类型的竞态被消除。
+>    （`LoadOrStore`），并发写同一字段不同类型的冲突结果被确定化。
 > 4. **`time` 字段的处理反转了**：旧版静默剥掉；新版把"字段被剥离"作为 `PartialWriteError` 上抛给
 >    客户端（HTTP 400），而且 engine 层不再跳过 `time` 字段（这是 #26998 的副作用，见 §7.1）。
 > 5. **新增 1 MiB 字段长度上限**：旧版没有限制，超过 1 MiB 的字符串字段照收；新版默认拒绝，可用
@@ -35,7 +35,7 @@
 
 | # | 变更点 | v1.8.10 | v1.12.3 | 影响 | 证据 |
 |---|--------|---------|---------|------|------|
-| 1 | 写入 API 形态 | `WriteToShard(shardID, points)` + `WriteToShardWithContext(ctx,…)`；`Shard.WritePointsWithContext(ctx,…)`；`Engine.WritePointsWithContext(ctx,…)` | `Store.WriteToShard(writeCtx tsdb.WriteContext, shardID, points)`；`Shard.WritePoints(points, tracker)`；`Engine.WritePoints(points, tracker)` | Go API 破坏性变更（企业版/嵌入式调用方必须改）；HTTP 行为不变 | `v1.8.10:tsdb/store.go:1412`；`v1.12.3:tsdb/store.go:1861` |
+| 1 | 写入 API 形态 | `WriteToShard(shardID, points)` + `WriteToShardWithContext(ctx,…)`；`Shard.WritePointsWithContext(ctx,…)`；`Engine.WritePointsWithContext(ctx,…)` | `Store.WriteToShard(writeCtx tsdb.WriteContext, shardID, points)`；`Shard.WritePoints(points, tracker)`；`Engine.WritePoints(points, tracker)` | Go API 破坏性变更（企业版/嵌入式调用方必须改）；HTTP 状态码另有 §5.1 所列变化 | `v1.8.10:tsdb/store.go:1412`；`v1.12.3:tsdb/store.go:1861` |
 | 2 | 写统计传递方式 | `context.WithValue` + `Int64` 指针（`tsdb.ConetextKey`） | `tsdb.StatsTracker` 四个回调；`Store.statsTracker(db, rp, login)` | 去掉 context value 反模式；支持按 measurement / 按登录名计量 | `v1.8.10:tsdb/shard.go:504-516`；`v1.12.3:tsdb/shard.go:549-554`、`v1.12.3:tsdb/store.go:1796` |
 | 3 | 请求身份 | `meta.User` 参数（OSS 不使用） | `tsdb.WriteContext{UserId}`；内置 `_systemuser_*` 假用户 | 新增 `ingress-metric-by-login-enabled` 指标维度 | `v1.8.10:coordinator/points_writer.go:357`；`v1.12.3:coordinator/points_writer.go:463-471`；`tsdb/store.go:1842-1858` |
 | 4 | 字段元数据落盘 | 每个**含新字段的写请求**调用一次 `Save()`（一次请求内多字段合并为一次全量重写：tmp + fsync + rename + SyncDir） | 追加写 `fields.idxl` 变更日志（`O_APPEND|O_SYNC`），批量合并；`fields.idx` 只在 Close / ApplyChanges / LoadMetadataIndex 重建 / Restore·Import 时全量写 | 新字段密集写入时 IO 放大显著下降 | `v1.8.10:tsdb/shard.go:1786-1864`；`v1.12.3:tsdb/shard.go:1834`、`:1915-2001`、`:1855-1913` |
@@ -43,7 +43,7 @@
 | 6 | 字段表并发结构 | `MeasurementFields{mu sync.Mutex; fields atomic.Value}`（copy-on-write map） | `MeasurementFields{fields gensyncmap.Map[string,*Field]}`（泛型 sync.Map） | 去掉整表复制；`CreateFieldIfNotExists` 原子化 | `v1.8.10:tsdb/shard.go:1557-1634`；`v1.12.3:tsdb/shard.go:1557-1603` |
 | 7 | 字段校验 | `FieldValidator` 接口（可插拔）+ 先校验后建字段 | 固定函数 `ValidateAndCreateFields`，**校验时即建字段**（`LoadOrStore`），并返回 `fieldsToCreate` | 并发类型冲突竞态修复（#23756）；`EngineOptions.FieldValidator` 被删除 | `v1.8.10:tsdb/field_validator.go:12-51`；`v1.12.3:tsdb/field_validator.go:17-84`；`v1.12.3:tsdb/engine.go:165` |
 | 8 | 字段长度上限 | 无 | `MaxFieldValueLength = 1048576`；超限 → `PartialWriteError{Dropped:1}`，可用 `skip-field-size-validation` 关闭 | 行为变更：>1 MiB 字符串字段由"接受"变"拒绝" | `v1.12.3:tsdb/field_validator.go:12,27-40`；`v1.12.3:tsdb/config.go:120` |
-| 9 | `time` 字段 | shard 与 engine 都静默跳过，写请求成功 | shard 返回 `Dropped:0` 的 `PartialWriteError`；engine **不再跳过** | 客户端收到 400 "partial write"；engine 行为见 §7.1 风险 | `v1.8.10:tsdb/shard.go:666-671`、`v1.8.10:tsdb/engine/tsm1/engine.go:1330-1333`；`v1.12.3:tsdb/field_validator.go:45-55`、`v1.12.3:tsdb/engine/tsm1/engine.go:1366-1367` |
+| 9 | `time` 字段 | shard 与 engine 都静默跳过，写请求成功 | shard 返回 `Dropped:0` 的 `PartialWriteError`；engine **不再跳过** | 客户端收到 400 "partial write"；engine 行为见 §7.1 风险 | `v1.8.10:tsdb/shard.go:666-671`、`v1.8.10:tsdb/engine/tsm1/engine.go:1330-1333`；`v1.12.3:tsdb/field_validator.go:45-56`、`v1.12.3:tsdb/engine/tsm1/engine.go:1366-1367` |
 | 10 | 错误文本 | `partial write: %s dropped=%d` | 追加 `for database: … for retention policy: …` | 客户端日志/告警匹配规则可能失效 | `v1.8.10:tsdb/shard.go:113-123`；`v1.12.3:tsdb/shard.go:121-140` |
 | 11 | 保留策略写窗口 | 无 | `PastWriteLimit` / `FutureWriteLimit`，超窗点计入 `WriteWindowDropped` 并 400 | 新功能；错误原因可区分 RP 边界与写窗口边界 | `v1.8.10:coordinator/points_writer.go:191-241`；`v1.12.3:coordinator/points_writer.go:218-245,299-360` |
 | 12 | 订阅分发 | `subPoints []chan<- *WritePointsRequest` + `AddWriteSubscriber`，逐 channel 非阻塞投递，统计 `subWriteDrop` | `Subscriber interface{ Send(*WritePointsRequest) }`，`SubWriteOK` 每请求 +1，`subWriteDrop` 指标删除 | 企业版接线方式变更；写入侧订阅指标语义变化 | `v1.8.10:coordinator/points_writer.go:147-149,410-431`；`v1.12.3:coordinator/points_writer.go:63-65,511-514,267-276` |
@@ -273,8 +273,8 @@ func (s *Store) statsTracker(db, rp, login string) StatsTracker {
 - 旧版 `PointsWriter` 在 shard goroutine 里把 `numPoints/numValues` 累加回 context
   （`v1.8.10:coordinator/points_writer.go:388-404`）；新版 `AddedPoints` 由 engine 在**写完 Cache/WAL** 之后回调
   （`v1.12.3:tsdb/engine/tsm1/engine.go:1454-1456`），`AddedMeasurementPoints` 则在组 key 的逐点循环内回调（`:1435-1437`）。因此 `writePointsOk` / `writeValuesOk`
-  的统计口径更准确：旧版在未传 context 的场景（如 UDP、订阅写入）退回 `len(points)` 估算
-  （`v1.8.10:tsdb/shard.go:570-578`），新版始终用 engine 实际处理的点数。
+  的统计口径更准确：旧版只有在直接调用 `Shard.WritePoints`/`Store.WriteToShard` 且未带统计指针时才退回 `len(points)` 估算
+  （`v1.8.10:tsdb/shard.go:570-578`；HTTP/UDP 的 `PointsWriter` goroutine 都会先注入指针，订阅写入走外部 writer），新版始终用 engine 实际处理的点数。
 - 新增两个配置：`ingress-metric-by-measurement-enabled`、`ingress-metric-by-login-enabled`
   （`v1.12.3:tsdb/config.go:138-139`），旧版没有（`git show v1.8.10:tsdb/config.go` 全文无此键）。
 - 身份来源：`WritePointsInto` 显式使用 `tsdb.SelectIntoUser`，`PointsWriter` 对匿名写使用
@@ -382,7 +382,7 @@ fd.Write(b)
 关键机制：
 
 1. **批量合并**：`writeRequests` channel 容量 `MaxCombinedWrites = 100`
-   （`v1.12.3:tsdb/shard.go:1667,1675,1819`）。`appendToChangesFile` 在真正写盘前会**排空队列**，
+   （`v1.12.3:tsdb/shard.go:1667,1675,1818`）。`appendToChangesFile` 在真正写盘前会**排空队列**，
    一次 append 至少合并 1 条；排空期间新到请求仍可入队并被同一批并入（通常 1~100+ 条），把多次 fsync 压成 1 次。
 2. **长度前缀 + protobuf**：`marshalFieldChanges` 用 `proto.MarshalOptions.MarshalAppend` 在缓冲区
    头部预留 8 字节，写入长度后再回填（`v1.12.3:tsdb/shard.go:2067-2098`）；读取用
@@ -928,7 +928,7 @@ func (t *TSMReader) parseAndCacheFileName(path string) error {
 | 丢弃点摘要 | 只保留最早/最晚样本 + 分类计数 | `v1.12.3:coordinator/points_writer.go:156-198` | 大批量超窗写入时内存 O(1) 而非 O(dropped) |
 | 空 shard group 防御 | 返回错误而非 panic | `v1.12.3:coordinator/points_writer.go:351-354`（#25717） | 单点坏元数据不再拖垮进程 |
 | 坏 shard 记忆 | `badShards` 缓存打开错误 | `v1.12.3:tsdb/store.go:95-120,461-466`（#23437） | 避免每次写入反复尝试打开损坏 shard（旧版会反复 IO） |
-| `time` 字段报错上抛 | 让客户端知道字段被丢弃 | `v1.12.3:tsdb/field_validator.go:45-55`（#26998） | 可观测性提升；但改变了 HTTP 状态码，见 §5 |
+| `time` 字段报错上抛 | 让客户端知道字段被丢弃 | `v1.12.3:tsdb/field_validator.go:45-56`（#26998） | 可观测性提升；但改变了 HTTP 状态码，见 §5 |
 | SSEG 建 series fsync | `Flush()` 增加 `file.Sync()`（`b4e781eff6`） | **每个产生新 series 的写请求 ≤8 次 fsync**（每分区一次，见 [02 §3.9(c)](02_index_series_diff.md)）；v1.8.10 为 0 | 持久性增强；代价是写延迟，且发生在 `SeriesPartition` 写锁内 | `v1.12.3:tsdb/series_segment.go:219-227`、`tsdb/series_partition.go:219-222,232-238,278-283` |
 | 订阅序列化内联 | 序列化从订阅 goroutine 移到写请求 goroutine（`85abb3af36`） | 订阅侧少一次跨 goroutine 排队；`SubWriteOK` 变为每请求 +1 | 有匹配订阅时写延迟增加一次全量 line protocol 序列化 | `v1.12.3:coordinator/points_writer.go:511-514`；`services/subscriber/service.go:42-67,608-627` |
 
@@ -1161,7 +1161,7 @@ cpu,host=web01 value=1.0,time=1704067200 1704067200000000000
 | 版本 | 结果 |
 |------|------|
 | v1.8.10 | `validField` 检查发现还有 `value`，点保留；validator 与 engine 都跳过 `time`；HTTP **204**，只写 `value` |
-| v1.12.3 | `ValidateAndCreateFields` 对 `time` 返回 `Dropped:0` 的 `PartialWriteError`（`field_validator.go:45-55`），点继续写；`shard.go:728-731` 把它塞进 `err` 并返回；HTTP **400** `partial write: invalid field name: input field "time" … Field "time" has been stripped from point. dropped=0 for database: mydb for retention policy: autogen` |
+| v1.12.3 | `ValidateAndCreateFields` 对 `time` 返回 `Dropped:0` 的 `PartialWriteError`（`field_validator.go:45-56`），点继续写；`shard.go:728-731` 把它塞进 `err` 并返回；HTTP **400** `partial write: invalid field name: input field "time" … Field "time" has been stripped from point. dropped=0 for database: mydb for retention policy: autogen` |
 
 若点**只有** `time` 字段（`cpu time=1704067200 …`），两版都整点丢弃（旧 `v1.8.10:tsdb/shard.go:662-679`，
 新 `v1.12.3:tsdb/shard.go:690-705` 的 `validField` 检查），`Dropped=1`。
@@ -1197,15 +1197,16 @@ cpu,host=web01 value=1.0,time=1704067200 1704067200000000000
 - 后续若有人用不同类型写这个字段，会得到"已存在为另一类型"的冲突，看起来"无缘无故"；
 - 该行为在 [06 §8.5](../06_cluster_communication_spec.md) 有记录，但**是 v1.12.3 才有的**（旧版校验通过后才建字段）。
 
-### 7.3 `fields.idxl` 只增不减，直到 Close/ApplyChanges
+### 7.3 `fields.idxl` 只增不减，直到 Close/ApplyChanges/LoadMetadataIndex/Import
 
-- `appendToChangesFile` 每次追加，只有 `ApplyChanges`（启动时）和 `Close` 会 `WriteToFile` 并删除
-  （`v1.12.3:tsdb/shard.go:2243-2268,1681-1694`）。
+- `appendToChangesFile` 每次追加；全量 `WriteToFile` 只在 `Close` / `ApplyChanges`（启动时）/
+  `LoadMetadataIndex` 重建 / Restore·Import 时发生（`v1.12.3:tsdb/shard.go:2243-2268,1681-1694`、
+  `tsdb/engine/tsm1/engine.go:934,1245`），随后删除 `fields.idxl`。
 - 长时间运行且持续新建字段（例如按天新建 measurement 的场景）会让 `fields.idxl` 持续增长；
   下次启动 `loadAllFieldChanges` 会把全部变更读进内存（`:2172-2213`）。
 - **另有 v1.12.3 回归**：删除 measurement 的变更（`Field=nil` + `DeleteMeasurement`）不会被 `marshalFieldChanges` 序列化，
   崩溃后过期字段会复活（详见 [02 §7.8](02_index_series_diff.md)）。
-- 半写保护只在"下次追加"时生效（`:1948-1958`）；如果进程在 `fd.Write` 中途崩溃且**不再有新字段写入**，
+- 半写保护只在"下次追加"时生效（`:1958-1965`）；如果进程在 `fd.Write` 中途崩溃且**不再有新字段写入**，
   文件尾部会留下半条记录，直到下次追加或 `ApplyChanges` 的 `io.ErrUnexpectedEOF` 分支处理
   （`:2205-2208` 会告警并跳过）。
 
@@ -1306,7 +1307,7 @@ if pointSize > MaxFieldValueLength && iter.Type() == models.String {
 | 30 | shard 打开失败缓存 | 无 | `tsdb/store.go:95-120,139,461-466,784-847` | `54ac7e54ed` (#23437) |
 | 31 | Cache key 类型 | `tsdb/engine/tsm1/cache.go:343` | `tsdb/engine/tsm1/cache.go:342` | `45a8227ad6` (#25622) |
 | 32 | Ring 写路径 | `tsdb/engine/tsm1/ring.go:99,237` | `tsdb/engine/tsm1/ring.go:85,98,227` | `45a8227ad6` |
-| 33 | Ring 分区常量 | `tsdb/engine/tsm1/ring.go:15`（16，注释误写 256） | `tsdb/engine/tsm1/ring.go:12-15,19-42` | `e85a10248d` |
+| 33 | Ring 分区常量 | `tsdb/engine/tsm1/ring.go:16`（16，注释误写 256） | `tsdb/engine/tsm1/ring.go:12-15,19-42` | `e85a10248d` |
 | 34 | newring 校验 | `tsdb/engine/tsm1/ring.go:52-55` | `tsdb/engine/tsm1/ring.go:43-49` | `e85a10248d` |
 | 35 | WAL 段大小 | `tsdb/engine/tsm1/wal.go:467` | `tsdb/engine/tsm1/wal.go:466-467` | `e5f6894037` (#18991) |
 | 36 | WAL 编码/fsync | `tsdb/engine/tsm1/wal.go:311,398-462` | 同（未变） | —— |

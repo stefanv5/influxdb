@@ -1457,7 +1457,7 @@ sequenceDiagram
    的 LogFile 成为 `activeLogFile`**（`partition.go:225-231`）。文件名格式为
    `L0-%08d.tsl` / `L%d-%08d.tsi`（`log_file.go:1543-1545`、`index_file.go:528-530`）。
 5. **收尾**：`p.fileSet = NewFileSet(files)`、`p.seq = p.fileSet.MaxID()`；
-   `deleteNonManifestFiles(m)` 删除目录里不在清单中的孤儿文件（`partition.go:297-320`）；
+   `deleteNonManifestFiles(m)` 尝试删除不在清单中的孤儿文件，但 `os.RemoveAll(filename)` 用的是相对 CWD 的 base name，路径不存在时静默返回 nil，孤儿文件实际留在分区目录（`partition.go:297-322`，`:316`）；
    没有 active log 则 `prependActiveLogFile()`（`partition.go:528`）。
 6. **重建内存集合**：`buildSeriesSet()` 从最新文件到最旧文件做 `Diff(TombstoneSeriesIDSet)` +
    `Merge(SeriesIDSet)`（`partition.go:324-349`）；随后 `p.opened = true`，
@@ -1470,7 +1470,7 @@ sequenceDiagram
 目录里还多一个 `L1-00000004.tsi`：
 
 - 打开 3 个清单文件；`L0-00000003.tsl` 大小 800KB < 1MB → 成为 `activeLogFile`；
-- `deleteNonManifestFiles` 删除 `L1-00000004.tsi`；
+- `deleteNonManifestFiles` 尝试删除孤儿 `L1-00000004.tsi`，但因相对路径静默失败，文件留在分区目录；
 - `p.seq = MaxID()`（取三个文件 id 的最大值，本例为 3）；
 - 若 `L0-00000003.tsl` 是 1.2MB（≥ 1MB），则没有 active log，`prependActiveLogFile()` 新建 `L0-00000004.tsl`。
 

@@ -86,23 +86,31 @@ flowchart TB
     end
 
     subgraph IQ["InfluxQL 点式迭代器路径（未重构）"]
-        I1["Executor.executeQuery"] --> I2["ExecutionContext.send / Send"]
-        I2 --> I3["StatementExecutor.ExecuteStatement"]
+        I1["Executor.executeQuery"] --> I3["StatementExecutor.ExecuteStatement"]
+        I1 -. "错误结果" .-> I2["ExecutionContext.send / Send"]
         I3 --> I4["query.Select"]
+        I3 --> I2
         I4 --> I5["query.Prepare"]
-        I5 --> I6["buildCursor"]
+        I4 --> I6["buildCursor"]
         I6 --> I7["buildExprIterator / buildCallIterator"]
         I7 --> I8["NewCallIterator → ReduceIterator / StreamIterator"]
         I8 --> I9["MergeIterator.Next"]
         I9 --> I10["FillIterator.Next / IntervalIterator.Next"]
         I10 --> I11["Emitter.Emit"]
+        I11 --> I2
     end
 
     subgraph FX["Flux 列式读取路径（新增控制层 + 下推层）"]
         F1["query/control.Controller.query"] --> F2["createQuery / compileQuery / enqueueQuery"]
         F2 --> F3["executeQuery → Query.pump"]
-        F3 --> F4["storageflux.storeReader.ReadFilter / ReadGroup / ReadWindowAggregate"]
-        F4 --> F5["services/storage.Store.WindowAggregate → WindowAggregateLimit"]
+        F3 --> F4a["storageflux.storeReader.ReadWindowAggregate"]
+        F4a --> F5["services/storage.Store.WindowAggregate → WindowAggregateLimit"]
+        F3 --> F4b["storeReader.ReadFilter"]
+        F4b --> F5b["Store.ReadFilter → ReadFilterLimit"]
+        F5b --> F6b["reads.NewFilteredResultSet"]
+        F3 --> F4c["storeReader.ReadGroup"]
+        F4c --> F5c["Store.ReadGroup → ReadGroupLimit"]
+        F5c --> F6c["reads.NewGroupResultSet"]
         F5 --> F6["reads.NewWindowAggregateResultSet"]
         F6 --> F7["NewWindowAggregateArrayCursor"]
         F7 --> F8["newFloatWindowMeanArrayCursor 等"]
@@ -140,14 +148,15 @@ sequenceDiagram
     participant P as flux.Program
 
     H->>C: Query(ctx, compiler)
-    C->>Q: createQuery (context.WithCancel)
+    C->>C: createQuery (context.WithCancel)
     C->>Q: tryCompile → Compiling
     C->>K: Compile(ctx, runtime.Default)
     K-->>C: Program
     C->>Q: tryQueue → Queueing
-    C->>Q: enqueueQuery (queryQueue 或直接起 goroutine)
+    C->>C: enqueueQuery (queryQueue 或直接起 goroutine)
     C->>Q: tryExec → Executing
-    C->>Q: createAllocator + recordUnusedMemory
+    C->>C: createAllocator(q)
+    C->>Q: recordUnusedMemory()
     C->>P: program.Start(ctx, alloc)
     loop pump
         P-->>Q: Results()
@@ -175,6 +184,7 @@ classDiagram
         <<interface>>
         Next()
         Err()
+        ...
     }
     class GroupCursor {
         <<interface>>
@@ -184,12 +194,14 @@ classDiagram
         PartitionKeyVals()
         Err()
         Aggregate()
+        ...
     }
     class ResultSet {
         <<interface>>
         Next()
         Cursor()
         Err()
+        ...
     }
     Store --> ResultSet
     Store --> GroupResultSet
@@ -649,7 +661,7 @@ reader 少一次遍历。`storage/reads/flux_predicate.go` 整个文件（183 �
 | 基础 filter/multishard | 有 | 有（错误处理加强） |
 | filter 游标跨 series 条件复用 | `reset` 复用 `c.filter` 但不更新 `cond`；含 `or` 的谓词跨 series 会沿用上一条 series 的条件 | `else { c.filter.cond = cond }`（5 处生成代码）；丢点/多点，`5976e41d54` #23522 |
 | 单聚合 sum/count | `floatArraySumCursor`、`integer*CountArrayCursor` | 能力保留，旧的非窗口实现被窗口化实现取代（`newWindowSumArrayCursor` 等，窗口为零值时即整段） |
-| limit（first/last 单窗口） | 无 | `newLimitArrayCursor` / `floatLimitArrayCursor`（`:27`、`:367`） |
+| limit（first/last 非窗口聚合） | 无 | `newLimitArrayCursor` / `floatLimitArrayCursor`（`:27`、`:367`） |
 | 窗口 first/last | 无 | `newWindowFirstArrayCursor` / `newWindowLastArrayCursor`（`:50`、`:76`） |
 | 窗口 count/sum | 无 | `:102`、`:125` |
 | 窗口 min/max | 无 | `:145`、`:162` |
@@ -1011,7 +1023,7 @@ func (c *floatArrayDescendingCursor) reset(seek, end int64, cacheValues Values, 
 `newAggregateArrayCursor` 对所有**非窗口聚合**中的 `first`/`last` 直接套 `newLimitArrayCursor`
 （`storage/reads/array_cursor.go:20`-`:25`，只按 `agg[0].Type` 分支，不判断窗口）。调用方有两处：
 裸聚合（`storage/reads/aggregate_resultset.go:128`-`:130`，窗口为 `math.MaxInt64`）与 group 聚合
-（`group_resultset.go:307`、`:355`）。`last` 还会把 shard 顺序反转（`services/storage/store.go:252`），
+（`group_resultset.go:307`、`:355`）。`last` 还会把 shard 顺序反转（group 聚合 `services/storage/store.go:195`、窗口聚合 `:252`），
 于是游标返回第一个点后 limit 就停止，不需要读完整个 series。
 旧版只能读完全部点再取最后一条。
 
@@ -1078,7 +1090,7 @@ HLL sketch 的大小只与精度参数有关，与 series 数无关。对
 #26691（错位数据）、#23522（filter 条件复用导致丢点/多点）、#24791（nil 游标 panic）、
 #24975（Close 吞错）、#22273（结果条数）、
 #25082（DST 丢行）、#21792（编译 panic）、#26143（多子查询 panic）、#27196（越权）
-都在第 3 节逐项给出证据；它们不直接提升吞吐，但把“偶发错误结果/进程崩溃”变成可诊断的错误。
+都在第 3/7/8 节逐项给出证据；它们不直接提升吞吐，但把“偶发错误结果/进程崩溃”变成可诊断的错误。
 
 ---
 

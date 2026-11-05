@@ -633,7 +633,7 @@ func (data *Data) PruneShardGroups(expiration time.Time) bool {
 **ShardGroupDeletedExpiration 常量**：
 
 ```go
-// services/meta/client.go:36 — ShardGroupDeletedExpiration
+// services/meta/client.go:35 — ShardGroupDeletedExpiration
 ShardGroupDeletedExpiration = -2 * 7 * 24 * time.Hour  // -14 天
 ```
 

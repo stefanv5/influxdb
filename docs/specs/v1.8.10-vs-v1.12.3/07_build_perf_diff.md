@@ -3,14 +3,14 @@
 > **基线**
 > - OLD（旧）: `v1.8.10` = commit `688e697c51`（2021-10-11）
 > - NEW（新）: `v1.12.3` = commit `f3d5cb68ab`（本仓库 `docs/specs/` 的代码基准）
-> - 区间: `git rev-list --count v1.8.10..f3d5cb68ab` = **527 commits**；`git diff --shortstat` = **602 files changed, 79,310 insertions(+), 45,239 deletions(-)**。当前工作树只比 `f3d5cb68ab` 多 4 个 docs 提交，代码相同。
+> - 区间: `git rev-list --count v1.8.10..f3d5cb68ab` = **527 commits**；`git diff --shortstat` = **602 files changed, 79,310 insertions(+), 45,239 deletions(-)**。当前工作树只比 `f3d5cb68ab` 多若干 docs 提交（数量随文档演进），代码相同。
 > - 本文覆盖: `go.mod` / `go.sum`、`.circleci/*`、`scripts/ci/*`、`releng/*`、`Dockerfile`、`Makefile`、`kit/*`、`pkg/*`、`monitor/*`、`tests/*`、`stress/*`，以及**跨子系统性能优化的汇总**（compaction、TSI 缓存、purger、query control、array cursor、TSM 文件名缓存等）。各子系统的深度细节请看对应主文档，本文只给机制与 commit。
 > - 旧版本证据统一来自 `git show v1.8.10:<path>`；新版本证据来自当前工作树（代码等价于 `f3d5cb68ab`）。
 
 > **小白导读**
 > 1. **这三年 InfluxDB 1.x 涨的主要不是功能，是「地基」**：Go 从 1.13 升到 1.24.13，`go.mod` 里的依赖条目从 51 条涨到 181 条，`go.sum` 从 493 行涨到 1684 行。相当于同一栋房子，钢筋标号换了三代，供应商名单翻了 3.5 倍。
 > 2. **打包流水线整个换掉了**：旧版是「Python 2.7 脚本 `build.py` + fpm + 手工 Dockerfile」；新版是「cross-builder 容器里的 50 行 bash + `packager` + 一份 YAML 清单」。旧流水线还顺带构建 i386/armhf/armel/static 变体，新版只保留 linux-amd64 / linux-arm64 / darwin-amd64 / windows-amd64。
-> 3. **`/debug/vars` 从「只有统计值」变成「能自描述」**：新增 `config`（当前生效配置）、`stats`（compaction 吞吐占用率）、`cq`（连续查询扁平化统计）和每用户 `userquerybytes`。以前要 `influxd config` 才能看到的参数，现在监控端点自己就能吐出来。
+> 3. **`/debug/vars` 从「只有统计值」变成「能自描述」**：新增 `config`（当前生效配置）、`stats`（compaction 吞吐占用率）和每用户 `userquerybytes`，并把已有的 `cq` 统计扁平化。以前要 `influxd config` 才能看到的参数，现在监控端点自己就能吐出来。
 > 4. **性能优化几乎全在「少做事」上**：TSM 文件名不再反复解析（缓存 generation/sequence）、TSI 缓存不再为 map key 反复 `string([]byte)`、purger 不再用一把大锁卡住整个 FileStore、compaction planner 不再反复 mmap + 解码超大文件（>2GB）的首块。
 > 5. **测试从「跑一遍看绿不绿」变成「跑一遍 + 验不变量」**：新增 property-based compaction 测试（相邻性不变量）、`CheckedClose`、race 与 tsi1 的显式矩阵。代价是 CI 配置从 225 行涨到 567 行，调试 CI 本身成了一门手艺。
 > 6. **有两处「化石」没清**：根目录 `Dockerfile` 还停在 `golang:1.15.10` + `dep ensure`，`appveyor.yml` 还停在 `GOROOT=C:\go112` + `dep`。它们和 `go.mod` 已经完全对不上，属于历史遗留，不要拿它们当构建入口。
@@ -110,7 +110,6 @@ flowchart TB
     ST --> EXP
     TMR --> FSM
     PLAN --> TSMREAD
-    FSM --> PURGE
     XXH --> RING
     CTRL -.->|配额/tracing| ACR
 ```
@@ -976,7 +975,7 @@ go install google.golang.org/protobuf/cmd/protoc-gen-go
 | # | 优化点 | 旧（v1.8.10） | 新（v1.12.3） | 机制 | commit | 影响子系统 |
 |---|--------|---------------|---------------|------|--------|-----------|
 | 1 | TSM 文件名解析 | `findGenerations()` 在文件集变化时对每个文件 `ParseFileName(f.Path)` 做字符串切分；`LastModified` 未变则 `:620-625` 早退 | `TSMReader` 在创建/重命名时解析一次，结果存进 `FileStat.Generation/Sequence` | 把「按文件集变化」的解析降为每个 reader 一次 | `f0d5c73253` (#26905) | tsm1 planner |
-| 2 | compaction planner 的 CPU 占用 | 仅在世代 >2GB 时调用 `BlockCount(files[0],1)` 读盘解码（阈值 1000；v1.8.10 没有 aggressive 概念） | `blockCountCache` 缓存 `FirstBlockCount`，失败才回退 | 把「每次规划都解压超大世代首块」变成「每个 reader 一生一次」（aggressive 判定本身是 1.9 线引入） | `2a0353ffd2` (#26432) | tsm1 / engine |
+| 2 | compaction planner 的 CPU 占用 | 仅在世代 >2GB 时调用 `BlockCount(files[0],1)` 读盘解码（阈值 1000；v1.8.10 没有 aggressive 概念） | `blockCountCache` 缓存 `FirstBlockCount`，失败才回退 | 把「每次规划都解压超大世代首块」变成「每个 reader 一生一次」（aggressive 判定由 `f04105bede` #25594 在 v1.12.0 引入、`d8bcbd894c` #26100 把默认值调为 10000；首块缓存由 v1.12.1 的 `2a0353ffd2` 引入） | `2a0353ffd2` (#26432) | tsm1 / engine |
 | 3 | compaction 分组结构 | `tsmGeneration` 持有 `parseFileName` 闭包 | 结构体减为 `{id, files}` | 去掉间接调用，planner 更易推理 | `f0d5c73253` | tsm1 |
 | 4 | compaction 级别回退 | `maxSequence` 只看最大 generation，混级合并会把 L4 数据写回 L2 | 额外记录每代最小 sequence，推出 `maxInputLevel`，必要时抬升 `maxSequence` | 输出级别不下降，「已压实」的数据不会被重新稀释 | `5e9d85c972` (#27233) | tsm1 compact |
 | 5 | 低级别文件嵌套 | planner 假设低级别文件一定排在前面 | 重写 planner 处理「低级别文件出现在高级别之后」 | 改善嵌套低层文件的调度（#26911，1.12 线回归修复；v1.8.10 由 `PlanOptimize` 兜底，见 [04 存储与 Compaction 差异](04_storage_compaction_diff.md) §6.4） | `d1d68d656d` (#26911) | tsm1 planner |
@@ -988,7 +987,7 @@ go install google.golang.org/protobuf/cmd/protoc-gen-go
 | 11 | purger 空转 | `add(nil)` 也会拿锁、起 goroutine、打日志 | 开头 `if len(files) == 0 { return }` | 降低无意义操作与日志噪音 | `e883e8bec3` (#26762) | tsm1 file_store |
 | 12 | array cursor 优化判定 | `pos == 0 && len(res) >= len(tvals)` | 增加 `c.tsm.pos == 0` 前置条件 | 修复「整块直出」优化在错误位置触发导致的错值 | `31cb61f556` (#26691) | tsm1 array_cursor |
 | 13 | 查询并发/内存上限 | 无显式控制器 | `query/control.Config`：`query-concurrency`、`query-initial-memory-bytes`、`query-max-memory-bytes`、`total-max-memory-bytes`、`query-queue-size` | 从「无上限 + OOM」变成「排队 + 配额」 | `b9ee9e5b44`、`f1aa051787` | query/control |
-| 14 | 写窗口检查 | v1.8.10 无 RP 写入窗口：循环外算一次 `min`，循环内只做 `p.Time().Before(min)` | `NewWriteWindow(rp)` 每批（`MapShards`）只算一次边界 | 1.9–1.11 的 `withinWriteWindow` 每点两次 `time.Now()` → v1.12.3 每批一次，O(points) 降到 O(1)（相对 1.9–1.11） | `19f65f50b7` (#25558) | coordinator |
+| 14 | 写窗口检查 | v1.8.10 无 RP 写入窗口：循环外算一次 `min`，循环内只做 `p.Time().Before(min)` | `NewWriteWindow(rp)` 每批（`MapShards`）只算一次边界 | 写窗口是 v1.12.0 新增能力（`07c261a21a`）；同日的 `19f65f50b7` 把每点两次 `time.Now()` 降为每批一次。v1.8.10 无此功能，因此这不是相对 v1.8.10 的性能优化 | `19f65f50b7` (#25558) | coordinator |
 | 15 | 大小写不敏感比较 | `strings.ToLower(a) == strings.ToLower(b)` | `strings.EqualFold(a, b)` | 消除两侧临时字符串分配 | `2529799abb` (#18147) | services/meta 等 |
 | 16 | `SHOW FIELD KEY CARDINALITY` | 走通用路径 | 走 `_fieldKeys` 系统迭代器 | 避免全量 series 扫描 | `f5da0f50f4` (#23871) | query |
 | 17 | 备份 tar 拷贝窗口 | `io.Copy` 默认 32KB 窗口 | `Stream(..., bufSize, ...)` 可配置，默认 1MB | 减少 syscall 次数 | `bac5cedb3c` (#26964) | pkg/tar、tsm1 backup |
@@ -1015,7 +1014,7 @@ go install google.golang.org/protobuf/cmd/protoc-gen-go
 		group := generations[gen]
 ```
 
-`ParseFileName` 要做 `filepath.Base` + 按 `-` 和 `.` 切分 + `strconv.Atoi` 两次。但旧版并非每秒都解析：`:620-625` 用 `FileStore.LastModified()` 短路，文件集没变就直接返回上次结果。真实代价是「每次文件集变化（增删/轮转）时 N 个文件各 2 次 `Atoi`」，而不是「每秒 400 次」——200 个文件的 shard 只在变化那一拍付这笔钱。新版把结果挂到 `FileStat`：
+`ParseFileName` 要做 `filepath.Base` + 两次 `strings.Index`（先 `.` 后 `-`）+ 两次 `strconv.ParseUint(..., 10, 32)`。但旧版并非每秒都解析：`:620-625` 用 `FileStore.LastModified()` 短路，文件集没变就直接返回上次结果。真实代价是「每次文件集变化（增删/轮转）时 N 个文件各 2 次 `ParseUint`」，而不是「每秒 400 次」——200 个文件的 shard 只在变化那一拍付这笔钱。新版把结果挂到 `FileStat`：
 
 ```go
 // v1.12.3:tsdb/engine/tsm1/file_store.go:236-246
@@ -1070,7 +1069,7 @@ type blockCountCache struct {
 }
 ```
 
-v1.8.10 **没有** aggressive points-per-block 判定；它只用 `BlockCount(files[0],1)` 判断“>2GB 且满块则跳过”，阈值是 `DefaultMaxPointsPerBlock`(1000)。首块缓存与 aggressive(10000) 都是 1.9 线 `f04105bede`(#25594) 引入、1.12 继续演进的机制，不是 v1.8.10 的行为。新版把这个值缓存在 `TSMReader` 上，通过 `ExtStats()` 暴露：
+v1.8.10 **没有** aggressive points-per-block 判定；它只用 `BlockCount(files[0],1)` 判断“>2GB 且满块则跳过”，阈值是 `DefaultMaxPointsPerBlock`(1000)。首块缓存（`2a0353ffd2` #26432，v1.12.1）与 aggressive 判定（`f04105bede` #25594 在 v1.12.0 引入，默认值由 `d8bcbd894c` #26100 调为 10000）都是 v1.12 线新增的机制，不是 v1.8.10 的行为。新版把这个值缓存在 `TSMReader` 上，通过 `ExtStats()` 暴露：
 
 ```go
 // v1.12.3:tsdb/engine/tsm1/reader.go:687-698
@@ -1206,7 +1205,7 @@ func (p *purger) hasFiles() bool {
 # 1) 唯一入口是 test.sh
 ./test.sh 0
 #    ├─ run_test_docker Dockerfile_build_ubuntu64 test_64bit --test --junit-report --package
-#    ├─ docker build -f Dockerfile_build_ubuntu64 ...   (ubuntu:focal + ruby + fpm + python2 + gcc)
+#    ├─ docker build -f Dockerfile_build_ubuntu64 ...   (ubuntu:focal + ruby + fpm + python2.7（build.py）+ python3 + gcc)
 #    └─ 容器内执行：
 #         python build.py --test --junit-report --package
 #           ├─ go vet ./...
@@ -1300,7 +1299,7 @@ packager .circleci/packages/config.yaml
   "cmdline": [ ... ],
   "memstats": { ... },
   "httpd":   { ... },
-  "cq":      { "name": "cq", "tags": {}, "values": { "queryOk": 42, "queryFail": 0 } },
+  "cq":      { "name": "cq", "tags": null, "values": { "queryOk": 42, "queryFail": 0 } },
   "runtime": { ... }
 }
 ```
@@ -1348,7 +1347,7 @@ $ go mod download && du -sh "$(go env GOMODCACHE)"
 ## 7. 仍存在的风险
 
 1. **依赖膨胀与供应链面**。131 个间接依赖里包含 4 个云厂商 SDK、3 个 SQL 驱动、Kafka、Snowflake、SAP HANA、Vertica。这些代码大部分不会被链接进 `influxd`，但会进入 `go.sum`、构建缓存和 SBOM。对「必须能离线构建」的环境，预热模块缓存的成本显著上升。
-2. **CGO + Rust 让构建从「纯 Go」变成「多语言工具链」**。`find_rustlib_path` 没有在仓库里定义（`grep -rn "find_rustlib_path" .` 只命中 `.circleci/config.yml:94,97`），完全依赖 `quay.io/influxdb/cross-builder` 镜像。任何想脱离该镜像自建 CI 的人都要自己复刻 `xcc`、`find_rustlib_path` 和 musl 交叉工具链——这是 1.12.3 最难自建的部分。
+2. **CGO + Rust 让构建从「纯 Go」变成「多语言工具链」**。`find_rustlib_path` 没有在仓库里定义（`grep -rn --include=config.yml "find_rustlib_path" .circleci` 只命中 `.circleci/config.yml:94,97`），完全依赖 `quay.io/influxdb/cross-builder` 镜像。任何想脱离该镜像自建 CI 的人都要自己复刻 `xcc`、`find_rustlib_path` 和 musl 交叉工具链——这是 1.12.3 最难自建的部分。
 3. **`install-rust.sh` 的版本回落是静默的**。`RUST_LATEST_VERSION=${FLUX_RUST_VERSION:-1.53}`（`scripts/ci/install-rust.sh:7`）在 `grep 'FROM rust:'` 失败时会回落到 Rust 1.53。由于 `set -ex` 不会因为 grep 无匹配而失败（管道里 `cut` 成功退出），失败是静默的，只会在编译 Rust 依赖时报出难以定位的错误。
 4. **`Dockerfile` 与 `appveyor.yml` 是彻底的死代码**。前者 `FROM golang:1.15.10` + `dep ensure`（`Dockerfile:1-5`），后者 `GOROOT: C:\go112` + `dep`（`appveyor.yml:15,27-29`）。新贡献者若照这两个文件构建必然失败，且失败信息（`Gopkg.toml` 不存在、Go 版本过低）与真实原因（应使用 go modules）相距很远。
 5. **CI 复杂度**。567 行配置、3 条常驻 workflow、多种执行器（docker / machine / 带 GCS 认证的私有镜像）、`circleci_ip_ranges: true` 的签名 job。任何一处 tag 或镜像 digest 变更（如 `ci-packager-next@sha256:c92ea43...`）都可能在不同 workflow 上表现不一致——`56a3f970e4` 只改 CI 不改 `go.mod` 就是这种不一致的实例。
@@ -1377,7 +1376,8 @@ $ go mod download && du -sh "$(go env GOMODCACHE)"
 | 旧 protobuf 生成器 | `v1.8.10:generate.sh:3-4` | `protoc-gen-gogofaster` / `protoc-gen-gogo`（gogo v1.3.2 为直接依赖） | — |
 | 新 protobuf 生成器 | `v1.12.3:generate.sh:3` | `google.golang.org/protobuf/cmd/protoc-gen-go` | `8b38d0e2bf` |
 | 官方 protobuf 依赖 | `v1.12.3:go.mod:57,126` | `google.golang.org/protobuf v1.34.1`（直接）；gogo 降为 indirect | `8b38d0e2bf` |
-| protobuf 版本升级 | `v1.12.3:go.mod:57` | v1.33.0 → v1.34.1；配套 protoc v5.26.1 | `dbbe4611c0`、`d4b16dcd98` |
+| protobuf 版本升级 | `v1.12.3:go.mod:57` | v1.33.0 → v1.34.1（`03b6ed2bed` 升级 Flux 时同步） | `dbbe4611c0`、`03b6ed2bed` |
+| protoc 版本 | `v1.12.3:services/meta/internal/meta.pb.go:3-4` | v5.26.1（`d4b16dcd98`）→ v5.29.2（`03b6ed2bed`）；当前生成头为 `protoc v5.29.2` | `d4b16dcd98`、`03b6ed2bed` |
 
 ### 8.2 CI 与构建
 
@@ -1419,7 +1419,7 @@ $ go mod download && du -sh "$(go env GOMODCACHE)"
 
 | 证据 | 路径:行 | 内容 | commit |
 |------|---------|------|--------|
-| 旧 expvar | `v1.8.10:services/httpd/handler.go:1479-1572` | 无 config/stats/cq | — |
+| 旧 expvar | `v1.8.10:services/httpd/handler.go:1479-1572` | 无 config/stats 诊断段；cq 已作为带 `{name,tags,values}` 包装的 Statistic 存在 | — |
 | 新 expvar 入口 | `v1.12.3:services/httpd/handler.go:2291` | `serveExpvar` | — |
 | config 段 | `v1.12.3:services/httpd/handler.go:2356-2382` | `parseConfigDiagnostics` | `269f1b6281` |
 | stats 段 | `v1.12.3:services/httpd/handler.go:2384-2406` | `compact-throughput-usage-percentage` | `0e656d6dd5` |

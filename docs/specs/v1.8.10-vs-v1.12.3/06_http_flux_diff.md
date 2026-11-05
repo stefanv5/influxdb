@@ -21,7 +21,7 @@
 >    证书过期巡检；代价是**默认开始检查证书/私钥文件权限**。
 > 3. **大厅里多了几块仪表盘**：`/debug/vars` 从"system + cmdline + memstats + 统计"
 >    扩展为额外输出 `build`、`crypto`、`config`（TSDB 配置）、`stats`
->    （压缩吞吐占用率）、`cq`（连续查询计数）。
+>    （压缩吞吐占用率）；`cq`（连续查询计数）本已存在，改为扁平输出。
 > 4. **写查询的人和查查询的人对上了号**：`SHOW QUERIES` 多一列 `user`，
 >    并且非管理员只能看到自己有读权限的库上的查询（修掉一个越权泄漏）。
 > 5. **Flux 从"能跑"变成"有预算"**：旧版 Flux 控制器是 `flux/control`
@@ -183,9 +183,9 @@ Flux 路由 `:287-299`。新版对应 `v1.12.3:services/httpd/handler.go:193-318
 - `/api/v2/buckets*` 用 **pat** 风格参数 `:dbrp`，源码用
   `r.URL.Query().Get(":dbrp")` 读取（`v1.12.3:services/httpd/handler.go:1265-1277`、
   `:1280`、`:1313`、`:1390`），不是 Go 1.22 的 `r.PathValue`。
-- `labels/members/owners` 九条路由是"占位拒绝"，返回 405
-  `"not supported in this version"`（`handler.go:1609-1624`），用于让 Terraform /
-  influx CLI 之类的 V2 客户端得到明确答案而不是 404。
+- `labels/members/owners` 九条路由是"占位拒绝"，返回 405（文案分别为
+  `bucket labels/members/owners not supported in this version`，
+  `handler.go:1610/1615/1620`），让 Terraform / influx CLI 等 V2 客户端得到明确答案。
 
 ### 3.2 中间件链与限流
 
@@ -689,26 +689,9 @@ if !config.ignoreFilePermissions {
 "compact-throughput-burst":               c.CompactThroughputBurst,
 ```
 
-注册侧：
-
-```go
-// v1.12.3:monitor/service.go:156-166
-if m.Limiter != nil {
-    m.RegisterDiagnosticsClient("stats", &stats{comp: compactThroughputStats{limiter: m.Limiter}})
-}
-if m.TSDBConfig != nil {
-    m.RegisterDiagnosticsClient("config", m.TSDBConfig)
-}
-```
-
-```go
-// v1.12.3:cmd/influxd/run/server.go:205
-s.Monitor = monitor.New(s, c.Monitor, &c.Data)
-// v1.12.3:cmd/influxd/run/server.go:426
-s.Monitor.RegisterDiagnosticsClient("cq", srv)
-// v1.12.3:cmd/influxd/run/server.go:525
-s.Monitor.WithCompactThroughputLimiter(s.TSDBStore.EngineOptions.CompactionThroughputLimiter)
-```
+注册侧（`v1.12.3:monitor/service.go:156-166`）：`m.Limiter != nil` 时注册 `stats`，
+`m.TSDBConfig != nil` 时注册 `config`；`cmd/influxd/run/server.go:205` 构造
+`monitor.New`，`:426` 注册 `cq`，`:525` 注入 compact-throughput limiter。
 
 CQ 服务为满足 `Monitor` 的诊断接口补了一个空实现
 （`v1.12.3:services/continuous_querier/service.go:173-177`），同时把统计写入
@@ -717,8 +700,9 @@ CQ 服务为满足 `Monitor` 的诊断接口补了一个空实现
 `globalTags` 也从裸 map 换成带锁的 `tags` 结构（`v1.12.3:monitor/service.go:37-68`），
 修掉了 `SetGlobalTag` 与 `Statistics` 并发访问 map 的竞态。
 
-同一区间还修了 `/debug/vars` 的重复键：旧版同名 statistic 会产生重复 JSON key；新版用
-`uniqueKeys` 计数并追加 `:1`、`:2` 后缀（`userquerybytes`、`userquerybytes:1`…；`v1.12.3:services/httpd/handler.go:2509-2514`，`8843a01ebf`）。这与 §3.5 的 per-user
+同一区间还修了 `/debug/vars` 的重复键：旧版只按几种已知 tag 拼 key，`userquerybytes`
+多用户时仍会撞键；新版保留同样拼接后加 `uniqueKeys` 计数与 `:N` 兜底
+（`v1.12.3:services/httpd/handler.go:2509-2514`，`8843a01ebf`），与 §3.5 的 per-user
 `userquerybytes` 直接相关。另外 `[httpd]` 的 `SHOW DIAGNOSTICS` 新增 `flux-enabled`、
 `https-insecure-certificate`（`v1.12.3:services/httpd/config.go:110-118`）。
 
@@ -798,9 +782,9 @@ READ 授权，但仍受开关约束——`prom-read-auth-enabled` 默认 `false`
 （`handler.go:2033`）且用 `context.Background()`（`:2097`），既不受
 `max-body-size` 限制，也不随客户端断开取消。
 
-**(c) 可观测性**：旧版 `servePromRead` 无计数、也不进 `requestTracker`
-（`v1.8.10:services/httpd/handler.go:1248-1252`）；新版在入口 `PromReadRequests++`
-并 `requestTracker.Add`（`v1.12.3:services/httpd/handler.go:2031-2032`）。
+**(c) 可观测性**：旧版 `servePromRead` 没有 `promReadReq` 计数、也不进 `requestTracker`
+（但会计入全局 `queryRespBytes`，`v1.8.10:services/httpd/handler.go:1293`）；新版在
+入口 `PromReadRequests++` 并 `requestTracker.Add`（`v1.12.3:services/httpd/handler.go:2031-2032`）。
 因此旧版 `promReadReq` 恒 0，`/debug/requests` 也看不到 Prom read。
 
 ### 3.15 Flux 查询端点
@@ -885,7 +869,7 @@ if !q.m.unlimited {                         // CAS 扣减同样只在非 unlimit
 
 ```go
 // v1.12.3:query/control/controller.go:337-343 — 请求结果分类指标
-c.metrics.requests.WithLabelValues(lvs...).Inc()  // label: success/compile-error/queue-error/...
+c.metrics.requests.WithLabelValues(lvs...).Inc()  // label: success/compile_error/runtime_error/queue_error
 ```
 
 对 HTTP 层的影响：
@@ -989,7 +973,7 @@ selector 走 `createEmpty`/降序游标优化（`reader.go:689-720`，`isSelecto
    当前生产调用方都显式设置 `Range`，影响面主要是自定义/企业调用方。
 3. **`GetReadSource` 空指针防护**：`*anypb.Any == nil` 返回 `ErrMissingReadSource`
    （`v1.12.3:services/storage/store.go:28-31`）。旧版各入口各自判 `req.ReadSource == nil`
-   并返回 `"missing read source"`（`v1.8.10:services/storage/store.go:110/148/192/268/355`），
+   并返回 `"missing read source"`（`v1.8.10:services/storage/store.go:110/148/193/268/356`），
    不会 panic；新版只是把检查集中到一个函数。
 4. **删除能力**：
 
@@ -1064,8 +1048,9 @@ atomic.AddInt64(&h.stats.ValuesWrittenOK, nvalues)
 if err := h.PointsWriter.WritePoints(database, retentionPolicy, consistency, user, points); influxdb.IsClientError(err) {
 ```
 
-commit `6795ec6c01` 移除了 context-value 反模式。后果：`Statistics()` 不再输出
-`valuesWrittenOK`（旧版在 `v1.8.10:services/httpd/handler.go:394`，新版
+commit `6795ec6c01` 先移除 context-value 反模式，改为显式 tracker，但仍在 httpd
+累加 `ValuesWrittenOK`；随后 `117341fb0f` 把 values 统计下移到 tsdb store，
+`Statistics()` 才不再输出该项（旧版在 `v1.8.10:services/httpd/handler.go:394`，新版
 `v1.12.3:services/httpd/handler.go:455-479` 没有该项）。常量
 `statValuesWrittenOK` 仍留在 `service.go:34`，但已无引用。
 
@@ -1076,18 +1061,15 @@ commit `6795ec6c01` 移除了 context-value 反模式。后果：`Statistics()` 
 V1 与 V2 的 `default` 分支在旧版都缺 `return`（V1 `v1.8.10:services/httpd/handler.go:874-877`、V2 `:855-858`），新版两处都补上（V1 `:1656-1660`、V2 `:1636-1640`），同一 commit `997698f891` (#21746)。
 
 ```go
-// v1.8.10:services/httpd/handler.go:855-858
+// v1.8.10:services/httpd/handler.go:855-858（V1/V2 同形）
 default:
     err := fmt.Sprintf("invalid precision %q (use ns, us, ms or s)", precision)
     h.httpError(w, err, http.StatusBadRequest)
-// ← 没有 return，继续执行 bucket2dbrp + serveWrite
-```
+    // ← 旧版没有 return，继续执行 bucket2dbrp + serveWrite
 
-```go
-// v1.12.3:services/httpd/handler.go:1636-1640
+// v1.12.3:services/httpd/handler.go:1636-1640（V1 在 1656-1660）
 default:
-    err := fmt.Sprintf("invalid precision %q (use ns, us, ms or s)", precision)
-    h.httpError(w, err, http.StatusBadRequest)
+    ...同上...
     return
 ```
 
@@ -1136,7 +1118,7 @@ default:
 | 资源控制 | Flux 并发/内存/队列 | `query/control` 的 `memoryManager` + `queryQueue` + `wg` 配额 | `query/control/controller.go:175-227`、`memory.go:73-156` |
 | 资源控制 | 窗口聚合下推 | `ReadWindowAggregate` → `Store.WindowAggregate` → `reads.NewWindowAggregateResultSet` | `storage/flux/reader.go:85-93`、`services/storage/store.go:234-277` |
 | 正确性 | 降序游标 | `IsAscendingGroupAggregate`/`IsAscendingWindowAggregate` 决定 shard 读取方向 | `services/storage/store.go:195`、`:252` |
-| 正确性 | 空 `ReadSource` 不再 panic | `any == nil` 提前返回 `ErrMissingReadSource` | `services/storage/store.go:28-31` |
+| 正确性 | 空 `ReadSource` 的 nil 判定集中到 `GetReadSource` | 旧版各入口逐个返回 `missing read source`；新版把 nil `Any` 判定集中到 `GetReadSource` | `services/storage/store.go:28-31` |
 | 正确性 | V2 写入精度错误不再"边报错边写" | 补 `return` | `handler.go:1636-1640` |
 | 正确性 | CSV 双重转义 | `HashKey(false)` | `response_writer.go:228` |
 | 正确性 | monitor 全局 tag 竞态 | 用 `mu sync.RWMutex` 包裹 map | `monitor/service.go:37-68` |
@@ -1591,7 +1573,8 @@ sequenceDiagram
 | `e3e9232de5` | #25407 | V2 delete 剥离 measurement 双引号 |
 | `2dc3dcb3d1` | #24311 | CSV 输出不转义 |
 | `db523227a2` | #25669 | `/debug/vars` 增加 `fluxQueryRespBytes` |
-| `6795ec6c01` | — | 移除 context-value 写法，`valuesWrittenOK` 消失 |
+| `6795ec6c01` | — | 移除 context-value 写法，仍由 httpd 累加 `valuesWrittenOK` |
+| `117341fb0f` | — | 将 values 统计从 httpd 下移到 tsdb store |
 | `32d8b002d8` | #26981 | `SHOW QUERIES`/日志显示用户 |
 | `f75be56eee` | #26874 | `/debug/vars` 的 `cq` 改为扁平输出 |
 | `269f1b6281` | #26624 | `/debug/vars` 增加 `config`（TSDB 配置） |

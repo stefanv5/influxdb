@@ -84,7 +84,8 @@ flowchart TB
     DC -->|"DropShardMetaRef"| DSM
     DSM -->|"DropShard"| MC
     ST -->|"DeleteSeriesID NoFlush"| SF
-    ST -->|"sh.Close"| FS
+    ST -->|"sh.Close"| SH
+    SH -->|"engine/FileStore.Close"| FS
     FS -->|"purger.add"| PG
     CS -->|"registerShard 失败"| BS
     WR -->|"Subscriber.Send"| SUB
@@ -96,6 +97,7 @@ sequenceDiagram
     participant T as ticker CheckInterval
     participant R as retention.Service
     participant M as meta.Client
+    participant DSM as DropShardMetaRef（Service 字段）
     participant S as tsdb.Store
     participant F as series file
     T->>R: DeletionCheck
@@ -113,17 +115,21 @@ sequenceDiagram
             R->>S: DeleteShard(id)
             alt 返回 ErrShardNotFound（phantom）
                 Note over S,F: 不碰 series file（无 DeleteSeriesID / FlushSegments）
+                R->>DSM: DropShardMetaRef(id)
+                DSM->>M: DropShard（OSS）保留首次 DeletedAt + commit
             else 删除成功
                 S->>F: DeleteSeriesID(NoFlush)
                 S->>F: FlushSegments(partitionIDs)
+                R->>DSM: DropShardMetaRef(id)
+                DSM->>M: DropShard（OSS）保留首次 DeletedAt + commit
+            else 删除失败（非 NotFound）
+                Note over R: retryNeeded=true，不摘 meta 引用（下轮重试）
             end
-            R->>M: DropShardMetaRef(id) → DropShard
-            M->>M: DropShard 保留首次 DeletedAt + commit
         end
     end
     Note over R,M: phantom 自愈：meta 里有、ShardIDs() 里没有的 shard
-    R->>M: DropShardMetaRef(id)（仅 isOSS() 或 owners 含本节点）
-    M->>M: DropShard + commit
+    R->>DSM: DropShardMetaRef(id)（仅 isOSS() 或 owners 含本节点）
+    DSM->>M: DropShard（OSS）+ commit
     R->>M: PruneShardGroups
     Note over M: 仅当 DeletedAt 早于 now-14d 且 Shards 为空；有变更才 commit
 ```
@@ -278,7 +284,7 @@ import (
 同时 `UpdateRetentionPolicy` 被拆成两层：
 
 ```go
-// v1.12.3:services/meta/data.go:244 — UpdateRetentionPolicy 只负责查库/查名/设默认
+// v1.12.3:services/meta/data.go:228 — UpdateRetentionPolicy 只负责查库/查名/设默认（ApplyRetentionUpdate 在 246）
 	if err := ApplyRetentionUpdate(rpu, rpi); err != nil {
 		return err
 	}
@@ -289,7 +295,7 @@ import (
 // v1.12.3:services/meta/data.go:257 — ApplyRetentionUpdate 负责逐字段赋值
 ```
 
-拆分动机是让 enterprise 复用同一套"字段应用"逻辑（推断；`RetentionPolicyUpdate` 新增 `SetFutureWriteLimit`/`SetPastWriteLimit`）。**OSS 语义与旧版一致，只是多了两个字段**。另外 v2 bucket create 的幂等判定 `RetentionPolicySpec.Matches` 现在也比较写窗口，写窗口不同会返回 `ErrRetentionPolicyConflict`（`v1.12.3:services/meta/data.go:1123-1130`、`services/meta/client.go:241-245`）。
+拆分动机是让 enterprise 复用同一套"字段应用"逻辑（推断；`RetentionPolicyUpdate` 新增 `SetFutureWriteLimit`/`SetPastWriteLimit`）。**OSS 语义与旧版一致，只是多了两个字段**。另外 v2 bucket create 的幂等判定 `RetentionPolicySpec.Matches` 现在也比较写窗口，写窗口不同会返回 `ErrRetentionPolicyConflict`（`v1.12.3:services/meta/data.go:1117-1129`、`services/meta/client.go:241-245`）。
 
 SQL 语法由 influxql 升级带来（`go.mod`：`influxql v1.1.1-0.20200828144457-65d3ef77d385` → `v1.4.1`）：
 
@@ -359,7 +365,7 @@ ALTER RETENTION POLICY <rp> ON <db> [DURATION <d>] [REPLICATION <n>]
 						data.Databases[dbidx].RetentionPolicies[rpidx].ShardGroups[sgidx].DeletedAt = time.Now()
 					}
 
-// v1.12.3:services/meta/data.go:313
+// v1.12.3:services/meta/data.go:315
 					if len(shards) == 1 {
 						// ... make sure we don't overwrite the timestamp if it was already deleted.
 						if !data.Databases[dbidx].RetentionPolicies[rpidx].ShardGroups[sgidx].Deleted() {
@@ -630,7 +636,7 @@ v1.8.10 的 `Store` 里没有 `badShards` 字段（`v1.8.10:tsdb/store.go` 全�
 	...
 	s.mu.RUnlock()
 
-// v1.12.3:tsdb/store.go:1684 — 闭包 + defer
+// v1.12.3:tsdb/store.go:1685 — 闭包 + defer
 	getEpochsAndShards := func() (error, []*Shard, map[uint64]*epochTracker, *SeriesFile) {
 		s.mu.RLock()
 		defer s.mu.RUnlock()
@@ -640,10 +646,10 @@ v1.8.10 的 `Store` 里没有 `badShards` 字段（`v1.8.10:tsdb/store.go` 全�
 
 同类的第二个问题在引擎层：v1.8.10 的 `Engine.deleteSeriesRange` 对 `seriesKeys` 切片**没有加锁**（并发删除时存在 data race）；`1bc0eb4795 fix(tsm1): Fix data race of seriesKeys in deleteSeriesRange (#25268)` 引入 `seriesKeysLock` 修掉竞态，却把 `RUnlock` 漏在一条 `return nil` 路径上（读锁泄漏会阻塞后续写锁与 `FileStore.Apply`，把 DELETE 和 compaction 一起拖住）；`81b42fd344 (#26658)` 再用闭包 + `defer RUnlock` 修正。这一小块在区间内经历了"无锁 → 泄漏的锁 → 正确的锁"两次改动，v1.12.3 是最终正确形态（`v1.12.3:tsdb/engine/tsm1/engine.go:1720-1721`）。
 
-`21ab48416e fix: Resolves RLock() leakage in Store.DeleteSeries() (#26647)` 修的是一个**区间内引入又修掉**的回归：v1.8.10 的手工加解锁路径是平衡的（`RLock` 之后的三条返回路径都显式 `RUnlock`），但 `8eaa24d813 (#25312)` 在临界区里新增了"RP 混用 / source 类型不支持 / 按 RP 过滤"等分支，这些新增的错误返回**没有 `RUnlock`**。一次失败的 `DROP SERIES`（例如同时写了两个不同 RP 的 measurement）就能把 `Store.mu` 的读锁永久占住，后续任何写锁请求（建 shard、删 shard、压缩回调）都会挂死。`21ab48416e` 把整个临界区收进闭包并 `defer RUnlock`，从结构上消除这一类问题（`v1.12.3:tsdb/store.go:1684-1688`）。
+`21ab48416e fix: Resolves RLock() leakage in Store.DeleteSeries() (#26647)` 修的是一个**区间内引入又修掉**的回归：v1.8.10 的手工加解锁路径是平衡的（`RLock` 之后的三条返回路径都显式 `RUnlock`），但 `8eaa24d813 (#25312)` 在临界区里新增了"RP 混用 / source 类型不支持 / 按 RP 过滤"等分支，这些新增的错误返回**没有 `RUnlock`**。一次失败的 `DROP SERIES`（例如同时写了两个不同 RP 的 measurement）就能把 `Store.mu` 的读锁永久占住，后续任何写锁请求（建 shard、删 shard、压缩回调）都会挂死。`21ab48416e` 把整个临界区收进闭包并 `defer RUnlock`，从结构上消除这一类问题（`v1.12.3:tsdb/store.go:1685-1689`）。
 
 另外两处行为变化：
-- **按 RP 过滤**（`8eaa24d813 feat(tsm): Allow for deletion of series outside default rp (#25312)`）：`shardFilterFn = ComposeShardFilter(byDatabase(database), byRetentionPolicy(rp))`（`v1.12.3:tsdb/store.go:1714`）。旧版 `DELETE FROM db.rp.measurement` 会扫该 DB 下**所有** RP 的 shard。
+- **按 RP 过滤**（`8eaa24d813 feat(tsm): Allow for deletion of series outside default rp (#25312)`）：`shardFilterFn = ComposeShardFilter(byDatabase(database), byRetentionPolicy(rp))`（`v1.12.3:tsdb/store.go:1713`）。旧版 `DELETE FROM db.rp.measurement` 会扫该 DB 下**所有** RP 的 shard。
 - **并发度可配**（`eb3bc7069f feat: configurable DELETE concurrency (#23055)`）：`limiter.NewFixed(1)` → `limiter.NewFixed(s.EngineOptions.Config.MaxConcurrentDeletes)`（`v1.8.10:tsdb/store.go:1347` / `v1.12.3:tsdb/store.go:1732`），默认仍为 1（`tsdb/config.go:75`）。
 
 ### 3.12 purger 重写：从"全局写锁"到 sync.Map（#27146 / #26762）
@@ -764,7 +770,7 @@ func (p *purger) purge(fileNames []string) {
 
 若干实现细节值得注意：
 
-- **接口被拆成 OSS/Enterprise 两套**：`OSSMetaClient`（`Databases/DeleteShardGroup/DropShard/PruneShardGroups`）与 `MetaClient`（额外 `NodeID()`）。OSS 用 `ossMetaClientAdapter` 返回特殊值 `ossNodeID = math.MaxUint64`（`v1.12.3:services/retention/service.go:34`），`isOSS()` 据此判断"本地没有的 shard 一定是 phantom"。Enterprise 只有在 `slices.Contains(owners, NodeID())` 时才认为是自己的 phantom —— 这就是 `c168cc5aca fix: stop noisy logging about phantom shards that do not belong to node (#26527)` 修的东西：**旧版在集群里会把属于别的节点的 shard 也当成本地 phantom 反复告警**。
+- **接口被拆成 OSS/Enterprise 两套**：`OSSMetaClient`（`Databases/DeleteShardGroup/DropShard/PruneShardGroups`）与 `MetaClient`（额外 `NodeID()`）。OSS 用 `ossMetaClientAdapter` 返回特殊值 `ossNodeID = math.MaxUint64`（`v1.12.3:services/retention/service.go:34`），`isOSS()` 据此判断"本地没有的 shard 一定是 phantom"。Enterprise 只有在 `slices.Contains(owners, NodeID())` 时才认为是自己的 phantom —— 这就是 `c168cc5aca fix: stop noisy logging about phantom shards that do not belong to node (#26527)` 修的东西：**未包含 #26527 的 1.12 版本在集群里会把属于别的节点的 shard 也当成本地 phantom 反复告警**。
 - **`Open()` 增加前置校验**：`DropShardMetaRef == nil` 直接返回错误（`v1.12.3:services/retention/service.go:107`），避免"服务启动了但永远不会摘 meta 引用"的静默失效。
 - **错误处理更细**：`DeleteShard` 返回 `ErrShardNotFound` 时**继续**去 `DropShardMetaRef`（phantom 路径）；其他错误才 `retryNeeded = true` 并在下一轮重试。被 `InUse` 跳过的 shard 也在下一轮重试，且**不会**被误判为 phantom（`delete(deletedShardIDs, id)` 发生在错误判断之前，`v1.12.3:services/retention/service.go:219`）。
 
@@ -959,12 +965,12 @@ func (e *StatementExecutor) executeShowContinuousQueriesStatement(ctx *query.Exe
 | 6 | 集群 phantom 告警降噪 | `DeletionCheck` 返回后按 `owners` 过滤，只有本节点拥有的才算 phantom | `c168cc5aca` | `v1.12.3:services/retention/service.go:153/288` |
 | 7 | purger 不再阻塞 FileStore | `sync.Map` 取代覆盖全流程的 `RWMutex` | `d5a48e0662` (#27146/#27177) | `v1.12.3:tsdb/engine/tsm1/file_store.go:1599` |
 | 8 | purger 日志与无效重试 | 空批次早退（`e883e8bec3` #26762）；失败即出队、汇总 `Warn`（`d5a48e0662` #27146） | `e883e8bec3`、`d5a48e0662` | `v1.12.3:tsdb/engine/tsm1/file_store.go:1607` |
-| 9 | 消除 `DeleteSeries` 的 RLock 泄漏 | 闭包 + `defer s.mu.RUnlock()` | `21ab48416e` (#26647/#26852) | `v1.12.3:tsdb/store.go:1684` |
+| 9 | 消除 `DeleteSeries` 的 RLock 泄漏 | 闭包 + `defer s.mu.RUnlock()` | `21ab48416e` (#26647/#26852) | `v1.12.3:tsdb/store.go:1685` |
 | 10 | `deleteSeriesRange` 的 seriesKeys 竞态与 RLock 泄漏 | 先加锁修 data race（#25268），再修泄漏（#26658）：闭包 + `defer RUnlock` | `1bc0eb4795` / `81b42fd344` | `v1.12.3:tsdb/engine/tsm1/engine.go:1720-1721` |
 | 11 | `SetData` 死锁修复 | `defer c.mu.Unlock()` | `956915296a` (#22929)；未回移 1.8 线 | `v1.12.3:services/meta/client.go:917` |
 | 12 | 坏 shard 不反复重试 | `badShards` 内存黑名单 | `54ac7e54ed` (#23437) | `v1.12.3:tsdb/store.go:462/638` |
 | 13 | `ClearBadShardList` 数据竞争 | 补 `badShards.mu` | `e8ef25b647` (#26423/#26831) | `v1.12.3:tsdb/store.go:792` |
-| 14 | shard group 不重叠 | 与现有组求差集 | `3c811bcd81` (#22601) | `v1.12.3:services/meta/data.go:403-421` |
+| 14 | shard group 不重叠 | 与现有组求差集 | `3c811bcd81` (#22601) | `v1.12.3:services/meta/data.go:403-430`（收缩条件 422-429） |
 | 15 | 启动进度可见 | `StartupProgress` 已打开/总数/百分比（打开耗时旧版已有） | `3c87f524ed` (#25378) | `v1.12.3:tsdb/store.go:562/599` |
 | 16 | DELETE 并发可调 | `MaxConcurrentDeletes`（默认仍 1） | `eb3bc7069f` (#23055) | `v1.12.3:tsdb/config.go:75/170` |
 | 17 | 写入热路径减负 | subscriber 每批只序列化一次 line protocol；路由查表 O(1) | subscriber 重写 | `v1.12.3:services/subscriber/service.go:42/608` |
@@ -1075,7 +1081,7 @@ CREATE RETENTION POLICY "hot" ON "db0" DURATION 24h REPLICATION 1 FUTURE LIMIT 1
 
 `snapshot()`（`v1.12.3:services/meta/client.go:981`）走固定五步：
 
-1. `os.Create("<meta>/meta.db.tmp")`
+1. `os.Create("<meta>/meta.dbtmp")`（`tmpFile := filename + "tmp"`）
 2. `data.MarshalBinary()` → `proto.Marshal(data.marshal())`，此时 `data.Index` 已 +1
 3. `f.Write(d)` → `f.Sync()`（**fsync**）
 4. `f.Close()`（Windows 下 rename 前必须关闭）
@@ -1098,7 +1104,7 @@ CREATE RETENTION POLICY "hot" ON "db0" DURATION 24h REPLICATION 1 FUTURE LIMIT 1
 下一次 `PointsWriter.MapShards` 会构造 `NewWriteWindow(rp)`（`v1.12.3:coordinator/points_writer.go:218`），把 `now-6h` 与 `now+1h` 作为硬边界。写入一个 `now-7h` 的点：
 
 ```go
-// v1.12.3:coordinator/points_writer.go:347
+// v1.12.3:coordinator/points_writer.go:346
 		} else if withinWindow, bound, reason := ww.WithinWindow(p.Time()); !withinWindow {
 			mapping.AddDropped(p, bound, reason)
 			atomic.AddInt64(&w.stats.WriteDropped, 1)
@@ -1238,11 +1244,11 @@ partial write: dropped 0 points outside retention policy of duration 24h0m0s
 | SetData 锁 | `services/meta/client.go:932` | `services/meta/client.go:917` | `956915296a` #22929 |
 | PruneShardGroups | `services/meta/client.go:682` | `services/meta/client.go:680` + `services/meta/data.go:476` | `7bd3f89d18` #24530 |
 | 14 天常量 | `services/meta/client.go:36` | `services/meta/client.go:35` | — |
-| DropShard 保留 DeletedAt | `services/meta/data.go:295` | `services/meta/data.go:313` | 随 #24530 |
+| DropShard 保留 DeletedAt | `services/meta/data.go:295` | `services/meta/data.go:315` | 随 #24530 |
 | CreateShardGroup 去重叠 | `services/meta/data.go:358` | `services/meta/data.go:382`（循环 403-430，收缩条件 422-429） | `3c811bcd81` #22601 |
 | 写窗口字段（proto） | `services/meta/internal/meta.proto:43` | `services/meta/internal/meta.proto:47/58` | `07c261a21a` #25517 |
 | 写窗口校验 | — | `services/meta/data.go:141`、`services/meta/errors.go:73` | `07c261a21a` |
-| protobuf 生成器 | `services/meta/internal/meta.pb.go:1`（gogo，2864 行） | `services/meta/internal/meta.pb.go:1`（protoc-gen-go，4293 行） | `23c3d35aab` #21882、`d4b16dcd98`、`dbbe4611c0` |
+| protobuf 生成器 | `services/meta/internal/meta.pb.go:1`（gogo，2864 行） | `services/meta/internal/meta.pb.go:1`（protoc-gen-go，4293 行） | `23c3d35aab` #21882、`d4b16dcd98`、`dbbe4611c0`、`03b6ed2bed`（protoc-gen-go v1.34.1 / protoc v5.29.2） |
 | 生成字段 5/6、7/8 | — | `services/meta/internal/meta.pb.go:431/520` | 同上 |
 | Data.MarshalBinary | `services/meta/data.go:744` | `services/meta/data.go:820` | — |
 | retention 主循环 | `services/retention/service.go:74` | `services/retention/service.go:157` | `b4bd607eef` #25055 / `7bd3f89d18` |
@@ -1261,10 +1267,10 @@ partial write: dropped 0 points outside retention policy of duration 24h0m0s
 | Shard 转发 | — | `tsdb/shard.go:242/249` | `b4bd607eef` |
 | Store 转发 | — | `tsdb/store.go:957/969` | `b4bd607eef` |
 | purger | `tsdb/engine/tsm1/file_store.go:1376` | `tsdb/engine/tsm1/file_store.go:1599` | `d5a48e0662` #27146 / `e883e8bec3` #26762 |
-| badShards | — | `tsdb/store.go:139/462/632` | `54ac7e54ed` #23437 |
+| badShards | — | `tsdb/store.go:139/462/638` | `54ac7e54ed` #23437 |
 | ClearBadShardList 加锁 | — | `tsdb/store.go:792` | `e8ef25b647` #26423 |
 | DeleteSeries 锁 | `tsdb/store.go:1302` | `tsdb/store.go:1657/1684` | `21ab48416e` #26647 |
-| DeleteSeries RP 过滤 | — | `tsdb/store.go:1714` | `8eaa24d813` #25312 |
+| DeleteSeries RP 过滤 | — | `tsdb/store.go:1713` | `8eaa24d813` #25312 |
 | DELETE 并发 | `tsdb/store.go:1347` | `tsdb/store.go:1732`、`tsdb/config.go:75` | `eb3bc7069f` #23055 |
 | 启动进度日志 | — | `tsdb/store.go:562/593` | `3c87f524ed` #25378 |
 | CQ Diagnostics | — | `services/continuous_querier/service.go:175` | `f75be56eee` #26874 |

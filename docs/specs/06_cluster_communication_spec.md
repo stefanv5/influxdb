@@ -2328,7 +2328,7 @@ func (s *Shard) saveFieldsAndMeasurements(fieldsToSave []*FieldCreate) (int, err
 
 1. 函数名是 `saveFieldsAndMeasurements`，返回 `(int, error)`；旧文档里的 `create…FieldsAndMeasurements` 名称并不存在。`CreateFieldIfNotExists(name string, typ influxql.DataType)` 由上一阶段的 `ValidateAndCreateFields`（`tsdb/field_validator.go:63`）调用，不在本函数内。
 2. `Save(changes FieldChanges) error`（`tsdb/shard.go:1834-1836`）→ `changeMgr.RequestSave`（`:1838-1844`，阻塞等回执）→ 后台 `SaveWriter`（`:1844-1858`）→ `appendToChangesFile`（`:1915-2001`，`O_CREATE|O_APPEND|O_SYNC`，排空并合并队列中已排队的请求）。返回时变更已进 `fields.idxl`；`fields.idx` 仍是旧文件。
-3. 全量落盘 `WriteToFile`（`tsdb/shard.go:1855-1911`，tmp + `O_SYNC` + rename + `SyncDir`）只在 `Close`/`ApplyChanges`（`:2243-2268`）/引擎打开时发生（`tsdb/engine/tsm1/engine.go:780-783,934`）。
+3. 全量落盘 `WriteToFile`（`tsdb/shard.go:1855-1911`，tmp + `O_SYNC` + rename + `SyncDir`）只在 `Close`（`:1681-1694`）/`ApplyChanges`（`:2243-2268`）/`LoadMetadataIndex` 重建（`tsdb/engine/tsm1/engine.go:934`）/ Restore·Import 的 `overlay` 收尾（`:1245`）时发生；`engine.go:780-783` 只是打开/加载 `fields.idx`，不是全量写。
 
 ### 8.5 Field 类型冲突检测
 
@@ -2369,7 +2369,7 @@ flowchart TD
         W3 --> W4["changeMgr.RequestSave<br/>阻塞等回执"]
     end
     subgraph S["SaveWriter goroutine"]
-        S1["writeRequests 队列（容量 100）"] --> S2["排空队列并合并<br/>（单次最多 1+100 条）"]
+        S1["writeRequests 队列（容量 100）"] --> S2["排空队列并合并<br/>（队列容量 100，排空期间新请求并入）"]
         S2 --> S3["Truncate(上次已知长度)"]
         S3 --> S4["marshalFieldChanges"]
         S4 --> S5["fd.Write + O_SYNC → fields.idxl"]
@@ -2391,7 +2391,7 @@ flowchart TD
 - `Save` 返回前 kill：内存已创建 field，日志可能只写了半条；重启时 `Truncate(changeFileSize)` 丢弃半条，字段不可见。
 - 压缩到一半掉电：`fields.idx` 仍是旧文件（POSIX 下同目录 `rename(2)` 原子；Windows 的 `file.RenameFile` 先删目标再 rename，见 07 号文档 §7.2，存在 `fields.idx` 缺失的窗口）+ `fields.idxl` 未删除 → 下次启动重放幂等（Windows 上 `fields.idx` 缺失会从空索引开始，靠 `fields.idxl` 全量重建）。
 
-**关键常量**: `FieldsChangeFile = "fields.idxl"`（`tsdb/shard.go:51`）、`MaxCombinedWrites = 100`（`:1667`，作为 `writeRequests` channel 容量传给 `SetMeasurementFieldSetWriter`，`:1675`、`:1818`；`appendToChangesFile` 会排空队列，单次最多合并 1+100 条请求）、change-log 打开标志 `O_CREATE|O_APPEND|O_SYNC|O_WRONLY`（`:1935`）。`SkipFieldSizeValidation` 只关闭"字符串 > 1 MiB"检查，不影响类型冲突判定。
+**关键常量**: `FieldsChangeFile = "fields.idxl"`（`tsdb/shard.go:51`）、`MaxCombinedWrites = 100`（`:1667`，作为 `writeRequests` channel 容量传给 `SetMeasurementFieldSetWriter`，`:1675`、`:1818`；`appendToChangesFile` 会排空队列，排空期间新到请求可继续并入（通常 1~100+ 条））、change-log 打开标志 `O_CREATE|O_APPEND|O_SYNC|O_WRONLY`（`:1935`）。`SkipFieldSizeValidation` 只关闭"字符串 > 1 MiB"检查，不影响类型冲突判定。
 
 **对比**: `fields.idx` 的 rename 之后显式调用 `file.SyncDir`（`tsdb/shard.go:2020-2032`），而 meta snapshot 的 rename 没有（见 07 号文档 §9.2、S-07-07）。
 

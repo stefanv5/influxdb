@@ -258,7 +258,7 @@ func (c *Client) CreateDatabase(name string) (*DatabaseInfo, error) {
 | `SetPrivilege` | 483 | 设置 per-DB 权限 | — |
 | `SetAdminPrivilege` | 501 | 切换 admin 标志 | — |
 | `TruncateShardGroups` | 672 | 设置 TruncatedAt | — |
-| `PruneShardGroups` | 682 | 移除已过期的软删除 ShardGroup | 无变更时跳过 commit |
+| `PruneShardGroups` | 682 | 移除已过期且 `Shards` 为空的软删除 ShardGroup | 无变更时跳过 commit |
 | `PrecreateShardGroups` | 781 | 预创建即将到期的 ShardGroup | 避免写入时创建延迟 |
 | `CreateDatabaseWithRetentionPolicy` | 214 | 创建 DB + 指定 RP | RP 冲突返回 error |
 
