@@ -2397,7 +2397,7 @@ flowchart TD
 - `Save` 返回前 kill：内存已创建 field，日志可能只写了半条；重启时 `Truncate(changeFileSize)` 丢弃半条，字段不可见。
 - 压缩到一半掉电：`fields.idx` 仍是旧文件（POSIX 下同目录 `rename(2)` 原子；Windows 的 `file.RenameFile` 先删目标再 rename，见 07 号文档 §7.2，存在 `fields.idx` 缺失的窗口）+ `fields.idxl` 未删除 → 下次启动重放幂等（Windows 上 `fields.idx` 缺失会从空索引开始，靠 `fields.idxl` 全量重建）。
 
-**关键常量**: `FieldsChangeFile = "fields.idxl"`（`tsdb/shard.go:51`）、`MaxCombinedWrites = 100`（`:1667`，作为 `writeRequests` channel 容量传给 `SetMeasurementFieldSetWriter`，`:1675`、`:1818`；`appendToChangesFile` 会排空队列，排空期间新到请求可继续并入（通常 1~100+ 条））、change-log 打开标志 `O_CREATE|O_APPEND|O_SYNC|O_WRONLY`（`:1935`）。`SkipFieldSizeValidation` 只关闭"字符串 > 1 MiB"检查，不影响类型冲突判定。
+**关键常量**: `FieldsChangeFile = "fields.idxl"`（`tsdb/shard.go:51`）、`MaxCombinedWrites = 100`（`:1667`，作为 `writeRequests` channel 容量传给 `SetMeasurementFieldSetWriter`，`:1675`、`:1818`；`appendToChangesFile` 会排空队列：无并发生产者时单次合并上限 101 条（首批 1 条 + 队列容量 100）；排空期间持续有生产者入队时没有硬上限，直到某一瞬间队列为空）、change-log 打开标志 `O_CREATE|O_APPEND|O_SYNC|O_WRONLY`（`:1935`）。`SkipFieldSizeValidation` 只关闭"字符串 > 1 MiB"检查，不影响类型冲突判定。
 
 **对比**: `fields.idx` 的 rename 之后显式调用 `file.SyncDir`（`tsdb/shard.go:2020-2032`），而 meta snapshot 的 rename 没有（见 07 号文档 §9.2、S-07-07）。
 

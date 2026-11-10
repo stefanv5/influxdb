@@ -837,7 +837,7 @@ func (s *Store) DeleteShard(shardID uint64) error {
 > 2. 下一轮：`DeletedShardGroups()` 重新把该 id 放回 `deletedShardIDs`（组里仍有这个 `ShardInfo`）。
 > 3. 但 `ShardIDs()` 只返回 `s.shards` 的 key（`tsdb/store.go:1389-1394`），该 id 已不在其中 →
 >    Phase 2 的本地删除循环根本不会遍历到它。
-> 4. 同一轮的 phantom 循环（`services/retention/service.go:284-300`）在 OSS 直接
+> 4. 下一轮的 phantom 循环（`services/retention/service.go:284-300`）在 OSS 直接
 >    `DropShardMetaRef` → `meta.Client.DropShard` 删除 `ShardInfo`。磁盘目录
 >    `data/<db>/<rp>/<id>` 与 WAL 目录成为孤儿，之后无人再尝试删除。
 >

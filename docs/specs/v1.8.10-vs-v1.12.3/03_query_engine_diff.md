@@ -87,26 +87,30 @@ flowchart TB
 
     subgraph IQ["InfluxQL 点式迭代器路径（未重构）"]
         I1["Executor.executeQuery"] --> I1b["RewriteStatement / NormalizeStatement"]
-        I1 -. "错误/系统 measurement 直接写 results" .-> I2["ExecutionContext.send / Send"]
+        I1 -. "错误/系统 measurement：直接写 results，绕过 send" .-> I2R["results channel"]
         I1b --> I3["StatementExecutor.ExecuteStatement"]
         I3 --> I4["query.Select"]
-        I3 --> I2
-        I4 --> I5["query.Prepare"]
-        I4 --> I6["buildCursor"]
+        I3 --> I2["ExecutionContext.send / Send"]
+        I2 --> I2R
+        I4 --> I5["query.Prepare"] --> I6["buildCursor"]
         I6 --> I7["有 call：buildExprIterator / buildCallIterator"]
         I6 -. "无 call" .-> I7b["buildAuxIterator"]
-        I7 --> I8["NewCallIterator → ReduceIterator / StreamIterator"]
-        I7b --> I11
-        I8 --> I9["MergeIterator.Next"]
-        I9 --> I10["FillIterator.Next / IntervalIterator.Next"]
-        I10 --> I11["Emitter.Emit"]
+        I7b --> I7c["NewIteratorScanner → newScannerCursor"]
+        I7 --> I8["引擎层（每个 series）：NewCallIterator → Reduce/Stream"]
+        I8 --> I8b["NewParallelMergeIterator（同一 TagSet 内）"]
+        I8b --> I9["Select 层：Iterators.Merge → NewMergeIterator"]
+        I9 --> I9b["Merge 内再 NewCallIterator（count→sum / sum_hll→merge_hll）"]
+        I9b --> I10["NewIntervalIterator → NewFillIterator"]
+        I10 --> I10b["NewLimitIterator（LIMIT/OFFSET）"]
+        I10b --> I11["Emitter.Emit"]
+        I7c --> I11
         I11 -->|"非 SELECT INTO"| I2
-        I11 -. "SELECT ... INTO" .-> I12["writeInto → PointsWriter（不 Send）"]
+        I11 -. "SELECT ... INTO：逐行不 Send，循环后 Flush → ctx.Send 写入计数" .-> I12["writeInto → PointsWriter"]
     end
 
     subgraph FX["Flux 列式读取路径（新增控制层 + 下推层）"]
         F1["query/control.Controller.query"] --> F2["createQuery / compileQuery / enqueueQuery"]
-        F2 --> F3["executeQuery → Query.pump"]
+        F2 -. "异步：queryQueue 或每查询 goroutine" .-> F3["executeQuery → Query.pump"]
         F3 --> F4a["storageflux.storeReader.ReadWindowAggregate"]
         F4a --> F5["services/storage.Store.WindowAggregate → WindowAggregateLimit"]
         F3 --> F4b["storeReader.ReadFilter"]
@@ -124,12 +128,16 @@ flowchart TB
         F9 --> F10["table.do → colReader（窗口路径再 splitWindows）"]
         F9b --> F10
         F9c --> F10
+        F11["newIndexSeriesCursor → row.Query=shard 游标迭代器"]
+        F5 -. "下推读取" .-> F11
+        F5b -. "结果集 row.Query" .-> F11
+        F5c -. "结果集 row.Query" .-> F11
     end
 
     H1 --> I1
     H2 --> F1
     I7 -. "tsdb.Shard.CreateIterator（点迭代器）" .-> T1["tsdb/engine/tsm1 point iterators"]
-    F5 -. "tsdb.CreateCursorIterators（数组游标）" .-> T2["tsdb/engine/tsm1 arrayCursorIterator"]
+    F11 -. "tsdb.CreateCursorIterators（arrayCursorIterator）" .-> T2["tsdb/engine/tsm1 arrayCursorIterator"]
     T1 --> T3["Cache + TSM KeyCursor"]
     T2 --> T3
 ```
@@ -139,11 +147,15 @@ flowchart TB
 - InfluxQL 从来不经过 `storage/reads`：`coordinator/statement_executor.go:647` 调用
   `query.Select(ctx, stmt, e.ShardMapper, sopt)`，`query/select.go:622` 的 `buildCursor`
   通过 `IteratorCreator.CreateIterator` 拿到**点迭代器**。
-- Flux 才走 `storage/reads` / `storage/flux`：`services/storage/store.go:234` 的
-  `WindowAggregateLimit` 通过 `tsdb.CreateCursorIterators`（`tsdb/cursor.go:39`）
-  拿到**数组游标**（`arrayCursorIterator`）。
+- Flux 才走 `storage/reads` / `storage/flux`：`WindowAggregateLimit`（`services/storage/store.go:234`）、
+  `ReadFilterLimit`（`:126`）与 `ReadGroupLimit`（`:177`）都经 `newIndexSeriesCursor`
+  （`services/storage/series_cursor.go:40`）调用 `tsdb.CreateCursorIterators`（`tsdb/cursor.go:39`）
+  拿到**数组游标**（`arrayCursorIterator`）；filter/group 的结果集再由 `row.Query` 创建游标
+  （`storage/reads/array_cursor.go:118`）。
 - 因此本文件里的“数组游标/批量读取”改动只影响 Flux（以及 `influx_tools`），
   不影响 InfluxQL 的 `GROUP BY`。
+- InfluxQL 编译/Select/迭代器引擎三层、`services/storage` 适配层与数组游标契约的模块卡见
+  §3.15-§3.19；其中 §3.10 是 Flux 计划下推，§3.11 是 `storage/flux` 表执行。
 
 ### 2.2 Flux 查询生命周期（新控制器）
 
@@ -154,35 +166,53 @@ sequenceDiagram
     participant Q as control.Query
     participant K as flux.Compiler
     participant P as flux.Program
+    participant X as flux.Query (exec)
     participant W as worker goroutine
 
     H->>C: Query(ctx, compiler)
     C->>C: createQuery (context.WithCancel)
     alt createQuery 失败（controller shutdown）
         C-->>H: 返回错误（未创建 Query）
-    else compileQuery 失败
-        C-->>H: 返回错误（Compiling → Errored；父 ctx 取消则 Canceled）
-    else enqueueQuery 失败（队列满）
-        C-->>H: ResourceExhausted
-    else 成功
+    else
         C->>Q: tryCompile → Compiling
         C->>K: Compile(ctx, runtime.Default)
         K-->>C: Program
-        C->>Q: tryQueue → Queueing
-        C->>C: enqueueQuery（queryQueue 或每查询一个 goroutine）
-        C-->>H: 立即返回 Query（异步执行）
-        W->>Q: tryExec → Executing
-        W->>W: createAllocator(q) / recordUnusedMemory()
-        W->>P: program.Start(ctx, alloc)
-        loop pump
-            P-->>Q: Results()
-            Q-->>H: results channel
+        alt Compile 失败
+            C->>Q: setErr（Compiling → Errored）
+            C-->>H: 返回错误（父 ctx 取消则 Canceled）
+        else
+            C->>Q: tryQueue → Queueing
+            alt tryQueue 失败（状态迁移非法）
+                C-->>H: codes.Internal
+            else
+                C->>C: enqueueQuery（queryQueue 或每查询一个 goroutine）
+                alt 队列满 / controller 关闭
+                    C-->>H: ResourceExhausted / codes.Internal
+                else
+                    C-->>H: 立即返回 Query（异步执行）
+                    W->>Q: tryExec → Executing
+                    alt tryExec 失败（已取消/关闭）
+                        W->>Q: setErr（codes.Internal）
+                    else
+                        W->>C: q.c.createAllocator(q)
+                        W->>Q: q.recordUnusedMemory()
+                        W->>P: program.Start(ctx, alloc)
+                        P-->>W: exec
+                        W->>Q: q.pump(exec, ctx.Done())
+                        loop pump
+                            X-->>Q: Results()
+                            Q-->>H: results channel
+                        end
+                    end
+                    H->>Q: Cancel()（defer 注册，函数返回时执行）
+                    H->>Q: Done()
+                    Q->>Q: transitionTo(Finished) → cancel()
+                    Q->>Q: 排空 results 直到 close
+                    Q->>Q: exec.Done() → stats → runtimeErrs → deps.Finish() → finish()
+                    Q->>Q: MemoryManager.Release() → recordUnusedMemory() → countQueryRequest()
+                end
+            end
         end
-        H->>Q: Cancel()（defer 注册，函数返回时执行）
-        H->>Q: Done()
-        Q->>Q: transitionTo(Finished) → cancel()
-        Q->>Q: 排空 results 直到 close
-        Q->>Q: exec.Done() → stats → deps.Finish() → finish() → MemoryManager.Release()
     end
     Note over H,Q: Cancel/Done 由 Query() 成功后的 defer 注册；失败分支直接返回错误
 ```
@@ -364,8 +394,11 @@ func (h *Handler) addQueryBytesForUser(user string, n int64) {
 - 输出：`/debug/vars` 与 `SHOW STATS` 中多出 `userquerybytes` 统计（tag `user`，
   匿名记为 `StatAnonymousUser`），见 `services/httpd/handler.go:484`-`:496`。
 
-**影响**：默认关闭，升级不改变行为；开启后每个活跃用户多一个 `atomic.Int64`
-和一条统计行，用户数极大时 `SHOW STATS` 结果集会变大。
+**影响**：默认关闭，升级不改变行为；开启后每个 distinct user 在 `queryBytesPerUser` 中占一个
+`atomic.Int64` 条目，并在 `SHOW STATS` / `/debug/vars` 中生成一条 `userquerybytes` 统计
+（匿名用户合并为 `StatAnonymousUser`）。行数 = 进程启动以来出现过的 user 数；该 map 没有删除路径
+（`services/httpd/handler.go:505-511`），所以统计条数随运行时间单调增长。1000 个 user ≈ 1000 条
+Statistic；关闭开关时 0 条。
 
 ### 3.3 InfluxQL Executor：`StatementID` 与 `ErrNotExecuted`（#22273）
 
@@ -403,10 +436,28 @@ for i++; i < len(query.Statements); i++ {
 新版严格每剩一条语句一条 `ErrNotExecuted`。客户端如果按“结果条数 == 语句数”做校验，
 升级后行为才正确。
 
+**三语句实例**：`SELECT 1; BAD; SELECT 3`（第 2 条执行失败，`BAD` 为任意报错语句）：
+
+| 版本 | 返回结果（`StatementID` / `Err`） | 说明 |
+|------|-----------------------------------|------|
+| v1.8.10 | `0` / nil、`1` / 执行错误、`1` / `ErrNotExecuted` | `send` 覆盖 ID；补发循环从 `i=1` 开始，重复第 2 条，最后一条不补 |
+| v1.12.3 | `0` / nil、`1` / 执行错误、`2` / `ErrNotExecuted` | 补发循环 `i++` 后从 3 开始，最后一条得到 ID 2 |
+
+旧版结果条数也是 3，但 ID 序列是 `0,1,1`，客户端按 ID 对齐会错位；新版是 `0,1,2`。
+
 另外，区间内 `FineAuthorizer` 新增了 `OptimizeSeriesRead` 钩子（`2cf2103cc4` #25207）：
 接口定义在 `query/executor.go:93`-`:94`，`openAuthorizer`/`voidAuthorizer` 的实现是 no-op
 （`:118`-`:119`、`:147`-`:148`）。OSS 里它恒为 open/true，企业版可据此把授权条件下推成索引过滤、
 减少 series 扫描（`tsdb/index.go:2986`-`:2999`）。
+
+**模块卡：`FineAuthorizer.OptimizeSeriesRead`（企业版扩展点）**
+
+- 接口：`query/executor.go:93-94`；OSS 的 `openAuthorizer`/`voidAuthorizer` 都是
+  no-op（`:118-119`、`:147-148`）。
+- 调用：`tsdb/index.go:2986-2999` 在 `MeasurementTagKeyValuesByExpr` 里调用；
+  返回错误时回退到未优化的 `expr`/`auth`，不会让查询失败。
+- 边界：OSS 恒为 `true` 或 `false`，不能据此判断“权限已过滤”；真正的下推过滤只存在于
+  企业版。OSS 读者可把本节当作扩展点说明跳过。
 
 ### 3.4 InfluxQL TaskManager：user 字段、超时日志、SHOW QUERIES 鉴权
 
@@ -471,12 +522,58 @@ case "min", "max", "sum", "first", "last", "mean", "sum_hll", "merge_hll":
 
 - 出错不返回 `error`，而是把错误编码进字符串：`HLLERROR ...` 前缀；
   正常 sketch 用 `HLL_` + base64（`query/functions.go:2169`、`:2213` 的
-  `unmarshalPlus` / `marshalPlus`）。原因写在代码注释里：
-  “返回 error 会让所有聚合函数慢约 1%”。
+  `unmarshalPlus` / `marshalPlus`）。代码注释给出的设计动机是“返回 error 会让所有聚合函数慢约 1%”
+  （`query/functions.go:2192-2193`），**该数字没有基准出处**，本文只把它当作设计动机，
+  不作为跨版本性能结论。可复核的控制流是：错误被编码成 `HLLERROR ...` 字符串，
+  `AggregateString` 不返回 `error`。
 - `count_hll` 遇到长度合法但内容非法的 sketch 时静默返回 0（`query/functions.go:2256`-`:2262`），
   错误被吞掉——这是有意的性能取舍；但过短的字符串会直接 panic 而不是返回 0（见 §7.6），排障时需要知道。
 - `query/compile.go:787` 的 `compileCountHll` 只接受 1 个参数，并把
   `OnlySelectors` 置 false；`compile.go:309` 负责字段级分发。
+
+**数值案例（两个 shard、250 个 series）**：
+
+- **输入/前提**：只有当索引是 TSI 且 `opt.Dimensions` 为空（没有 `GROUP BY`/Dimensions）时，
+  `Engine.createCallIterator` 才走 `_seriesKey` 快路径，每个 shard 各产生一个
+  `sum_hll(_seriesKey)` sketch（`tsdb/engine/tsm1/engine.go:2917-2927`）。为可复算，把 `_seriesKey` 的固定字节串取为
+  `k1`…`k100`（分片 1）与 `k101`…`k250`（分片 2）；HLL 只对字节串做哈希，两组 key 互不重叠，
+  逻辑并集为 250。
+- **步骤与中间数值**：
+  1. 分片内 `sum_hll` 用 `hll.NewDefaultPlus()`（`p=16`）逐 key `Add`，输出 `HLL_`+base64
+     （`query/functions.gen.go.tmpl:108-130`、`query/functions.go:2213-2240`）。上述 key 集合实测
+     两个 sketch 的二进制长度分别为 **318B / 465B**（version=2、p=16、sparse flag=1）。
+  2. `Iterators.Merge` 把表达式改写成 `merge_hll`（`query/iterator.go:157-162`）；
+     `StringMergeHllReducer` 先接收分片 1 的 sketch，再 `Plus.Merge` 分片 2。`Merge` 会把 receiver
+     的 sparse 表示 `toNormal()`，所以合并结果一定是 **dense**：版本 1B + p 1B + flag 1B +
+     长度 4B + 65536B dense list = **65543B**（`pkg/estimator/hll/hll.go:203-230`、`:240-293`）。
+  3. `count_hll` 对合并结果调用 `Plus.Count()`；dense 路径走 LogLog-Beta
+     （`pkg/estimator/hll/hll.go:171-190`）。对上述固定 key 集合实测 **`Count()=250`**，
+     与 `EXACT` 的 250 相等；合并前两个 sparse sketch 的线性计数也分别精确为 100、150。
+- **预期输出**：非 EXACT 的 `SHOW SERIES CARDINALITY` / `count_hll(merge_hll(sum_hll(_seriesKey)))`
+  → `250`；`EXACT` 的 `count(distinct(_seriesKey))` → `250`。HLL 只提供概率界：
+  p=16 时标准误差 `0.40625%`，n=250 时 **1σ≈±1.0、95%≈±2.0**；本例实测估计值恰为 250，
+  属于偶然相等。只有显式 `EXACT` 的 `count(distinct(_seriesKey))` 才是精确值；
+  n 增大时绝对误差按 `0.40625% × n` 增长。
+- **误差上界**：标准误差为 `1.04/sqrt(m)`。本仓库 `p=16`、`m=2^16=65536`，
+  `1.04/256 = 0.40625% ≈ 0.41%`；250 个元素对应约 **±1.0**。原文的 `0.81%` 是 p=14 的
+  `1.04/128`，与 `DefaultPrecision=16` 不符；`±2` 也相应偏大一倍。
+- **为什么不能再用“sparse 可能精确”解释合并结果**：单个 shard 在**未发生 `Merge` 且不同 key 数
+  ≤ m=65536** 时保持 sparse，`Count()` 必走 `linearCount`（`hll.go:176-178`）；一旦不同 key 数超过
+  65536（`Add` 内 `sparseList.Len() > h.m`，`hll.go:155-158`）或接收过任意一次 `Merge`
+  （receiver 无条件 `toNormal`，`hll.go:211-213`），就是 dense，走 LogLog-Beta。
+  本例 100/150 < 65536，因此合并前确定是线性计数；合并后确定 dense。要精确值必须显式写 `EXACT`。
+- **非法 sketch 边界（可复算）**：
+
+  | 输入 | `unmarshalPlus`/`Count` 行为 | 结果 |
+  |---|---|---|
+  | `"abc"`（len=3） | `s[:4]` 越界 | panic |
+  | `"abcd"`（len=4，前缀非 `HLL_`） | `s[:9]` 越界 | panic |
+  | `"HLL_"`（len=4） | data 为空，返回 `(nil,nil)`；`Count()` 的 nil receiver 返回 0 | 0 |
+  | `"HLL_AAAA"`（8B） | base64 解出 3B，`UnmarshalBinary` 要求 ≥12B → error | 0 |
+  | `"HLLERROR boom"` | 解析出 error | 0 |
+
+  源码：`query/functions.go:2169-2200`（切片与前缀）、`:2256-2262`（置 0）、
+  `pkg/estimator/hll/hll.go:171-175`（nil → 0）、`:295-300`（≥12B 校验）。
 
 **行为变化**：`SHOW SERIES CARDINALITY` 的非 EXACT 路径从精确变近似（见 3.6）。
 另外 HLL 对**字符串值**直接 `[]byte(p.Value)`，对数值类型用 BigEndian 二进制
@@ -517,6 +614,18 @@ Expr: &influxql.Call{Name: "count", Args: []influxql.Expr{
 （`coordinator/statement_executor.go:923`）。所以：
 `SHOW SERIES CARDINALITY`（无 FROM/WHERE）= 精确；
 `SHOW SERIES CARDINALITY FROM cpu WHERE ...` = HLL 近似。
+
+**数值案例**：3 个 series —— `cpu,host=a`、`cpu,host=b`、`mem,host=a`。
+
+| 查询 | 重写结果 | 执行路径 | 输出 |
+|------|----------|----------|------|
+| `SHOW SERIES CARDINALITY`（无 FROM/WHERE） | 保持原语句（`v1.12.3:query/statement_rewriter.go:203-205`） | `TSDBStore.SeriesCardinality(db)`（`coordinator/statement_executor.go:923`） | `cardinality estimation = 3`（精确） |
+| `SHOW SERIES CARDINALITY FROM cpu` | `count_hll(sum_hll(_seriesKey))`（`:219-243`） | 扫描 2 个 `_seriesKey`（`cpu,host=a`、`cpu,host=b`） | `cardinality estimation = 2` |
+| 同上旧版 | `count(distinct(_seriesKey))`（`v1.8.10:query/statement_rewriter.go:207`） | 扫描数据块 | 同为 2，但走精确去重、内存 O(series) |
+| `SHOW SERIES CARDINALITY FROM cpu EXACT` | `stmt.Exact` 使 HLL 分支不成立 → 落到 `count(distinct)` | 数据扫描 | 2 |
+| `SHOW FIELD KEY CARDINALITY FROM cpu` | `_fieldKeys` 子查询（`:90-92`） | 只读 `_fieldKeys` 迭代器，`fieldKey=value` 去重 | 1（两个 series 的字段都叫 `value`） |
+
+**为什么 3/2 这种小基数看不出近似**：`p=16` 时稀疏阶段用 `m'=2^25` 的线性计数（`pkg/estimator/hll/hll.go:171-175`），Merge 后转 dense 时 LogLog-Beta 对小基数也会四舍五入回整数（`hll.go:176-190`，测试 `TestPlusCount`/`TestHLL_Merge_Normal` 对 5/10 个元素均断言精确值）。近似只在大基数或大量 register 时才显现；不能把旧稿的“3 vs 近似 2”当作精度差异——这里的 2 是因为 `FROM cpu` 只包含 2 个 series。
 
 **(b) `SHOW FIELD KEY CARDINALITY`：数据扫描 → `_fieldKeys` 索引**
 
@@ -674,6 +783,17 @@ reader 少一次遍历。`storage/reads/flux_predicate.go` 整个文件（183 �
 `no-content` 方言把响应状态设为 204 并丢弃查询结果（仍消费 results），另有
 `no-content-with-error` 变体，供 Flux 客户端做“只关心成败”的查询。
 
+**模块卡：`NoContentDialect`（`query/encode.go`，`v1.8.10` 无此文件）**
+
+- 入口：Flux 请求的 `dialect` 注册 `no-content` / `no-content-with-error`
+  （`query/encode.go:12-13`）。
+- 行为：`SetHeaders` 写 HTTP 204（`:34-36`）；`NoContentEncoder.Encode` 仍然
+  `defer results.Release()` 并逐表消费结果，但不写任何字节（`:40-54`）。
+- 变体：`NoContentWithErrorDialect` 把运行期错误编码成 CSV；客户端用“响应体长度是否为 0”
+  判断有无错误（`:56-70`）。
+- 风险：`no-content` 会吞掉运行期错误；需要区分成功/失败时必须用
+  `no-content-with-error`，且客户端要检查响应体而不是只看 204。
+
 ### 3.8 `array_cursor.gen.go`：从 23 个类型到 50 个类型
 
 `storage/reads/array_cursor.gen.go` 的规模变化：+3423 / −399。
@@ -725,14 +845,42 @@ req: cursors.CursorRequest{Ascending: asc, StartTime: start, EndTime: end - 1}
 旧版直接 `EndTime: end`（`v1.8.10:storage/reads/array_cursor.go:100`）。
 `tsdb/cursors.CursorRequest` 的新注释明确写了 `StartTime`/`EndTime` 都是 **inclusive**
 （`v1.12.3:tsdb/cursors/cursor.go:64`-`:71`）。
-影响：Flux 的 `range(start, stop)` 语义是 `[start, stop)`，旧版把 `stop` 直接交给
-存储层，底层按闭区间读，**恰好等于 stop 的点可能被返回**；新版统一减 1。
+影响：Flux 的 `range(start, stop)` 语义是 `[start, stop)`。v1.8.10 的 Flux 数据读路径
+（`ReadFilter`/`ReadGroup`；`ReadWindowAggregate` 是 v1.12.3 才加入的第三条数据路径）
+在 Flux 层传 `Range.End = Bounds.Stop`，`storage/reads` 又把它原样作为闭区间 `EndTime=end`，
+底层游标只裁 `> c.end`，因此**只要该 series 在 `t==stop` 有数据点就必然返回**
+（cache 与 TSM 两条来源都保留 `== end`）。v1.12.3 的三条数据路径在 Flux 层仍传 `Bounds.Stop`，
+但 `storage/reads/array_cursor.go:90` 统一传 `EndTime=end-1`，因此**必不返回 `t==stop`**。
+InfluxQL 不受影响：它不经过 `storage/reads`，上界由语句的 `TimeRange` 决定
+（`query/compile.go:1198`，来自 `WHERE time`），两版相同。
 
 **逐类型错误返回**：`reset` 从无返回值变成 `error`，`build*ArrayCursor` 同步改签名
 （`v1.12.3:tsdb/engine/tsm1/array_cursor.gen.go:42`、
 `tsdb/engine/tsm1/array_cursor_iterator.gen.go:18`），
 `multiShardArrayCursors.createCursor` 在 `cur == nil || err != nil` 时返回 nil
 （`storage/reads/array_cursor.go:126`），不再把错误丢掉后对 nil 游标调 `Next()`。
+
+**案例（窗口 mean/count、mean 与 limit 的数值输出）**：
+
+- **输入**：同一个 float 序列，时间戳/值（秒）为
+  `(0,1)(5,2)(9,3)(10,4)(15,5)(20,6)`；窗口 `every=10s`、`offset=0`。
+- **步骤与输出**：
+  1. `newFloatWindowMeanCountArrayCursor` 以 `GetLatestBounds(ts).Stop()` 作为窗口终点：
+     第一个窗口 `[0,10)` 收 0/5/9，输出时间戳 **10**、mean `(1+2+3)/3=2`、count 3；
+     第二个窗口 `[10,20)` 收 10/15，输出 **20**、mean `(4+5)/2=4.5`、count 2；
+     第三个窗口 `[20,30)` 收 20，输出 **30**、mean 6、count 1。
+  2. 因此 `MeanCountArray` 为 `Timestamps=[10,20,30]`、`Values0=[2,4.5,6]`、
+     `Values1=[3,2,1]`；输出时间戳是窗口 **stop**，不是 start，空窗口不产生点
+     （`storage/reads/array_cursor.gen.go:1096-1225`）。
+  3. `newFloatWindowMeanArrayCursor` 对同一输入只输出单列
+     `Timestamps=[10,20,30]`、`Values=[2,4.5,6]`；mean+count 只是多一列
+     （`array_cursor.gen.go:988-1080`）。
+  4. limit 快路径：升序 cursor 上 `first()` 返回第一个点 `(0,1)`；`last()` 使用同一
+     `floatLimitArrayCursor`，但由 `services/storage`/`multiShardArrayCursors` 以
+     `Ascending=false` 读取，游标第一批的第一个点就是 `(20,6)`，因此输出 `(20,6)`
+     （`array_cursor.gen.go:367-394`、`array_cursor.go:20-25`）。
+- **源码**：`storage/reads/array_cursor.gen.go:27-48`（limit 分发）、`:367-394`、
+  `:988-1225`（窗口 mean/mean+count）。
 
 ### 3.9 group/aggregate resultset 的变化
 
@@ -781,7 +929,93 @@ func (c *groupByCursor) Cursor() cursors.Cursor { return c.cursor }
 真正生效的只有 group 路径。新版删掉了这个字段（`resultSet` 只剩 `ctx/seriesCursor/seriesRow/arrayCursors`，
 `v1.12.3:storage/reads/resultset.go:14`-`:19`）。
 
-### 3.10 `storage/flux/table.gen.go`（+4792 行）到底带来了什么
+**案例（group sum 遇到 string：错误被折叠成“无数据”）**：
+
+- **输入**：`group(columns:["host"]) |> sum()`，三个 group 各一条 series：
+  `host=web01` 有 100 个 float 点（值 1…100），`host=web02` 有 1 个 string 点，
+  `host=web03` 有 50 个 float 点（值 1…50）。
+- **步骤与输出**：
+  1. web01、web03 分别建出 `newWindowSumArrayCursor`，各输出一行
+     `_value=5050`、`_value=1275`（无窗口时 sum 整段）。
+  2. web02 的 cursor 是 `cursors.StringArrayCursor`，`newWindowSumArrayCursor` 返回
+     `EInvalid: unsupported input type for sum aggregate: string`，`groupByCursor.Next()`
+     因此返回 `false`，`groupByCursor.Err()` 仍返回 `nil`
+     （`storage/reads/array_cursor.gen.go:125-142`、`group_resultset.go:343-347`、`:333`）。
+  3. `storage/flux` 的 group 循环看到 `cur == nil`，关闭该 group 并继续下一个
+     （`storage/flux/reader.go:324-329`）。
+- **预期输出**：2 行（web01=5050、web03=1275），不是 3 行；`WriteGroupResultSet` 的
+  `gc.Err()` 检查也拿不到错误（`response_writer.go:116`）。若一个 group 内有多条 series，
+  失败之后的 series 会被截断（`storage/flux/table.gen.go:963-983`）。
+- **窗口聚合个数校验**：`NewWindowAggregateResultSet` 只接受 1 个聚合，或
+  `[Mean, Count]` 两个；`[Mean, Sum]` 返回 `InternalError`，`[Mean, Count]` 接受并走
+  `MeanCountArray`（`storage/reads/aggregate_resultset.go:50-63`、`:119-131`）。
+- **源码**：`storage/reads/group_resultset.go:281`、`:333`、`:343-347`；
+  `storage/flux/reader.go:324-329`；`storage/flux/table.gen.go:963-983`。
+
+### 3.10 Flux 物理计划下推：`flux/stdlib/influxdata/influxdb/rules.go`（owner: 计划层）
+
+**归属与角色**：本节属于 **Flux 物理计划层**（包 `flux/stdlib/influxdata/influxdb`），不属于
+`storage/flux` 表执行层。它负责把 `From` 生成的 `ReadRange`/`ReadGroup` 与上层
+`window`/聚合算子改写成带聚合信息的物理节点；`storage/flux` 只消费改写后的
+`ReadWindowAggregate`/`ReadGroup` 请求。规则漏判的后果是“退回 Flux 层计算，结果正确但慢”；
+表/游标层的失败则是 panic、nil 游标或吞错（§7.1-§7.3）。两者必须在章节上分开。
+
+**注册顺序**（`v1.12.3:flux/stdlib/influxdata/influxdb/rules.go:21-33`）：
+`FromStorageRule → PushDownRangeRule → PushDownFilterRule → PushDownGroupRule →
+PushDownReadTagKeysRule → PushDownReadTagValuesRule → SortedPivotRule →
+PushDownWindowAggregateRule → PushDownWindowAggregateByTimeRule →
+PushDownBareAggregateRule → PushDownGroupAggregateRule`，共 11 条。
+旧版 `init()` 只注册 6 条、没有任何聚合下推（`v1.8.10:flux/stdlib/influxdata/influxdb/rules.go:12-20`）。
+
+**匹配与产出**：
+
+| 规则 | 匹配模式 | 产出 | 证据 |
+|------|----------|------|------|
+| `PushDownWindowAggregateRule` | `ReadRange \|> window \|> {count,sum,min,max,mean,first,last}` | `ReadWindowAggregatePhysSpec`（WindowEvery/Offset/CreateEmpty） | `:676-775` |
+| `PushDownWindowAggregateByTimeRule` | `ReadWindowAggregate \|> duplicate(_start/_stop) \|> window(inf)` | 设置 `TimeColumn`，供 `aggregateWindow` 使用 | `:777-833` |
+| `PushDownBareAggregateRule` | `ReadRange \|> 聚合` | `ReadWindowAggregate`，`WindowEvery=MaxInt64` | `:837-863` |
+| `PushDownGroupAggregateRule` | `ReadGroup \|> {count,sum,first,last,min,max}` | `ReadGroup` + `AggregateMethod`（单聚合） | `:866-957` |
+
+**流程**：
+
+```mermaid
+flowchart LR
+    A["FromNode"] -->|"FromStorageRule"| B["ReadRangePhysSpec / ReadGroupPhysSpec"]
+    B -->|"Range / Filter / Group"| C["ReadRange + datatypes.Predicate"]
+    C -->|"window(every, period) + agg"| D["PushDownWindowAggregateRule"]
+    C -->|"裸聚合"| E["PushDownBareAggregateRule"]
+    D --> F["ReadWindowAggregatePhysSpec"]
+    F -->|"duplicate(_start/_stop) + window(inf)"| G["PushDownWindowAggregateByTimeRule"]
+    G --> H["TimeColumn=_stop / _start"]
+    B -->|"ReadGroup + agg"| I["PushDownGroupAggregateRule"]
+    I --> J["ReadGroupPhysSpec.AggregateMethod"]
+```
+
+**代码卡**：
+
+- `canPushWindowedAggregate`（`:697-726`）只检查聚合列是 `_value`，**不检查字段类型**；
+- `isPushableWindow`（`:728-742`）要求 `every==period`、非负 offset、`TimeColumn=_time`、
+  `CreateEmpty` 为 false；
+- `PushDownGroupAggregateRule`（`:885-953`）拒绝多聚合（`len(group.AggregateMethod)>0`），
+  且 `mean` 不在 group 可下推集合内。
+
+**计划期谓词**：`PushDownFilterRule` 在 `rules.go:179` 调用 `ToStoragePredicate`，
+`ReadFilterSpec.Predicate` 从此固定为 `*datatypes.Predicate`（`storage.go:69`）。
+旧版每次 `ReadFilter`/`ReadGroup`/`handleRead` 都重新转换（`v1.8.10:storage/reads/flux_reader.go:57`、`:77`、`:121`、`:245`）。
+
+**案例**：`aggregateWindow(every: 1m, fn: mean)` 的完整下推轨迹见 §6.3；
+`from |> range |> filter` 的 `ReadFilter` 非窗口表见 §3.11。
+
+**风险**：① `mean` 只能窗口下推，group 下推不支持；② min/max 不校验类型，
+对 String 字段下推后会在 `storage/reads/array_cursor.gen.go:158`/`:175` panic（§7.3）；
+③ 规则只在计划期生效，`ReadFilterSpec.Predicate` 一旦定型，运行期没有“退回逐点过滤”的兜底，
+谓词转换错误会直接影响读取范围。
+
+### 3.11 `storage/flux`：表生成与列读取（`table.gen.go` / `table.go`，owner: 执行层）
+
+**归属与角色**：本节属于 **Flux 存储读执行层**（包 `storage/flux`）。它把
+`services/storage` 返回的 `reads.ResultSet`/`GroupResultSet` 转成 Flux `Table`，
+负责窗口切分、列读取和空表语义；不负责“是否下推”。下推规则见 §3.10。
 
 **先厘清搬家**：旧版 Flux 的 reader/table 在 `storage/reads/flux_reader.go`、
 `storage/reads/flux_table.go`、`storage/reads/flux_table.gen.go`、`storage/reads/flux_tags_cache.go`；
@@ -859,26 +1093,58 @@ if timeColumn == "" {
 selector 且值为 null 时，`splitWindows` 产出一张空表（`window.go:70`-`:75`），
 以保持 `first()/last()` 对空窗口的语义。
 
-**下推规则**（`flux/stdlib/influxdata/influxdb/rules.go`）：
-
-| 规则 | 匹配 | 产出 | 证据 |
-|------|------|------|------|
-| `PushDownWindowAggregateRule` | `ReadRange \|> window \|> {count,sum,min,max,mean,first,last}` | `ReadWindowAggregate`（带 WindowEvery/Offset） | `:676`-`:775` |
-| `PushDownWindowAggregateByTimeRule` | `ReadWindowAggregate \|> duplicate(_start/_stop) \|> window(inf)` | 设置 `TimeColumn`，供 `aggregateWindow` 用 | `:777`-`:833` |
-| `PushDownBareAggregateRule` | `ReadRange \|> 聚合` | `ReadWindowAggregate`（`WindowEvery=MaxInt64`） | `:837`-`:863` |
-| `PushDownGroupAggregateRule` | `ReadGroup \|> {count,sum,first,last,min,max}` | `ReadGroup` 带 `AggregateMethod` | `:866`-`:957` |
-
-旧版 `init()` 只注册 6 条规则（含 `SortedPivotRule`），没有任何聚合下推
-（`v1.8.10:flux/stdlib/influxdata/influxdb/rules.go:12`-`:20`）；新版 11 条 = 旧 6 条
-+ `FromStorageRule`（`fbfd4b4651` #21074，`rules.go:23`）+ 4 条聚合规则。
-`mean` 只支持窗口下推，不支持 group 下推（`determineTableColsForGroup` 注释里也写了
-“if in the future we will add support for mean”）。
+> 下推规则、注册顺序与匹配/产出见 §3.10；本节只保留表执行层的列读取与窗口切分。
 
 **结果形态**：非 selector 窗口聚合的输出列是 `_start,_stop,_value,tags...`（无 `_time`），
 selector 则保留 `_time`（`reader.go:410`-`:452`、`:514`-`:581`）。
 这与 Flux 自身 `window()+aggregate` 的输出一致，因此下推对用户透明。
 
-### 3.11 结果序列化：`response_writer` 的变化
+**案例（filter 表与 group 表的列布局）**：
+
+- **输入**：`from(bucket:"db/rp") |> range(start:10:00, stop:10:02) |>
+  filter(fn:(r)=>r.host=="a")`；存储返回两行
+  `(10:00:30, host=a, region=west, _value=60)`、`(10:01:30, host=a, region=west, _value=70)`。
+- **filter 表（`newFloatTable`）**：`determineTableColsForSeries` 生成
+  `_start,_stop,_time,_value,host,region`（所有 series tag 都是列，`reader.go:454-481`、
+  `reader.go:193-205`）；两行的 `_time` 分别为 10:00:30、10:01:30，`_value` 为 60、70。
+  此路径 `readTags` 不会跳过 region，因为 region 在列定义里。
+- **group 表（`group(columns:["host"]) |> count()`）**：group key 为 `_start,_stop,host`，
+  `determineTableColsForGroup` 生成 `_start,_stop,host,_value`（聚合分支没有 `_time`，
+  `reader.go:514-560`）；`readTags` 遍历完整 tag 集时发现 `region` 不在 `t.cols` 中，
+  直接 `continue` 跳过（`table.go:194-211`）。预期一行
+  `(_start=10:00, _stop=10:02, host=a, _value=2)`。
+- **错误路径**：`table.do` 开头若 `t.err != nil` 直接返回，不再把初始化错误吞掉
+  （`table.go:87-89`）。
+- **源码**：`storage/flux/reader.go:454-481`、`:514-560`；`storage/flux/table.go:87-89`、
+  `:185-211`；`storage/flux/table.gen.go:107-320`（窗口表列布局）。
+
+**三条读取路径**（与 §3.10 的计划层对应）：
+
+| 路径 | 入口 | 产出表 | 证据 |
+|------|------|--------|------|
+| `ReadFilter` | `storeReader.ReadFilter`（`reader.go:65`） | `new{Type}Table` | `table.gen.go:32` |
+| `ReadGroup` | `ReadGroup`（`reader.go:75`） | `new{Type}GroupTable` | `table.gen.go:657` |
+| `ReadWindowAggregate` | `ReadWindowAggregate`（`reader.go:85`） | `WindowTable` / `WindowSelectorTable` / `EmptyWindowSelectorTable` | `table.gen.go:107`/`:320`/`:416` |
+
+**失败模式**（与计划层分开）：
+
+| 失败点 | 现象 | 归属 |
+|--------|------|------|
+| 规则未下推 | 原始点表，结果正确但慢 | §3.10 计划层 |
+| `table.do` 初始化错误 | 直接返回，不再被吞掉（`table.go:87-89`） | 本节执行层 |
+| min/max 类型不支持 | `array_cursor.gen.go:158`/`:175` panic | §3.19 游标契约 / §7.3 |
+
+**风险**：① `allocateBuffer` 在旧 `colReader` 的 `refCount>0` 时**新建** `colReader` 与
+`len(cols)` 个 `array.Array`（`storage/flux/table.go:124-137`），不复用旧 buffer；
+`table.do` 在回调 `f` 返回后立即 `Release()`，之后才 `advance()` 取下一批（`table.go:91-98`）。
+因此风险是**内存峰值**而非数据错误：若调用方在 `f` 内保留 `ColReader` 超过一次 `advance()`，
+每多持有一份就多一份 Arrow 缓冲；列数据已由 `arrow.NewInt`/`toArrowBuffer` 从 cursor 复制
+（`storage/flux/table.gen.go:98-100`、`table.go:242-243`），不会在下次 `Next()` 时被改写。
+量级示例：5 列 float × 1000 点 × 8B ≈ 40KB/份。② `readTags` 跳过不在列定义里的 tag，若 spec 的
+group key 与表列不一致会静默丢 tag；③ 整数 `count` 用 `fillValue=0` 补空窗口，`createEmpty=false`
+时不会产生空窗口行，二者语义不同。
+
+### 3.12 结果序列化：`response_writer` 的变化
 
 本节的全部新行为来自 `1d92b7a8fc`（#23846 “response writer simplification”）；
 `32aa970eba`（#21291）只贡献 `MultiPointsFrame` / `DataTypeMulti` 与 mean+count 写出路径。
@@ -928,12 +1194,38 @@ if seriesValueCount == 0 {
 - 大小估算从生成代码的 `f.Size()`/`w.sf.Size()` 改成 `proto.Size(fr)`/`proto.Size(sf)`
   （`v1.12.3:storage/reads/response_writer.go:202`、`:216`）；数组侧 `a.Size()` 沿用旧实现
   （`v1.8.10:storage/reads/response_writer.gen.go:81` 已是 `w.sz += a.Size()`）。
-  注释明确说“frame.Size() 在 varint 编码下可能很贵”。
+  注释说明 `w.sz` 只是估算值，累加 `a.Size()` 是 O(batch) 且便宜；`frame.Size()` 在 varint
+  数字上需要遍历，可能更贵（`v1.12.3:storage/reads/response_writer.go:382-386`）。
+  **这是实现选择，仓库没有该路径的 benchmark**，不作为性能结论。
 
-**兼容性**：gRPC 响应多一个 `MultiPointsFrame` oneof 分支；旧版 `ReadResponse`
-解析器遇到未知 oneof 会忽略，但 **mean+count 双聚合的客户端必须升级**。
+**frame 案例**：
 
-### 3.12 `tsdb/cursors`：MeanCountArray 与游标契约
+输入 A（空 series）：Storage read 返回 2 个 group，`cpu,host=a` 在窗口内有 2 个点（1 个 FloatArray batch），`cpu,host=b` 在窗口内 0 个点（`cur.Next()` 返回空数组）。
+
+| 版本 | 对 A 的帧操作 | 对 B 的帧操作 | 最终 `Frames` |
+|------|----------------|----------------|----------------|
+| v1.8.10 | `startSeries` 先压入 SeriesFrame；`streamFloatArrayPoints` 再压入 FloatPoints，循环 0 次后 `w.res.Frames[:ss]` 同时回退 SeriesFrame 与空 FloatPoints（`v1.8.10:storage/reads/response_writer.gen.go:66-100`） | 同样先建 SeriesFrame + 空 FloatPoints，再回退 | `[SeriesFrame(A), FloatPoints(A)]`，2 帧；B 的 2 个 frame 是瞬态分配 |
+| v1.12.3 | 首个非空 batch 才 `startSeries(DataTypeFloat, tags)`，同批创建 FloatPoints（`response_writer.gen.go:71-90`） | 循环第一次 `a.Len()==0` 直接 break，`startSeries` 从未调用 | 同样 2 帧；B 不产生任何 frame，`WrittenN=0` |
+
+输入 B（mean+count 双聚合）：1 个 series、3 个时间窗口 `Timestamps=[10,20,30]`、`Values0=[2,4.5,6]`、`Values1=[3,2,1]`。
+
+| 项 | 结果 |
+|----|------|
+| 帧数 | 2：`SeriesFrame(data_type=DataTypeMulti=5)` + `MultiPointsFrame`（`ReadResponse_Frame_MultiPoints`） |
+| `MultiPointsFrame` 内容 | 3 个时间戳 + 3 个 mean + 3 个 count，共 3 列 |
+| `MeanCountArray.Size()` | `3*8 + 3*8 + 3*8 = 72` 字节（`tsdb/cursors/arrayvalues.go:33-37`） |
+| `w.sz` 估算 | 累加 72（用 `a.Size()`，不是 `proto.Size(frame)`） |
+| 旧客户端 | 旧 gogo 代码把 `MultiPointsFrame` 当未知 oneof 跳过（`skipStorageCommon`），不报错但读不到 mean+count 两个值 |
+
+`Flush` 的回收差异：旧版在 `stream.Send` 失败时直接返回，已 append 的 frame 留在 `w.res.Frames`；新版 `Flush` 用 `defer` 统一把 frame 放回池（`response_writer.go:262-299`），写失败也回收。
+
+**兼容性**：gRPC 响应多一个 `MultiPointsFrame` oneof 分支。旧版 gogo 生成代码没有
+unknown 字段（`v1.8.10:storage/reads/datatypes/storage_common.pb.go:183-188`），
+反序列化遇到未知 tag/oneof 时走 `skipStorageCommon` **跳过并继续，不返回错误**
+（同文件 `:2993-3003` 的 `skippy` 分支），因此旧客户端不会因新增帧报错，但也读不到
+mean+count 的两个值；**mean+count 双聚合的客户端必须升级**。
+
+### 3.13 `tsdb/cursors`：MeanCountArray 与游标契约
 
 ```go
 // v1.12.3:tsdb/cursors/arrayvalues.go:5
@@ -955,12 +1247,27 @@ type MeanCountArrayCursor interface {
 另外：
 
 - `CursorRequest` 的 `StartTime`/`EndTime` 明确写成 inclusive（`cursor.go:64`-`:71`）。
-- 所有数组的 `Len()` 改为 nil-safe（`v1.12.3:tsdb/cursors/arrayvalues.gen.go:29`-`:34` 等 6 处）；
+- 6 种模板生成数组的 `Len()` 改为 nil-safe（`v1.12.3:tsdb/cursors/arrayvalues.gen.go:29-34` 等 6 处；手写的 `MeanCountArray` 不在其中，见下）；
   来自 `bc80e881fa` #24784（“do not panic when empty tags are queried”），避免对 nil 数组取长度时 panic。
 - 新增 `tsdb/cursors/mock`（`cursor_iterator.go`、`integer_array_cursor.go`），
   供上层单测注入可控游标。
 
-### 3.13 tsm1 数组游标：#26691、错误传播、降序 reset
+**消费案例**：3 个窗口的 `MeanCountArray`：
+
+| 字段 | 值 |
+|------|-----|
+| `Timestamps` | `[10, 20, 30]`（ns；数值不影响 Size） |
+| `Values0`（mean） | `[2, 4.5, 6]` |
+| `Values1`（count） | `[3, 2, 1]` |
+| `Len()` | 3 |
+| `Size()` | `3*8 + 3*8 + 3*8 = 72` 字节 |
+| `MinTime()` / `MaxTime()` | 10 / 30 |
+
+序列化端把它写成一个 `ReadResponse_Frame_MultiPoints`（§3.12），三列长度必须相等；`MeanCountArrayCursor.Next()` 返回 `*MeanCountArray`，调用方必须在同一个 cursor 上成对消费 mean 与 count，不能拆成两个 cursor。`CursorRequest{StartTime:0, EndTime:100}` 两端 inclusive（`cursor.go:64-71`）：要表达 `[0,100)` 需传 `EndTime:99`（ns 精度下为 `100-1`）。
+
+nil 边界要分开看：6 种模板生成的数组（Float/Integer/Unsigned/String/Boolean/Timestamp）`Len()` 对 nil receiver 返回 0（`arrayvalues.gen.go:29-34` 等）；手写的 `MeanCountArray.Len()`/`Size()` **没有 nil 判断**（`arrayvalues.go:28-37`），对 nil 指针调用会 panic。
+
+### 3.14 tsm1 数组游标：#26691、错误传播、降序 reset
 
 **(a) #26691：优化条件漏判 `c.tsm.pos`**
 
@@ -973,9 +1280,35 @@ if pos == 0 && c.tsm.pos == 0 && len(c.res.Timestamps) >= len(tvals.Timestamps) 
 
 这段是升序游标的“全部点都能由 TSM 块直接提供”的快路径：直接把 `tvals` 赋给结果，
 跳过逐点归并。旧条件只检查结果缓冲的 `pos==0` 和长度，没有检查 **TSM 侧当前位置**
-`c.tsm.pos`。当 TSM 位置不为 0 时，会把从块中间开始的 `tvals` 当成整块返回，
-导致**时间戳重复/缺失**。commit `31cb61f556` 补上 `c.tsm.pos == 0`，并新增
+`c.tsm.pos`。当 TSM 位置不为 0 时，会把从块中间开始的 `tvals` 当成整块返回，导致
+**时间戳重复（不是缺失）**。commit `31cb61f556` 补上 `c.tsm.pos == 0`，并新增
 `tsdb/engine/tsm1/array_cursor_optimization_bug_test.go`（166 行）复现。
+
+**案例（#26691 逐步复现）**：
+
+- **输入**（`array_cursor_optimization_bug_test.go:20-140`）：响应缓冲 1000 点；
+  cache 995 点，时间戳 `100..1094`（步长 1）；TSM 单块 8 点
+  `[10,10000,20000,30000,40000,50000,60000,70000]`；`reset(seek=10, end=71000)`。
+- **步骤与数值**：
+
+  | 调用 | 进入时 cache.pos | 进入时 tsm.pos | 返回点数 | 返回时间戳 |
+  |---|---:|---:|---:|---|
+  | `reset` | 0 | 0 | — | 解码 8 点块，`Search(>=10)=0` |
+  | `Next()` 第 1 次 | 0 | 0 | 1000 | `10` + cache `100..1094`（995 点）+ TSM `10000,20000,30000,40000` |
+  | `Next()` 第 2 次，旧版 | 995 | 5 | 8 | `10,10000..70000`；其中 `10,10000,20000,30000,40000` 重复，`50000,60000,70000` 是新增 |
+  | `Next()` 第 2 次，新版 | 995 | 5 | 3 | `50000,60000,70000` |
+  | `Next()` 第 3 次 | 995 | 0（下一块为空） | 0 | — |
+
+  第 1 次调用走完归并主循环后 `pos=996`，剩余 4 个槽复制 `tvals[1:5]`，因此
+  `cache.pos=995`、`tsm.pos=5`。旧版第 2 次的条件 `pos==0 && len(res)>=len(tvals)`
+  （`1000>=8`）成立，整块复制 8 点；新版因 `c.tsm.pos==5 != 0` 走普通复制，只取
+  `tvals[5:]` 的 3 点（`array_cursor.gen.go:107→113`、`:120-138`）。
+- **预期输出**：唯一时间戳共 `995+8=1003` 个。旧版发出 `1000+8=1008` 个（5 个重复），
+  新版发出 `1000+3=1003` 个；两版都不丢点，差异只是旧版重复。
+- **降序 reset 的边界（可复算）**：`pos = sort.Search(len, values[i].UnixNano() > seek) - 1`
+  等于“最后一个 `<= seek` 的下标”。`seek` 小于首元素 → `-1`；等于首元素 → `0`；
+  大于等于尾元素 → `len-1`。`Next()` 的循环条件是 `tsm.pos >= 0 && cache.pos >= 0`，
+  所以 `-1` 时直接返回空数组，不会越界（`array_cursor.gen.go:190-215`、`:245-260`）。
 
 **(b) 错误传播**
 
@@ -1020,6 +1353,300 @@ func (c *floatArrayDescendingCursor) reset(seek, end int64, cacheValues Values, 
 `sort.Search` 返回 0，减一得 -1，不需要 `if len(...)>0` 特判。
 降序 `Next()` 里的 `pos -= 2` 末尾裁剪逻辑保留不变
 （`v1.12.3:tsdb/engine/tsm1/array_cursor.gen.go:288`-`:294`）。
+
+### 3.15 InfluxQL 编译层：`query/compile.go`（未重构，新增 `count_hll` 入口）
+
+**角色/owner**：把 `*influxql.SelectStatement` 编译成 `query.Statement`，负责字段表达式校验、
+时间/分组/填充选项、`OnlySelectors` 判定和函数分发。它不创建游标，也不执行查询。
+
+**结构**：`compiledStatement` 保存 `Options IteratorOptions`、`OnlySelectors`、`FunctionCalls`、
+`HasDistinct`、`InheritedInterval`、`HasAuxiliaryFields`；`compiledField` 按表达式类型分发到
+`compileSymbol`/`compileCall`/`compileCountHll`（`query/compile.go:106-115`）。
+`CompileOptions` 由 `Prepare` 传入（`query/select.go:81-88`）。
+
+**流程**：
+
+```mermaid
+flowchart LR
+    A["influxql.ParseStatement"] --> B["query.Compile (compile.go:106)"]
+    B --> C["newCompiler + stmt.Clone"]
+    C --> D["preprocess：时间/分组/fill"]
+    D --> E["compile：字段表达式"]
+    E --> F{"表达式类型"}
+    F -->|"Call count_hll"| G["compileCountHll：1 个参数 (compile.go:787)"]
+    F -->|"其他 Call"| H["compileCall 分发"]
+    F -->|"VarRef/通配"| I["compileSymbol"]
+    G --> J["compiledStatement"]
+    H --> J
+    I --> J
+```
+
+**代码卡**：
+
+- `v1.12.3:query/compile.go:106-128`：`Compile`；`:118-127` 的 `defer recover` 只包住
+  `RewriteDistinct`/`RewriteTimeFields`/`RewriteRegexConditions`，**不包** `newCompiler`、`Clone`、
+  `preprocess`、`compile`。
+- `v1.12.3:query/compile.go:309-310` 字段级分发到 `count_hll`；`:787-793` 校验参数个数并置
+  `OnlySelectors=false`。
+- 旧版同位置没有 `count_hll` 分支、也没有 recover（`v1.8.10:query/compile.go:106-127`）。
+
+**案例（编译期 panic → 错误）**：输入
+`SELECT * FROM cpu WHERE ( host =~ /foo/ ^ other AND env =~ /bar/ ) and time >= now()-15m`。
+旧版在 `RewriteRegexConditions` 中把 `*influxql.BinaryExpr` 当 `*influxql.RegexLiteral` 断言，
+进程 panic；新版被 `:118` 的 recover 捕获，返回
+`likely malformed statement, unable to rewrite: interface conversion: ...`
+（测试期望见 `query/compile_test.go:364`）。注意：若 panic 发生在 `c.compile` 之前，recover
+尚未注册，仍由 `Executor.recover` 兜底（§7.8）。
+
+**风险**：`defer` 位置（§7.8）；`count_hll` 只接受 1 个参数，`SELECT count_hll(a,b)` 返回错误
+而不是 HLL；`OnlySelectors=false` 会影响 aux 字段校验（`compile.go:1019-1024`）。
+
+### 3.16 Select 层：`query/select.go` 的 `Prepare → buildCursor → Merge → Interval → Fill → Limit`
+
+**角色/owner**：`query.Select` 是 InfluxQL 查询的编排层：编译、准备 `IteratorCreator`、
+构建游标、套 merge/interval/fill/limit，最后交给 `Emitter`。它位于引擎层之上，
+不直接读 TSM/Cache。
+
+**结构**：`preparedStatement{stmt, opt, ic, columns, maxPointN, now}`；
+`exprIteratorBuilder` 持有 `IteratorCreator/sources/opt/selector/writeMode`；
+`valueMapper` 把字段表达式映射成列；`buildCursor` 负责时间列、aux 列和最终 `Cursor`。
+旧版结构相同（`v1.8.10:query/select.go:100-125`），差异只在错误返回和 `buildCallIterator` 的包装。
+
+**流程**：
+
+```mermaid
+flowchart TB
+    A["query.Select (select.go:91)"] --> B["Prepare -> Compile -> preparedStatement"]
+    B --> C["preparedStatement.Select (select.go:113)"]
+    C --> D["buildCursor (select.go:622)"]
+    D --> E{"valueMapper.calls 为空?"}
+    E -->|"是"| F["buildAuxIterator -> NewIteratorScanner -> scannerCursor"]
+    E -->|"否"| G["buildExprIterator -> buildCallIterator (select.go:214)"]
+    G --> H["引擎层 CreateIterator"]
+    H --> I["Iterators.Merge (iterator.go:122) -> NewMergeIterator (:172)"]
+    I --> J["Merge 内 NewCallIterator：count->sum、sum_hll->merge_hll (:150-164)"]
+    J --> K["NewIntervalIterator / NewFillIterator (select.go:568-570)"]
+    K --> L["NewLimitIterator (select.go:846/876)"]
+    F --> M["Emitter"]
+    L --> M
+```
+
+**代码卡**：
+
+- `Prepare`/`Select`（`:81-97`）、`preparedStatement.Select`（`:113-136`）、`buildCursor`（`:622`）；
+- `buildCallIterator` 先清空 `opt.Limit/opt.Offset`（`:214-218`），由外层统一套 limit；
+- `Iterators.Merge`（`query/iterator.go:122-164`）在 `count` 时把表达式改成 `sum`、
+  在 `sum_hll` 时改成 `merge_hll`；旧版只改 `count`（`v1.8.10:query/iterator.go:139-146`）。
+- `NewLimitIterator` 在 `buildAuxIterator`（`:846`）与 `buildFieldIterator`（`:876`）各有一处；
+  旧版对应 `:847`/`:877`。
+
+**案例**：§6.1 的 `GROUP BY time(24h, 12h)` DST 回退是本节 `NewIntervalIterator` 的数值推演；
+`SELECT count(value) FROM cpu GROUP BY host` 在 Select 层把每个 series 的 `count` 改写为
+`sum`：两个 shard 的同一 series 各输出 `count=3`、`count=2`，Merge 后得到 `5`，而不是
+对原始点重新计数。
+
+**风险**：① `defer em.Close()`（`coordinator/statement_executor.go:558`）丢弃 `Close` 返回值，
+`MergeIterator.Close` 的 `errors.Join`（`query/iterator.gen.go:161-173`）在 InfluxQL 内部
+调用点仍看不到；② `LIMIT/OFFSET` 是 per-series（引擎层 `newLimitIterator`，
+`tsdb/engine/tsm1/engine.go:3050-3056`），不是全局；③ `buildCallIterator` 清空 limit 后，
+若某个算子没有外层 limit 包装，LIMIT 语义会变化（当前所有路径都由 `buildCursor` 收口）。
+
+### 3.17 InfluxQL 迭代器引擎层：`tsdb/engine/tsm1/engine.go`（未重构）
+
+**角色/owner**：引擎层负责把 InfluxQL 的 `IteratorOptions` 变成每个 series 的点迭代器：
+索引定位 → `TagSets` → `createTagSetIterators` → 每个 series 包 `NewCallIterator` →
+同一 TagSet 内 `NewParallelMergeIterator`。它不负责跨 TagSet 的合并，也不做 interval/fill/limit 的最终收口。
+
+**两层边界**：
+
+```mermaid
+flowchart LR
+    subgraph ENGINE["引擎层（tsdb/engine/tsm1/engine.go）"]
+        A["createCallIterator (:2903)"] --> B["TagSets + LimitTagSets"]
+        B --> C["createTagSetIterators (:3093)"]
+        C --> D["每个 series: NewCallIterator (:2985)"]
+        D --> E["NewParallelMergeIterator (:2993)"]
+    end
+    subgraph SELECT["Select 层（query/select.go）"]
+        F["Iterators.Merge (iterator.go:122)"] --> G["NewMergeIterator (:172)"]
+        G --> H["NewCallIterator（count->sum / sum_hll->merge_hll）"]
+        H --> I["Interval -> Fill -> Limit -> Emitter"]
+    end
+    E --> F
+    E --> T["Cache + TSM KeyCursor（点迭代器）"]
+```
+
+**结构**：`TagSet`/`TagSets` 由索引返回；`createTagSetIterators` 为每个 series 建点游标；
+`NewParallelMergeIterator(inputs, opt, GOMAXPROCS(0))` 只并行化同一 TagSet 内的 series；
+`opt.Limit/Offset` 在 `Dimensions != GroupBy` 时下推到每个 series（`:3050-3056`）。
+
+**代码卡**：
+
+- `createCallIterator`（`:2903-3004`）：先 `MeasurementExists`，TSI 的 `_seriesKey` 快路径
+  可直接 `NewCallIterator(seriesIterator, opt)`；否则 TagSets → per-series Call → ParallelMerge。
+- 旧版相同位置：`v1.8.10:tsdb/engine/tsm1/engine.go:2515`、`:2575`、`:2583`。
+- `NewCallIterator` 的分发在 `query/call_iterator.go:39-60`（含 `sum_hll`/`merge_hll`）。
+
+**案例（数值）**：`SELECT count(value) FROM cpu GROUP BY host`，`host=a` 在 shard 1 有 3 点、
+在 shard 2 有 2 点，`host=b` 在 shard 1 有 4 点。
+
+- 引擎层：每个 `(shard, series)` 一个点迭代器，包 `count` 后分别得到 3、2、4；
+  `NewParallelMergeIterator` 在 TagSet 内合并。
+- Select 层：`Iterators.Merge` 把 `count` 改写为 `sum`（`query/iterator.go:150-156`），
+  同一 series 的 3+2=5，`host=b`=4；输出两行。
+- 若没有 Select 层的 `count→sum` 改写，两个 shard 的 count 会被再计数成 2，而不是 5。
+- DST 案例（完整推演见 §6.1）：`SELECT count(value) ... GROUP BY time(24h, 12h) tz('America/Los_Angeles')`，
+  2023-11-05 回退窗口旧版为 `[11-04T19:00Z, 11-05T19:00Z)`、收 24 点，新版为
+  `[11-04T19:00Z, 11-05T20:00Z)`、收 25 点；差异来自 `end += Offset` 放在 `Zone(end)`
+  之前（`query/iterator.go:857-866` vs 旧 `:864`）。
+
+**风险**：① 每个 TagSet 只在进入时检查一次 `InterruptCh`（`:2966-2972`），长 TagSet 内
+中断延迟取决于游标；② `NewParallelMergeIterator` 的 goroutine 数与 `GOMAXPROCS` 相关，
+series 很多时内存/调度压力在引擎层；③ per-series LIMIT 与用户直觉的全局 LIMIT 不同（主 03 §3.1）。
+
+### 3.18 `services/storage`：Flux 请求 → shard/SeriesCursor → `reads.ResultSet`
+
+**角色/owner**：`services/storage.Store` 实现 `reads.Store`，把 Flux 的
+`ReadFilter`/`ReadGroup`/`ReadWindowAggregate` 请求翻译成 shard ID、`SeriesCursor` 和
+`reads.ResultSet`。它位于 `storage/flux`（协议/表）与 `tsdb`（shard/索引）之间，
+是“谁把 Flux spec 变成 reads 请求”的唯一适配层。
+
+**结构**：`Store{TSDBStore *tsdb.Store, MetaClient, Logger}`；`indexSeriesCursor` 持有
+`sqry tsdb.SeriesCursor`、`fields`、`row reads.SeriesRow`、`cond/measurementCond`。
+关键方法：`ReadFilterLimit`（`store.go:126`）、`ReadGroupLimit`（`:177`）、
+`WindowAggregateLimit`（`:234`）、`findShardIDs`（`:63`）、`validateArgs`（`:88`）、
+`newIndexSeriesCursor`（`series_cursor.go:40`）。旧版对应 `v1.8.10:services/storage/store.go:109`（`ReadFilter`）、
+`:147`（`ReadGroup`）、`:60`（`findShardIDs`）、`:85`（`validateArgs`）、`series_cursor.go:40`。
+
+**代码卡**：`ReadFilterLimit`（`store.go:126-176`）的 `GetReadSource → validateArgs →
+findShardIDs → newIndexSeriesCursor → NewFilteredResultSet`；`ReadGroupLimit`（`:177-232`）
+的 `newCursor` 闭包；`WindowAggregateLimit`（`:234-277`）的降序判定；
+`indexSeriesCursor` 的谓词拆分（`series_cursor.go:64-100`）。
+
+**流程**：
+
+```mermaid
+flowchart TD
+    A["storage/flux.storeReader.Read*"] --> B["Store.ReadFilterLimit / ReadGroupLimit / WindowAggregateLimit"]
+    B --> C["GetReadSource + validateArgs (:88)"]
+    C --> D["findShardIDs (:63)"]
+    D --> E{"len(shardIDs)==0?"}
+    E -->|"是"| F["return (nil, nil)"]
+    E -->|"否"| G["newIndexSeriesCursor (:40)"]
+    G --> H["tsdb.CreateCursorIterators"]
+    H --> I["reads.NewFilteredResultSet / NewGroupResultSet / NewWindowAggregateResultSet"]
+```
+
+**三条兄弟路径**：
+
+| 路径 | 入口 | 方向/结果集 |
+|------|------|-------------|
+| `ReadFilterLimit` | `store.go:126-176` | `findShardIDs(..., false, ...)` → `NewFilteredResultSet` |
+| `ReadGroupLimit` | `store.go:177-232` | `descending := !IsAscendingGroupAggregate` → `NewGroupResultSet`（`newCursor` 闭包可重复建 cursor） |
+| `WindowAggregateLimit` | `store.go:234-277` | `descending := !IsAscendingWindowAggregate` → `NewWindowAggregateResultSet` |
+
+**案例（shard 内容 → SeriesCursor → 结果行）**：
+
+- **输入**：`filter(fn:(r)=>r.host=="web" and r._value>50)`，时间范围内有两个 shard：
+  shard 3 含 `(cpu,host=web,_value=60)`、`(cpu,host=web,_value=70)`、
+  `(cpu,host=db,_value=80)`；shard 4 含 `(cpu,host=web,_value=90)`。
+- **步骤与数值**：
+  1. `validateArgs` 补默认 RP；`findShardIDs` 按时间范围返回 `[3,4]`
+     （`services/storage/store.go:63-86`、`:126-150`）。
+  2. `newIndexSeriesCursor` 调 `NodeToExpr` 得到 `host=="web" and _value>50`；
+     `HasFieldKeyOrValue` 置 `hasValueExpr=true`，于是
+     `measurementCond = RewriteExprRemoveFieldValue(cond) = host=="web"`，
+     `opt.Condition = RewriteExprRemoveFieldKeyAndValue(cond) = host=="web"`；
+     每行再 `Reduce` 成 `ValueCond = "$ > 50"`（`$` 是存储层的字段占位符，
+     即 `_value > 50`；host 已由索引过滤）
+     （`services/storage/series_cursor.go:64-100`、`:198-207`）。
+  3. `ReadFilterLimit` 返回 `NewFilteredResultSet`。
+- **预期输出**：3 行 `(web,60)(web,70)(web,90)`；db/80 被 `host=="web"` 排除。
+- **空 shard**：`findShardIDs` 返回 `[]` → `ReadFilterLimit` 返回 `(nil, nil)`，
+  `storage/flux.filterIterator.Do` 直接 `return nil`（`store.go:150-153`、
+  `storage/flux/reader.go:151-154`）。
+- **错误**：`ReadSource==nil` → `missing read source`；db/RP 不存在 → `validateArgs` 错误；
+  `NodeToExpr` 失败 → `newIndexSeriesCursor` 返回错误（`series_cursor.go:67`）。
+- **源码**：`services/storage/store.go:126-176`、`services/storage/series_cursor.go:40-100`。
+
+**风险**：① 空 shard/空 cursor 都折叠成 `(nil, nil)`，上层无法区分“没数据”和“读失败”；
+② `ReadGroupLimit` 的 `newCursor` 每次调用都重建 series cursor，group 数多时开销在适配层；
+③ 谓词拆分依赖 `HasFieldKeyOrValue` 与 `RewriteExprRemove*`。若表达式含 `OR` 且某个分支是
+字段/值条件，例如 `host='web' OR _value>50`，`RewriteExprRemoveFieldValue` 会把 `_value>50`
+分支替换为 `true`（`storage/reads/influxql_predicate.go:224-236`），`Reduce` 后
+`measurementCond` 为 `true` → 置 nil（`services/storage/series_cursor.go:74-77`），
+**不再按 measurement 过滤**（索引需遍历范围内所有 measurement 的 series）；tag 条件仍在
+`opt.Condition` 中，最后由每行 `ValueCond` 过滤。只有纯 tag 的 `AND` 条件能完整下推到索引。
+
+### 3.19 数组游标跨包契约：`storage/reads` ↔ `tsm1` ↔ `storage/flux`
+
+**角色/owner**：`tsdb/cursors` 是 `storage/reads` 与 `tsm1` 之间的共享类型契约；
+`storage/reads/array_cursor*` 负责类型分发、时间范围和结果集；
+`tsdb/engine/tsm1/array_cursor*` 负责 `KeyCursor`→数组；`storage/flux` 负责
+`row.Query`→表。三层的所有权不同，错误传播也不同。
+
+**结构**：
+
+- 5 种数组（Float/Integer/Unsigned/String/Boolean）加三列 `MeanCountArray`
+  （`tsdb/cursors/arrayvalues.go:5-9`）；`MeanCountArrayCursor`（`cursor.go:42-45`）。
+- `CursorRequest.StartTime`/`EndTime` 都是 **inclusive**（`cursor.go:64-71`）；
+  `storage/reads` 构造请求时把 `[start, stop)` 转成 `[start, stop]`（`array_cursor.go:78-90`）。
+- `tsdb/cursors/arrayvalues.gen.go:29-34` 等 6 处的 `Len()` 是 nil-safe；这是防御性契约，
+  不是“任意 nil 数组都可当空数组消费”。
+
+**代码卡**：`MeanCountArray`（`tsdb/cursors/arrayvalues.go:5-9`）、
+`CursorRequest` 的 inclusive 注释（`cursor.go:64-71`）、tsm1 `reset` 返回 error
+（`tsdb/engine/tsm1/array_cursor.gen.go:42-61`）；旧版 `reset` 无返回值、读块错误 `_` 丢弃
+（`v1.8.10:tsdb/engine/tsm1/array_cursor.gen.go:41-53`）。
+
+**流程**：
+
+```mermaid
+flowchart LR
+    A["storage/flux row.Query"] --> B["tsdb.CreateCursorIterators"]
+    B --> C["tsm1 arrayCursorIterator.Next(CursorRequest)"]
+    C --> D["floatArrayAscendingCursor.reset (array_cursor.gen.go:42)"]
+    D --> E["KeyCursor.ReadFloatArrayBlock"]
+    E --> F["cursors.FloatArray"]
+    F --> G["storage/reads newAggregateArrayCursor / window cursor"]
+    G --> H["storage/flux colReader -> Table"]
+```
+
+**跨包所有权与错误表**：
+
+| 层 | 负责 | 错误行为 |
+|----|------|----------|
+| `storage/reads/array_cursor.go:20-56` | 聚合分发：first/last→limit，其余→window | `NewWindowAggregateArrayCursor` 的 min/max default 分支 panic（`gen.go:158`/`:175`） |
+| `storage/reads/array_cursor.go:78-90` | `[start,stop)` → `[start,stop]` | 无错误 |
+| `storage/reads/array_cursor.go:118-128` | multiShard `createCursor` | `cur==nil \|\| err!=nil` → nil，错误被折叠 |
+| `tsm1/array_cursor.gen.go:42-61` | reset 首块读取 | 返回 `error` |
+| `tsm1/array_cursor.gen.go:113` | 优化快路径 | 追加 `c.tsm.pos == 0`（#26691） |
+| `tsm1/array_cursor.gen.go:190-215` | 降序 reset | `sort.Search(...)` 后 `-1` |
+| `tsm1/array_cursor.gen.go` 的 `nextTSM` | 后续块读取 | 仍 `_` 丢弃；10 个游标的 `Err()` 恒 nil |
+| `storage/flux/reader.go:183-186` | nil cursor | 当作“该 series 没数据”继续 |
+
+**案例（#26691，跨包契约视角）**：
+
+- **输入/步骤**：完整输入与逐步数值见 §3.14(a)。本层只关心所有权：
+  `storage/flux` 通过 `tsdb.CreateCursorIterators` 拿到 `tsm1.arrayCursorIterator`，
+  后者的 `Next(CursorRequest)` 调用 `floatArrayAscendingCursor.reset/Next`；
+  `reset` 只检查首块读错误，后续块仍走 `nextTSM` 的 `_` 丢弃路径。
+- **输出**：第 1 次 `Next()` 返回 1000 点（cache 995 + TSM 5），第 2 次旧版返回 8 点
+  （5 个重复）、新版返回 3 点；累计唯一时间戳 1003。跨包可见的差异只有“重复”，
+  上层 `storage/flux` 的 `colReader` 会照原样把重复时间戳写进表，不会去重。
+- **源码**：`storage/reads/array_cursor.gen.go`（本层不归并，只消费数组）、
+  `tsdb/engine/tsm1/array_cursor.gen.go:107-138`、`:190-260`；
+  回归测试 `tsdb/engine/tsm1/array_cursor_optimization_bug_test.go:20-140`。
+
+**风险**：① 错误只在 `reset()` 首块被检查，后续块仍丢弃，`Err()` 恒 nil；② `createCursor`
+在 `cur==nil || err!=nil` 时返回 nil，filter/group 结果集把错误折叠成“无数据”；
+③ `arrayCursorIterator` 对每种 (类型, 方向) 只缓存一个 cursor（`array_cursor_iterator.gen.go:23-38`）；
+`reset()` 覆盖 `c.cache.values`、`c.tsm.values`（复用 `c.tsm.buf`）与 `c.tsm.keyCursor`，`Next()` 复用并覆盖 `c.res`
+（`array_cursor.gen.go:42-58`、`:78-84`）；`KeyCursor.key` 直接别名 `q.key[:0]`，下一次
+`seriesFieldKeyBytes` 会改写（`array_cursor_iterator.go:79-83`）。因此返回数组与 `KeyCursor`
+只在**本次 `Next()` 返回后到下一次 `Next()` 前**有效；违约后果：数组被下一批覆盖（读到错值）、
+tombstone 按错 key 查（删错点）。消费方要么在回调内消费，要么 `copy`。见主 08 §2.3/§9.4。
+
 
 ---
 
@@ -1069,8 +1696,12 @@ c.res.Values0[pos] = float64(sum) / float64(count)
 ### 4.4 时间范围少读一个点（#21347）
 
 `EndTime = end - 1`（`storage/reads/array_cursor.go:90`）让底层闭区间恰好等价于
-Flux 的 `[start, stop)`。旧版多包含一个边界点，除了语义错误，还可能让
-`pos -= 2` 裁剪逻辑多走一轮。收益是“正确性 + 少量无效读取”，不是数量级。
+Flux 的 `[start, stop)`。旧版 `EndTime=end`，因此每条 series 的每次 cursor 请求
+**最多多返回 1 个点**（恰好 `t==stop` 的那个点）；裁剪循环只对 `> c.end` 的点执行
+（`v1.8.10:tsdb/engine/tsm1/array_cursor.gen.go:137-143`），旧版 `end=stop` 时该点不进入裁剪，
+新版 `end=stop-1` 时才把它裁掉。所以收益是“正确性 + **≤1 点/请求**”，不存在旧版多走一轮裁剪；
+读取块数不变（block 仍整体解码），是常数级收益，不是数量级。实测口径：同一 block 内放
+`stop-1/stop/stop+1` 三个点，记录 `Next()` 返回数组与 `pos`。
 
 ### 4.5 谓词转换前移
 
@@ -1092,10 +1723,12 @@ Flux 的 `[start, stop)`。旧版多包含一个边界点，除了语义错误�
 
 ### 4.7 常量内存基数估计（#20603 / #20745）
 
-HLL sketch 的大小只与精度参数有关，与 series 数无关。对
-`SHOW SERIES CARDINALITY FROM ...` 这类查询，旧版 `count(distinct(_seriesKey))`
-需要把 distinct 集合放在内存里（最坏 O(series)），新版是 O(1) sketch。
-代价是**结果变成近似值**（见第 5 节）。
+HLL sketch 的大小只与精度参数有关，与 series 数无关：p=16 时单个 shard 的 sparse sketch
+为 318B/465B（100/150 key），任一 `Merge` 后统一为 **65543B**（`pkg/estimator/hll/hll.go:33`）。
+对 `SHOW SERIES CARDINALITY FROM ...` 这类查询，旧版 `count(distinct(_seriesKey))`
+需要把 distinct 集合放在内存里（最坏 O(series)）；新版每个 shard 持有一个 sketch，
+非 EXACT 查询的峰值 = 同时持有的 sketch 数 × 65543B，sketch 数 ≤ shard 数，
+因此**相对 series 数是 O(1)，相对 shard 数不是**。代价是**结果变成近似值**（见第 5 节）。
 
 ### 4.8 索引级 `SHOW FIELD KEY CARDINALITY`（#23871）
 
@@ -1130,19 +1763,19 @@ HLL sketch 的大小只与精度参数有关，与 series 数无关。对
 | `ReadFilterSpec.Predicate` 类型 | `*semantic.FunctionExpression` | `*datatypes.Predicate` | **外部实现编译失败** | 改用 `ToStoragePredicate` 在计划期转换 |
 | `Reader` 接口 | 5 个方法（含 Close） | 6 个（+`ReadWindowAggregate`），alloc 变接口 | **编译失败** | 实现新方法；`memory.Allocator` 用接口值 |
 | `Store.GetSource` 返回类型 | gogo `proto.Message` | protobuf-go `proto.Message` | **编译失败** | 换 import；线格式不变 |
-| 游标 stop 边界 | 可能包含 stop 点 | 不含 | **边界结果变化** | 依赖“含 stop”的查询需改 `range`/条件 |
+| 游标 stop 边界 | Flux `ReadFilter`/`ReadGroup` 必返回 `t==stop` 的点 | `EndTime=stop-1`，必不返回 | **边界结果变化（仅 Flux）**；InfluxQL 不走 `storage/reads`，两版相同 | 只有 Flux `range(stop:...)` 且 stop 上有数据点的查询会少一个点 |
 | `SHOW SERIES CARDINALITY FROM ...` | 精确 | HLL 近似 | **结果数值变化** | 需要精确时加 `EXACT` |
 | `SHOW TAG VALUES FROM "db"."rp"."m"` | 扫描所有 RP | 只扫指定 RP；多 RP 报错 | **结果变化/报错** | 去掉多 RP；不写 RP 仍跨所有 RP |
 | `SHOW TAG KEYS ... WITH KEY` | 语法不支持 | 支持 | 不会（新增能力） | — |
 | `SHOW MEASUREMENTS ON *.*` / `ON db.*` | 语法不支持（`ON` 后必须是标识符） | 支持通配库/RP | 不会（新增能力） | —；见 `v1.12.3:coordinator/statement_executor.go:733`-`:770`、`611a4370a2` #22388 |
-| `SHOW FIELD KEY CARDINALITY` | 扫数据 | 走 `_fieldKeys` 索引 | 通常更准/更快；索引不完整时可能不同 | 确认 TSI 索引健康 |
+| `SHOW FIELD KEY CARDINALITY` | 扫数据块得到 field key 集合 | 读 `_fieldKeys` 系统迭代器（`fieldKey`/`fieldType`） | 索引与数据一致时**结果相同**；索引陈旧/损坏时新版返回索引集合、旧版返回数据集合，差异方向取决于索引状态，不能称“更准”；新版不分配测量 cursor、不读 TSM/cache，但**未做基准，不能称“更快”** | 索引陈旧时先重建/确认 TSI 健康 |
 | 窗口 `mean`（区间内新增能力） | v1.8.10 无窗口下推 | 初版 float64 累加，现 int64 累加 | **大整数结果更准** | 无需迁移 |
 | `SHOW QUERIES` 列 | 5 列 | 6 列（+user） | 严格按列数解析的客户端会坏 | 按列名解析 |
 | `SHOW QUERIES` 可见性 | 非管理员可见他人库 | 只看有 READ 权限的库 | **行为收紧** | 预期之内 |
 | 多语句错误结果 | 数量/ID 错 | 每条剩余语句一条 | 客户端结果对齐逻辑变化 | 按 `StatementID` 对齐 |
 | `MergeIterator.Close` | 恒 nil | `errors.Join` 返回合并错误 | InfluxQL 内部调用点仍丢弃（`defer em.Close()`，`statement_executor.go:558`） | 直接使用 `query` 包的代码需检查 `Close()` 返回值 |
 | `Iterators.Close` | nil 元素 panic | 跳过 nil，返回首个错误 | 不会 | — |
-| 编译畸形语句 | panic（进程可能崩） | 返回错误 | 更好 | — |
+| 编译畸形语句 | `Compile` 内 panic 冒泡到 `Executor.recover`，返回 `StatementID=-1` 的错误结果；仅 `INFLUXDB_PANIC_CRASH=true` 时进程退出 | `Compile` 的 rewrite 阶段局部 recover，返回“likely malformed statement”错误 | 错误位置更靠近编译期，不是“从崩溃变为不崩溃” | — |
 | `max-select-point` 错误文案 | `exceeed` | `exceeded` | 匹配旧文案的告警规则会失效 | 更新正则 |
 | EXPLAIN / EXPLAIN ANALYZE / InfluxQL 错误消息 | 浮点字面量旧格式化精度 | influxql v1.4.1 新精度 | 输出文本变化；按字面量比对 EXPLAIN 或错误串的测试/告警会失配 | 更新期望值；结果类型不变（`8648298012` #24764、`77d6f20894` #26181、`v1.12.3:go.mod:23`） |
 | proto 生成代码的 Go 常量名 | `FrameTypePoints`/`DataTypeFloat`/`HintNone`/`GroupBy` 等 | `<Message>_<Enum>_<Value>` 前缀（如 `ReadResponse_FrameTypePoints`）；`TimestampRange` 变指针 | **源码不兼容** | 按新常量名重编译；取 range 前判空（`v1.12.3:storage/reads/datatypes/storage_common.pb.go:32`、`:81`、`:141`、`:199`） |
@@ -1163,11 +1796,14 @@ HLL sketch 的大小只与精度参数有关，与 series 数无关。对
    只是不启用，同样不会走 `storage/flux`。
 3. **线格式与 Go API 要分开看**：proto 字段号未变（gogo→protobuf-go 只是生成器），
    但 Go 类型/枚举名/接口签名变了。**二进制兼容、源码不兼容**。
-4. **错误语义更“显式”，默认配置下没有性能回退的证据**：编译器 panic 变错误、
-   窗口聚合结果集的错误会上抛（filter/group 路径仍会吞错，见 §7.1/§7.2）、Close 错误返回；
-   控制器默认不限制、聚合下推是纯增量，
-   唯一可能是 `ReadGroup` 与 `WindowAggregate` 的 `last()` 单窗口路径反转 shard 顺序
-   （`services/storage/store.go:195`、`:252`），对非 `last` 查询没有影响。
+4. **错误语义更“显式”，但不能断言没有性能回退**：编译器 panic 变错误、
+   窗口聚合结果集的错误会上抛（filter/group 路径仍会吞错，见 §7.1/§7.2）、Close 错误返回。
+   本文**没有 v1.8.10 vs v1.12.3 的查询基准**，因此不能写“默认配置下没有性能回退”。
+   已识别的机制级开销：① 每个 Flux 查询安装 `memory.ResourceAllocator`，每次申请走
+   CAS 循环（`query/control/memory.go:73-116`）；② 新版控制器状态机与新增指标；
+   ③ 可确认的语义变化是 `ReadGroup` 与 `WindowAggregate` 的 `last()` 单窗口路径反转 shard 顺序
+   （`services/storage/store.go:195`、`:252`），它只改变扫描方向，对非 `last` 查询无影响。
+   需要结论时应按 §4 口径做基准，而不是写“唯一可能”。
 
 ---
 
@@ -1277,6 +1913,25 @@ from(bucket: "mydb/autogen")
 **注意**：如果下游依赖“原始点表”做 `keep()`/`map()`，下推后表里只有窗口值，
 但这是 Flux 语义本身决定的（`aggregateWindow` 的输出就是窗口值），不是 1.x 的额外变化。
 
+**数值案例（1 分钟窗口、3 个窗口）**：
+
+- **输入**：`range(start: 10:00:00, stop: 10:03:00)`，点
+  `(10:00:00,1)(10:00:20,2)(10:00:40,3)(10:01:00,4)(10:01:30,6)(10:02:00,8)`。
+- **步骤与输出**：窗口 `[10:00,10:01)` → mean `(1+2+3)/3=2`；`[10:01,10:02)` →
+  `(4+6)/2=5`；`[10:02,10:03)` → `8`。`aggregateWindow` 的 `TimeColumn=_stop`，表列是
+  `_start,_stop,_time,_value`，`_time` 等于窗口 stop，三行：
+  `(10:00,10:01,10:01,2)`、`(10:01,10:02,10:02,5)`、`(10:02,10:03,10:03,8)`。
+- **边界**：Flux 的 `range(start, stop)` 是 `[start, stop)`，`storage/reads` 把请求改成
+  `EndTime=stop-1`（`storage/reads/array_cursor.go:78-90`），所以恰好 `10:03:00.000` 的点
+  不参与；`10:00:00.000` 的点属于第一个窗口。
+- **对照**：若用 `window(every:1m) |> mean()`（`TimeColumn==""`），`splitWindows` 会把
+  一张表拆成 3 张表，每张列为 `_start,_stop,_value`（无 `_time`）；`aggregateWindow`
+  （`TimeColumn=_stop`）不拆表，产出一张 3 行表并带 `_time`
+  （`storage/flux/reader.go:694-700`、`storage/flux/table.gen.go:299-310`、
+  `storage/flux/reader.go:410-452`）。
+- **源码**：`flux/stdlib/influxdata/influxdb/rules.go:676-742`、
+  `storage/reads/array_cursor.gen.go` 的窗口 mean 游标、`storage/flux/table.gen.go:117`。
+
 ---
 
 ## 7. 仍存在的风险
@@ -1349,9 +2004,12 @@ Flux v0.196.1 的 `builtin min/max` 也没有类型约束（`universe.flux:1822`
 只覆盖查询协程。注意 `execute/recover_debug.go` 在 `debug` 构建标签下把 recover 变成空实现——
 debug 构建里该 panic 会直接崩进程。
 
-`v1.12.3:storage/flux/table.gen.go:3791`/`:4710` 的 `EInvalid` 分支对 min/max 基本不可达：
-游标在 `windowAggregateResultSet.createCursor`（`aggregate_resultset.go:119`-`:133`）与
-`groupByCursor.createCursor`（`group_resultset.go:352`-`:357`）就已 panic。
+`v1.12.3:storage/flux/table.gen.go:3791`/`:4710` 的 `EInvalid` 分支（min/max + String/Boolean）
+在这两条路径上**不可达**：`windowAggregateResultSet.createCursor`（`aggregate_resultset.go:119-133`）
+与 `groupByCursor.createCursor`（`group_resultset.go:352-357`）先调用
+`newWindowMin/MaxArrayCursor`，对非 float/int/uint 游标在 `storage/reads/array_cursor.gen.go:157-160`
+/`:174-177` 直接 `panic("unsupported for aggregate min/max")`，不会把 `EInvalid` 返回给表生成器。
+只有 `createCursor` 返回错误而非 panic 的路径（如 sum/mean）才会走到 `EInvalid`。
 
 ### 7.4 内存配额只增不减
 
@@ -1387,12 +2045,29 @@ flux v0.196.1 的 `ResourceAllocator.Free` 只减 `bytesAllocated`、**不回调
 - 因此 0 值一律表示“不限制”，且不保证校验能发现危险组合；生产环境应把
   `query-concurrency`、`query-queue-size`、`total-max-memory-bytes`、
   `query-max-memory-bytes`（及 `query-initial-memory-bytes`）一起配置。
-- `ConcurrencyQuota`/`QueueSize` 是 `int32`，注释自己承认极大值会导致 OOM
-  （`controller.go:72`-`:76`、`:98`-`:108`）。
+- `ConcurrencyQuota`/`QueueSize` 是 `int32`，实际边界写在源码注释里：`ConcurrencyQuota` 受
+  WaitGroup delta 限制为 `math.MaxInt32`（`controller.go:72-76`）；`QueueSize` 的
+  `make(chan *Query, N)` 在 `N > 1<<45-12` 时 panic，取 `1<<45-12` 会立即 OOM，
+  `math.MaxInt32` 在作者本机可启动（`controller.go:98-108`）。两者都没有编译期/启动期上限校验，
+  危险值只靠 OOM/panic 暴露。
+
+**端到端失败案例（`query-concurrency=1`、`query-queue-size=1`、3 个并发查询）**：
+
+| 查询 | 路径 | 结果 |
+|------|------|------|
+| Q1 | `tryExec` 成功 → `Executing` | 占用唯一的执行槽 |
+| Q2 | `enqueueQuery` → 队列（深度 1）→ worker 稍后 `tryExec` | 在队列中等待 |
+| Q3 | `enqueueQuery` 时队列已满 | `codes.ResourceExhausted`（“queue length exceeded”，`controller.go:386-424`） |
+| Q2 客户端断开 | `Cancel()` 取消父 ctx → `pump` 观察 `done` → `exec.Cancel()`；随后 `Done()` | `State()` 在 `Done()` 前对外报告 `Canceled`；`Done()` 内部转 `Finished` 并继续排空结果（`:896-930`、`:694-719`、`:735-760`） |
+| 任一查询 `RequestMemory` 超过单查询硬上限 | `q.limit+want > memoryBytesQuotaPerQuery` | `errors.New("query hit hard limit")`，查询转 `Errored`（`memory.go:73-116`） |
+
+状态迁移为 `Created → Compiling → Queueing → Executing → Canceled/Errored/Finished`；
+队列满/内存硬上限都是**显式返回码**，不是静默排队或 OOM。
 
 ### 7.6 HLL 的误差与“吞错”
 
 - `count_hll` 对**长度合法但内容非法**的 sketch 返回 0（`query/functions.go:2256`-`:2262`），
+  具体输入/输出对照见 §3.5 的“非法 sketch 边界”表；
   `unmarshalPlus` 的错误被丢掉，查询不会失败。但 `unmarshalPlus` 直接切片
   `s[:len(hllPrefix)]` / `s[:len(hllErrorPrefix)]`（`query/functions.go:2170`-`:2173`）：
   `len(s) < 4`，或 `4 <= len(s) < 9` 且前缀不是 `HLL_`（`hllErrorPrefix` 是 9 字节）时**越界 panic**。
@@ -1429,8 +2104,11 @@ func (q *Query) ProfilerResults() (flux.ResultIterator, error) {
 	p := q.program.(*lang.AstProgram)
 ```
 
-如果 compiler 不是 `lang.AstProgram`（自定义 Compiler / 测试 mock），
-这里会 panic。该接口只在 profiling 路径调用，影响面小，但属于“新控制器引入的隐式契约”。
+仓库内 `ProfilerResults` 只有 `Query` 的实现与测试 mock（`query/encode_test.go:139`），
+无业务调用点。该方法**先**断言 `q.program.(*lang.AstProgram)`，**再**检查 `len(p.Profilers)`
+（`controller.go:608-612`），所以只要调用方（Flux 运行时 profiling 路径）调用它、而 compiler
+不是 `lang.AstProgram`（自定义 Compiler），即使没有 profiler 也会 panic。影响面取决于是否存在
+这样的调用方，不是由 profiler 数量决定；这属于“新控制器引入的隐式契约”。
 
 ---
 

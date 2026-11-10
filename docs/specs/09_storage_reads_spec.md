@@ -365,7 +365,7 @@ flowchart TD
     C --> D["findShardIDs<br/>store.go:63-86"]
     D --> E{"len(shardIDs)==0?"}
     E -->|"是"| F["return (nil, nil)"]
-    E -->|"否"| G["newIndexSeriesCursor<br/>series_cursor.go:33"]
+    E -->|"否"| G["newIndexSeriesCursor<br/>series_cursor.go:40"]
     G --> H["reads.NodeToExpr<br/>series_cursor.go:65"]
     H --> I{"HasFieldKeyOrValue?"}
     I -->|"否"| J["opt.Condition = cond<br/>measurementCond = cond"]

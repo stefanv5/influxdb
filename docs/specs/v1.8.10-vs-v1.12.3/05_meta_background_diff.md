@@ -4,14 +4,14 @@
 > - OLD（旧）: `v1.8.10` = commit `688e697c51`（2021-10-11）
 > - NEW（新）: `v1.12.3` = commit `f3d5cb68ab`（本仓库 `docs/specs/` 的代码基准）
 > - 区间: 527 commits / 602 files / +79,310 −45,239；当前工作树只额外包含若干 docs 提交（数量随文档演进），代码相同。
-> - 本文覆盖: `services/meta/*`、`services/retention/*`、`services/continuous_querier/*`、`services/precreator/*`、`services/snapshotter/*`、`services/subscriber/*`、`tsdb/store.go` 的 shard 删除/修剪路径、`tsdb/engine/tsm1/file_store.go` 的 purger、`coordinator` 中与 CQ/RP/写入编排相关的部分。
+> - 本文覆盖: `services/meta/*`、`services/retention/*`、`services/continuous_querier/*`、`services/precreator/*`、`services/snapshotter/*`、`services/subscriber/*`、`tsdb/store.go` 的 shard 删除/修剪路径、`tsdb/engine/tsm1/file_store.go` 的 purger（仅 retention 交互摘要，owner 04）、`coordinator` 中与 CQ/RP/写入编排相关的部分。
 > - 旧版本证据统一来自 `git show v1.8.10:<path>`；新版本证据来自当前工作树。
 
 > **小白导读**
 > 1. **meta 的"户口本"流程没变**：改数据永远是"复印一份 → 在复印件上改 → 整本重新誊写并盖章（fsync+rename）→ 换掉正本 → 按铃通知所有人"。这一套在 v1.8.10 和 v1.12.3 里逐字相同，变的是"复印/誊写"用哪套序列化工具，以及"什么时候允许撕掉一页"。
 > 2. **`meta.pb.go` 那 5000 多行 diff 不是重写业务**：它是把代码生成器从 `protoc-gen-gogo` 换成官方 `protoc-gen-go`，消息类型和命令号一个没改，只有 `RetentionPolicySpec`/`RetentionPolicyInfo` 各多了两个 `int64` 字段（写入窗口）。
 > 3. **最关键的修复发生在"删除顺序"上**：旧版 retention 是"软删除（写 DeletedAt）→ 尝试删磁盘 → 14 天后无条件修剪"，磁盘删失败也照修；一旦搬家（删磁盘文件）失败或延迟，meta 里已经没有这条记录，磁盘上的 shard 目录就永远没人认领——也就是"孤儿文件"。新版反过来：**先删磁盘、再从 meta 摘掉 shard 引用；meta 里只要还剩 shard，就绝不修剪这个 shard group**。
-> 4. **旧版删除大 shard 会"一条 series 一次 fsync"**，几十万 series 时 retention 会看起来像卡死；新版把 fsync 攒到"每个 series-file 分区一次"，并且每删 1 万条打一行进度日志（#27114）。
+> 4. **旧版删除大 shard 要"一条 series 一次 flush"（只刷用户态缓冲，不 fsync）**，几十万 series 时 retention 会看起来像卡死；新版把 flush 攒到"每个 series-file 分区一次"，并按分区补 fsync（≤8 次），且每删 1 万条打一行进度日志（#27114）。
 > 5. **旧版删 shard 可能被"正在读它的查询"永久卡住**，整个 retention 循环停在 `Shard.Close()` 上；新版先"禁止新读者进入"，再检查"还有没有人在读"，有人读就跳过、下轮再来（#25055）。
 > 6. **purger 从"一个人拿着大门钥匙锁住整栋楼干活"变成"用带锁的格子柜"**：旧版在整个扫描+关闭+删除期间持有 `purger.mu` 写锁，会把 `FileStore` 的提交路径一起拖住；新版换成 `sync.Map` + 极短临界区。
 
@@ -21,7 +21,7 @@
 |---|--------|---------|---------|------|------|
 | 1 | meta 提交骨架 `commit()` | Clone→snapshot→换 cache→`close(changed)` | **逐字未变** | 无 | `v1.8.10:services/meta/client.go:964` / `v1.12.3:services/meta/client.go:948` |
 | 2 | meta 落盘 `snapshot()` | tmp→Write→Sync→Close→RenameFile | **逐字未变** | 无 | `v1.8.10:services/meta/client.go:997` / `v1.12.3:services/meta/client.go:981` |
-| 3 | Lease | OSS 恒成功、内存对象 | **逐字未变** | 无 | `v1.8.10:services/meta/client.go:128` / `v1.12.3:services/meta/client.go:127` |
+| 3 | Lease | OSS 恒成功、内存对象、`Owner=0`、无持久化 | **逐字未变** | 唯一调用方是 CQ；多进程不互斥（3.1c） | `v1.8.10:services/meta/client.go:128` / `v1.12.3:services/meta/client.go:127` |
 | 4 | `meta.pb.go` 生成器 | `protoc-gen-gogo`（2864 行，手写 Marshal） | `protoc-gen-go v1.34.1 / protoc v5.29.2`（4293 行，protoreflect） | 线格式兼容；序列化路径与文件体积变化 | `v1.8.10:services/meta/internal/meta.pb.go:1` / `v1.12.3:services/meta/internal/meta.pb.go:1` |
 | 5 | RP 写入窗口字段 | 无 | `FutureWriteLimit=5/7`、`PastWriteLimit=6/8` | 新 SQL 语法、meta.db 新增字段、写路径丢点判定 | `v1.8.10:services/meta/internal/meta.proto:43` / `v1.12.3:services/meta/internal/meta.proto:47` |
 | 6 | `CreateShardGroup` 边界 | 直接 `Truncate`，允许重叠 | 与已有 shard group 求差集，保证不重叠 | 同时间戳可能落到不同起止时间的组 | `v1.8.10:services/meta/data.go:358` / `v1.12.3:services/meta/data.go:382` |
@@ -35,7 +35,7 @@
 | 14 | 坏 shard 记忆 | 无（`Store` 无此字段） | `badShards shardErrorMap` | 启动不再对同一 shard 反复 Open | `v1.8.10:tsdb/store.go` 无 `badShards` / `v1.12.3:tsdb/store.go:462` |
 | 15 | `DeleteSeries` 锁 | 手工 `RUnlock` 分支 | 闭包 + `defer RUnlock` | 消除 RLock 泄漏（#26647） | `v1.8.10:tsdb/store.go:1302` / `v1.12.3:tsdb/store.go:1657` |
 | 16 | CQ 调度 / DST / SELECT INTO 写回 | `truncate` + `shouldRunContinuousQuery` | 调度与 DST **逐字未变**；写回走 `PointsWriter`，本区间新增写窗口 | 调度不变；设置 `PAST/FUTURE LIMIT` 时 CQ 补算点可能被丢弃并计 `QueryFail`（§3.15） | `v1.8.10:services/continuous_querier/service.go:547` / `v1.12.3:services/continuous_querier/service.go:559`；`v1.12.3:coordinator/points_writer.go:211-245` |
-| 17 | `/debug/vars` 的 `cq` | 整个 `models.Statistic`（含 name/tags） | 只输出 `Values` 扁平 map | 监控解析格式变化（#26874） | `v1.8.10:services/httpd/handler.go:1479` / `v1.12.3:services/httpd/handler.go:2452` |
+| 17 | `/debug/vars` 的 `cq` | 整个 `models.Statistic`（含 name/tags） | 只输出 `Values` 扁平 map | 监控解析格式变化（#26874）；输出/截断细节 owner 06 §3.12 | `v1.8.10:services/httpd/handler.go:1479` / `v1.12.3:services/httpd/handler.go:2452` |
 | 18 | `SHOW RETENTION POLICIES` | 5 列 | 7 列（新增 future/past write limit） | 客户端列解析需适配 | `v1.8.10:coordinator/statement_executor.go:787` / `v1.12.3:coordinator/statement_executor.go:862` |
 | 19 | subscriber | `points chan` 直发 + 每订阅 `chanWriter` | `subscriptionRouter` + 字节配额（`total-buffer-bytes`） | 重写；新增配置与 `memUsage` 指标 | `v1.8.10:services/subscriber/service.go:233` / `v1.12.3:services/subscriber/service.go:608` |
 | 20 | precreator / snapshotter | — | 无功能变化（仅 `ioutil`→`io`） | 无需迁移 | `git diff v1.8.10 HEAD -- services/precreator` 为空 / `v1.12.3:services/snapshotter/client.go:53` |
@@ -51,6 +51,7 @@ flowchart TB
         PB["internal.Data protobuf"]
         DISK["磁盘 meta.db / meta.dbtmp"]
         CH["changed chan struct{}"]
+        SNP["snapshotter.updateMetaStore"]
     end
     subgraph RET["services/retention"]
         DC["Service.DeletionCheck"]
@@ -75,6 +76,8 @@ flowchart TB
     MD -->|"proto.Marshal"| PB
     SNAP -->|"rename(2) 原子替换"| DISK
     MC -->|"close changed"| CH
+    SNP -->|"ImportData 合并（在 Data 克隆上）"| MD
+    SNP -->|"SetData(Data) → commit；成功后 createNewDBShards 失败 = 半完成"| MC
     SUB -->|"WaitForDataChanged()"| MC
     CH -->|"close 唤醒"| SUB
     DC -->|"DeleteShardGroup / PruneShardGroups"| MC
@@ -90,6 +93,8 @@ flowchart TB
     CS -->|"registerShard 失败"| BS
     WR -->|"Service.Send（经 router）"| SUB
     CQ -->|"Statistics"| HW
+    CQ -->|"SELECT INTO → BufferedPointsWriter"| WR
+    WR -.->|"目标 RP 设 PAST/FUTURE LIMIT 时补算点被丢 → PartialWriteError → CQ 记 QueryFail"| CQ
 ```
 
 ```mermaid
@@ -102,6 +107,7 @@ sequenceDiagram
     participant F as series file
     T->>R: DeletionCheck
     R->>M: Databases
+    R->>R: DeletedShardGroups() 预填 deletedShardIDs（上一轮已软删组）
     R->>M: DeleteShardGroup(db, rp, sgID)
     alt DeleteShardGroup 失败
         Note over R: retryNeeded=true；本 tick 不把该组 shard 放进 deletedShardIDs
@@ -111,44 +117,110 @@ sequenceDiagram
     R->>S: ShardIDs
     loop 每个本地且已软删除的 shard
         R->>S: SetShardNewReadersBlocked(id, true)
-        R->>S: ShardInUse(id)
-        Note over R: 这两步在 shard 已不存在时也返回包装的 ErrShardNotFound，<br/>同样被外层过滤送进 DropShardMetaRef
-        alt 闸门 / InUse 自身失败（非 NotFound）
-            Note over R: shard 仍在本地，retryNeeded=true，下轮重试
-        else 有活跃读者
-            R->>S: SetShardNewReadersBlocked(id, false)
-            Note over R: 本轮跳过，下轮重试
-        else 无读者
-            R->>S: DeleteShard(id)
-            Note over S: 先 delete(s.shards, id)（store.go:997），再 Index/walkShards/Close/RemoveAll
-            alt 返回 ErrShardNotFound（本地已无该 shard，含并发删除）
-                Note over S,F: 不碰 series file（无 DeleteSeriesID / FlushSegments）
-                R->>DSM: DropShardMetaRef(id)
-                DSM->>M: DropShard（OSS）保留首次 DeletedAt + commit
-            else 删除成功
-                S->>F: DeleteSeriesID(NoFlush)
-                S->>F: FlushSegments(partitionIDs)
-                R->>DSM: DropShardMetaRef(id)
-                DSM->>M: DropShard（OSS）保留首次 DeletedAt + commit
-                Note over R,M: 任一步失败 → retryNeeded，下一 tick 由 phantom 分支重试
-            else 删除失败（非 NotFound，必在摘除之后）
+        alt SetShardNewReadersBlocked(true) 失败（本 shard 未加闸）
+            Note over R: 未注册 defer；不需也不会 unblock；retryNeeded=true，下轮重试
+        else 加闸成功（已注册 defer 释放）
+            R->>S: ShardInUse(id)
+            Note over R: 闸门/InUse 在 shard 已不存在时返回包装的 ErrShardNotFound，<br/>外层过滤后仍走 DropShardMetaRef
+            alt ShardInUse 自身失败（非 NotFound）
                 R->>S: SetShardNewReadersBlocked(id, false)（defer）
-                Note over R: retryNeeded=true，但 shard 已不在 ShardIDs()<br/>下轮由 phantom 分支摘 meta 引用，磁盘文件可能成孤儿
+                Note over R: 失败会释放闩锁，不是永久关闭；retryNeeded=true，shard 仍在本地
+            else 有活跃读者
+                R->>S: SetShardNewReadersBlocked(id, false)（defer）
+                Note over R: 本轮跳过，下轮重试
+            else 无读者
+                R->>S: DeleteShard(id)
+                Note over S: 入口 sh==nil→ErrShardNotFound；持锁查 pendingShardDeletes（命中→return nil）；<br/>否则 delete(s.shards,id)（store.go:997）后 Index/walkShards/Close/RemoveAll
+                alt 已在 pendingShardDeletes（并发 DROP SHARD）→ return nil
+                    Note over S,F: 不做 series file/磁盘操作；外层仍走 DropShardMetaRef
+                else 返回 ErrShardNotFound（本地已无该 shard）
+                    Note over S,F: 不碰 series file（无 DeleteSeriesID / FlushSegments）
+                    R->>DSM: DropShardMetaRef(id)
+                    DSM->>M: DropShard（OSS）保留首次 DeletedAt + commit
+                else 删除成功（series file 步骤仅 Cardinality>0 且 sfile!=nil）
+                    S->>F: DeleteSeriesID(NoFlush)
+                    S->>F: FlushSegments(partitionIDs)
+                    R->>DSM: DropShardMetaRef(id)
+                    DSM->>M: DropShard（OSS）保留首次 DeletedAt + commit
+                    Note over R,M: 只有 DropShardMetaRef（含 commit）失败 → retryNeeded；<br/>DeleteSeriesID/FlushSegments 失败仅记日志，不阻断、不重试
+                else 删除失败（非 NotFound，必在摘除之后）
+                    R->>S: SetShardNewReadersBlocked(id, false)（defer）
+                    Note over R: retryNeeded=true，但 shard 已不在 ShardIDs()<br/>下轮由 phantom 分支摘 meta 引用，磁盘文件可能成孤儿
+                end
             end
         end
     end
     Note over R,M: phantom 自愈：已软删除/已过期组里、本地 ShardIDs() 没有的 shard
-    R->>DSM: DropShardMetaRef(id)（仅 isOSS() 或 owners 含本节点）
-    DSM->>M: DropShard（OSS）+ commit
+    loop 剩余 deletedShardIDs（本轮已成功删本地者已被移除）
+        R->>DSM: DropShardMetaRef(id)（仅 isOSS() 或 owners 含本节点）
+        DSM->>M: DropShard（OSS）+ commit
+    end
     R->>M: PruneShardGroups
     Note over M: 仅当 DeletedAt 早于 now-14d 且 Shards 为空；有变更才 commit<br/>失败 → retryNeeded，下一 tick 重来
 ```
 
 ## 3. 逐项差异
 
-### 3.1 meta 状态机骨架：clone-modify-commit / snapshot / changed / lease 全都没变
+### 3.0 shard / shard group 生命周期总表
 
-先给结论，避免读者被 `meta.pb.go` 的巨大 diff 误导：**状态机的控制流在 v1.8.10 与 v1.12.3 之间逐字符相同**。
+本节是后续 3.4-3.14 的“地图”。**owner 划分**：shard group 的生命周期（Created/Active/Expired/SoftDeleted/Pruned）由 meta + retention 负责；单个 shard 的本地删除（ReaderBlocked/InUseSkipped/LocalDeleted/Phantom）由 `retention.Service` + `tsdb.Store` 负责；series 文件的批量 fsync 机制 owner 是 02 §3.11（本文 3.14 只保留 retention 视角的摘要），purger owner 是 04 §3.15（本文 3.12 只保留交互摘要）。完整状态机与 note 见主 12 §6.1。
+
+```mermaid
+stateDiagram-v2
+    [*] --> Created: CreateShardGroup / PrecreateShardGroups
+    Created --> Active: 首次写入命中
+    Active --> Expired: EndTime + RP.Duration < now
+    Active --> SoftDeleted: DeleteShardGroup 设置 DeletedAt
+    Expired --> SoftDeleted: DeleteShardGroup 设置 DeletedAt
+    Active --> SoftDeleted: DropShard 摘掉组内最后一个 shard
+    SoftDeleted --> ReaderBlocked: retention SetShardNewReadersBlocked(true)
+    ReaderBlocked --> InUseSkipped: ShardInUse=true
+    InUseSkipped --> ReaderBlocked: 下一轮重试
+    ReaderBlocked --> LocalDeleted: ShardInUse=false -> DeleteShard
+    LocalDeleted --> SoftDeleted: DropShardMetaRef / DropShard
+    LocalDeleted --> Phantom: DeleteShard 摘除后磁盘操作失败
+    Phantom --> SoftDeleted: DropShardMetaRef
+    SoftDeleted --> Created: 旧时间戳再次写入 → 新建另一个组（新 ID）
+    SoftDeleted --> Pruned: len(Shards)==0 且 DeletedAt < now-14d
+    Pruned --> [*]
+```
+
+| 状态 | 判定条件 | 进入路径 | 离开路径 | 本区间差异 | 对应节 |
+|------|----------|----------|----------|------------|--------|
+| Created | `ShardGroupInfo` 存在，`DeletedAt==0`，尚未写入 | `CreateShardGroup`（写路径或 precreator） | 首次写入命中 → Active | 与已有组求差集，允许组短于 `ShardGroupDuration`（#22601） | 3.4 |
+| Active | 写路径 `ShardGroupAt`/`Contains` 命中；无独立字段 | 首次写入 | 到期或 `DeleteShardGroup` | RP 写窗口在 `MapShards` 过滤点（属于 RP 字段，不是组状态） | 3.3、3.4 |
+| Expired | `EndTime.Add(RP.Duration).Before(now)`（`services/meta/data.go:1275`） | 时间推进 | `DeleteShardGroup` → SoftDeleted | 判定未变；写路径仍可能命中（除非先被写窗口过滤） | 3.6、3.13 |
+| SoftDeleted | `DeletedAt != 0`，物理文件可能仍在 | `DeleteShardGroup`，或 `DropShard` 摘掉最后一个 shard 的副作用 | 本地删除、14 天后 Pruned；或旧时间戳再次写入时新建另一个组（新 ID，本组仍保留到 Pruned） | `DropShard` 保留首次 `DeletedAt`（#24530）；Prune 增加 `len(Shards)==0` 必要条件 | 3.5、3.6 |
+| ReaderBlocked | `FileStore.newReaderBlockCount>0` | retention 删除前加闸 | `ShardInUse=false` 后删除；失败/跳过则解锁 | 新增读者闸门（#25055） | 3.9 |
+| InUseSkipped | `ShardInUse=true` | 加闸后仍有活跃读者 | 下一轮重试（不阻塞其他 shard） | 新增“跳过而非等待” | 3.9、6.1 |
+| LocalDeleted | 已从 `s.shards` 摘除，series tombstone/索引/目录已处理 | `DeleteShard` 成功 | `DropShardMetaRef` 摘 meta 引用 | `ErrShardNotFound` 语义、索引清理时机、批量 fsync（fsync 细节 owner 02） | 3.8、3.14 |
+| Phantom | meta 有、本地 `ShardIDs()` 无（OSS 或 owners 含本节点） | 本地删除成功但摘引用失败；或数据目录不可见 | `DropShardMetaRef` | 新增 phantom 自愈 + owners 过滤（#26527） | 3.13、7.6 |
+| Pruned | `len(Shards)==0` 且 `DeletedAt` 早于 `now-14d` | SoftDeleted 且组内无 shard | 终态 | 从“只看到期”变为“到期 + 空组” | 3.6 |
+
+> `TruncatedAt` 只影响 `ShardGroupByTimestamp` 路由，是 Enterprise/运维分支，不是独立生命周期状态（主 12 §6.1）；`badShards` 是 `tsdb.Store` 的本地打开失败缓存，也不是 shard 状态（3.10、7.5）。3.4-3.10 的每个变更点都对应上表的一次迁移或一次迁移前的检查；3.11 的 `DeleteSeries` 与 3.14 的 series-file fsync 属于 series 删除模块，不是 shard 生命周期本身。
+
+### 3.1a meta 状态机：clone-modify-commit 与 changed 广播
+
+**角色**：`services/meta` 是单机的元数据状态机。所有 DDL（库/RP/shard group/订阅/CQ）都走同一条“克隆 → 在副本上改 → 全量落盘 → 换内存指针 → 关通道通知”的控制流。v1.8.10 与 v1.12.3 的这条控制流逐字符相同，差异只在“副本怎么序列化”和“什么时候允许删 shard”（3.2、3.4-3.6）。
+
+**结构**：
+
+| 组件 | 作用 | 旧/新证据 |
+|------|------|-----------|
+| `Data` | 全量元数据树（Databases/RPs/ShardGroups/Subscriptions/CQs） | `v1.8.10:services/meta/data.go` / `v1.12.3:services/meta/data.go` |
+| `Client` | 对外 API、读写锁、`cacheData` 指针、`changed` 通道 | `v1.8.10:services/meta/client.go:49` / `v1.12.3:services/meta/client.go:48` |
+| `commit(data)` | index+1 → `snapshot` → 换 `cacheData` → `close(changed)` | `v1.8.10:services/meta/client.go:964` / `v1.12.3:services/meta/client.go:948` |
+| `changed` | 无缓冲的“广播”通道；关闭即通知，随后立即换新通道 | `v1.8.10:services/meta/client.go:976` / `v1.12.3:services/meta/client.go:960` |
+
+**流程**（以 `CreateRetentionPolicy` 为例）：
+
+1. 调用方在 `Client.mu` 下取 `cacheData`，`Clone()` 出副本；读操作走 `RLock`，写操作升级为 `Lock` 后二次检查（主 07 §3.2 步骤 2-4）。
+2. 在副本上执行 `Data.CreateRetentionPolicy` 等变更；校验失败直接返回，`cacheData` 不动。
+3. `commit(data)`：`data.Index++` → `snapshot(c.path, data)`（3.1b）。
+4. 落盘成功后 `c.cacheData = data`，随后 `close(c.changed); c.changed = make(chan struct{})`。
+5. 等待者（唯一生产消费者是 `subscriber.waitForMetaUpdates`）在 `close` 时被唤醒，**必须重新取通道**再等待下一次变更；复用旧通道会立即返回并空转。
+
+**代码**：
 
 ```go
 // v1.8.10:services/meta/client.go:964 — (*Client).commit
@@ -172,6 +244,43 @@ func (c *Client) commit(data *Data) error {
 }
 ```
 
+**案例**：§6.2 跟踪 `CREATE RETENTION POLICY "hot" ... FUTURE LIMIT 1h PAST LIMIT 6h` 的完整字节流：`Index` 从 N 变 N+1，`snapshot` 写出的 `RetentionPolicyInfo` 多出 field 7/8（1h=7 字节、6h=8 字节），`changed` 唤醒 subscriber。该案例同时是 3.1b 的落盘案例。
+
+**风险**：`Subscriptions` 不是深拷贝，`DropSubscription` 会原地改共享数组（7.13）；protobuf 运行时降级会丢写窗口字段（7.8）；每次 `DropShard` 都是一次全量 commit（7.7）。
+
+### 3.1b snapshot/commit：五步落盘、失败矩阵与 Windows rename
+
+**角色**：把内存中的全量 `Data` 变成磁盘上可原子替换的 `meta.db`。它是 meta 状态机的持久化边界，**不是**后台服务；调用者是每次 `commit`。
+
+**结构**：
+
+| 项 | 值/实现 | 证据 |
+|----|---------|------|
+| 正式文件 | `<meta>/meta.db`（`metaFile`） | `v1.12.3:services/meta/client.go:31` |
+| 临时文件 | `<meta>/meta.dbtmp`（`filename + "tmp"`，中间无点） | `v1.12.3:services/meta/client.go:981-983` |
+| 序列化 | `Data.MarshalBinary` → `proto.Marshal(data.marshal())` | `v1.12.3:services/meta/data.go:820` |
+| 原子替换 | `file.RenameFile(tmp, meta.db)`；Unix 为 `rename(2)`，Windows 先删目标再 rename | `v1.12.3:pkg/file/file_unix.go:54`、`pkg/file/file_windows.go:10` |
+
+**流程**（五步）：
+
+1. `os.Create(tmp)`；失败则本次 commit 直接返回，`cacheData` 保持旧指针。
+2. `data.MarshalBinary()`；失败时 tmp 文件可能为空/半写，`defer f.Close()` 关闭。
+3. `f.Write(d)`；失败同上。
+4. `f.Sync()`（fsync 数据）；失败同上。
+5. `f.Close()`（Windows 下 rename 前必须关闭）→ `file.RenameFile(tmp, meta.db)`；成功后 `commit` 才换内存指针。
+
+**失败矩阵**：
+
+| 失败点 | 磁盘 | 内存 | 可见后果 | 恢复 |
+|--------|------|------|----------|------|
+| `os.Create` | 旧 `meta.db` 完整 | 旧 `cacheData` | 调用方拿到错误 | 下次 commit 重试 |
+| `MarshalBinary` / `Write` / `Sync` / `Close` | 旧 `meta.db` 完整；tmp 残留 | 旧 `cacheData` | 本次变更未持久化，返回错误 | 下次 `os.Create` 截断 tmp |
+| `RenameFile`（Unix） | 旧 `meta.db` 完整 | 旧 `cacheData` | 返回错误；tmp 残留 | 下次重试 |
+| `RenameFile`（Windows） | 先 `os.Stat(meta.db)`：成功 → `os.Remove(meta.db)` → `os.Rename(tmp, meta.db)`（`pkg/file/file_windows.go:10-17`）。`os.Remove` 失败 → 直接返回错误、`meta.db` 仍在；remove 成功而 rename 失败 → `meta.db` 不存在、只剩 `meta.dbtmp`；`os.Stat` 返回非 nil 错误（如权限）→ 跳过 remove 直接 rename，结果取决于 rename 的错误 | 旧 `cacheData` | 只有“remove 成功、rename 失败”这一窗口会让节点重启读不到 meta | 需人工恢复 tmp/备份（主 07 §11.1） |
+| rename 成功、换内存前进程崩溃 | 新 `meta.db` | 进程已退出 | 重启加载新文件 | 自动 |
+
+**代码**：
+
 ```go
 // v1.8.10:services/meta/client.go:997 — snapshot
 // v1.12.3:services/meta/client.go:981 — snapshot
@@ -188,15 +297,85 @@ if err = f.Close(); err != nil { return err }       // 先关句柄以兼容 Win
 return file.RenameFile(tmpFile, filename)           // 原子替换
 ```
 
-要点：
+**案例**：§6.2 的字节流案例给出一次成功 commit 的 5 步、field 7/8 的 varint 长度，以及升级后每个 RP 至少 +4 字节的原因。失败场景见上表；Windows 的“先删后 rename”窗口是 7.8/主 07 §11.1 的核心风险。
 
-- **先落盘再更新内存**：`snapshot` 失败时 `commit` 直接返回，`c.cacheData` **指针**保持旧值，调用方拿到 error。**但 RP 的 `Subscriptions` 是例外**：`RetentionPolicyInfo.clone()` 只深拷贝 `ShardGroups`（`v1.12.3:services/meta/data.go:1347-1358`），`DropSubscription` 用 `append(rpi.Subscriptions[:i], rpi.Subscriptions[i+1:]...)` 原地搬移共享底层数组（`:591-606`），commit 前旧 `cacheData` 与已返回的快照已被改动；snapshot 失败时内存与磁盘实际分叉，见 7.13。
-- **changed 广播是"关通道"而不是"发消息"**：`close(c.changed)` 会唤醒所有 `WaitForDataChanged()` 的等待者，然后立刻换一个新通道。消费者必须在收到信号后**重新取通道**；对已关闭通道的 receive 会立即返回，复用旧通道只会空转并错过后续 commit 的唤醒。
-- **Lease 在 OSS 里是空实现**：`AcquireLease` 只返回带过期时间的结构体，永不失败、也永不持久化（`v1.8.10:services/meta/client.go:128` / `v1.12.3:services/meta/client.go:127`，两边函数体一致）。CQ 的 lease 语义因此没有变化。
+**案例：Windows 上 `remove` 成功、`rename` 失败后的重启（T0–T3）**
 
-状态机骨架真正变化的只有四处：`SetData` 的锁（3.7）、`PruneShardGroups` 的判定（3.6）、`Data.CreateShardGroup` 的区间算法（3.4）、`Data.DropShard` 的时间戳（3.5），外加 protobuf 代码生成与两个新字段。
+输入：Windows 节点，`<meta>/meta.db` 为上一次成功提交的版本（含 `db0`/`rp0`/用户/CQ），`cacheData.Index=42`；外部进程（杀毒/索引器/备份）短暂占用 `<meta>/meta.dbtmp` 或目标路径。
 
-另需注意 `services/meta` 一侧新增的 3 个授权钩子：`AuthorizeCreateDatabase`/`AuthorizeCreateRetentionPolicy`/`AuthorizeDeleteRetentionPolicy`（`v1.12.3:services/meta/query_authorizer.go:138/161/184`），它们是 `/api/v2/buckets` 端点鉴权的基础，详见 06 §3.19。
+| 时刻 | 动作 | 磁盘 | 内存/返回值 |
+|------|------|------|--------------|
+| T0 | `commit` 进入 `snapshot` | `meta.db`=v42、无 tmp | `cacheData`=v42 |
+| T1 | `os.Create(meta.dbtmp)` → `Write` → `Sync` → `Close` 全部成功 | `meta.db`=v42、`meta.dbtmp`=v43 完整 | 未换指针 |
+| T2 | `os.Stat(meta.db)` 成功 → `os.Remove(meta.db)` 成功 | **`meta.db` 不存在**、`meta.dbtmp`=v43 | 未换指针 |
+| T3 | `os.Rename(meta.dbtmp, meta.db)` 失败（如 `ERROR_ACCESS_DENIED`/共享冲突） | 仍无 `meta.db`，只剩 `meta.dbtmp`（内容 v43） | `snapshot` 返回错误；`commit` 返回错误，`cacheData` 仍是 v42；服务继续运行 |
+| T4a | 进程不重启，下一次任意 commit 成功 | `Stat(meta.db)` 不存在 → 跳过 remove，`Rename(tmp, meta.db)` 成功；新文件包含 v42+本次变更 | 文件层面自愈；T2/T3 未提交的 v43 变更本身已丢失 |
+| T4b | 进程在 T4a 前重启 | `Load()` 的 `os.Open(meta.db)` 返回 `IsNotExist` → **`return nil`**（不是错误） | `Open()` 看到 `cacheData.Index==1`（`NewClient` 的初值）→ `snapshot` 用空 Data **截断并覆盖 meta.dbtmp**，再改名为全新的空 `meta.db`（随机 `ClusterID`、无数据库/用户/CQ） |
+
+T4b 的后果：节点正常启动、无错误日志，但 `SHOW DATABASES` 为空、所有用户/CQ/RP 消失、`ClusterID` 变化；T3 留下的 `meta.dbtmp`（v43）在重启的 `os.Create` 时已被截断，只能从备份恢复。`Load()` 把“文件不存在”当“全新实例”（`v1.12.3:services/meta/client.go:1018-1023`）是该窗口真正危险的地方。v1.8.10 的 `snapshot`（`v1.8.10:services/meta/client.go:997-1025`）、`file_windows.go` 与 `Load` 实现逐字相同，因此**不是版本回归**，两版都有。
+
+**风险**：全量重写 + fsync 的写放大（7.7）；Windows 非原子替换（7.8）；降级到 v1.8.10 后写窗口字段在第一次提交时丢失（7.8、5.1）。
+
+### 3.1c Lease：60 秒空实现、CQ 唯一调用方与单机语义
+
+**角色**：`AcquireLease` 在集群版里用于选主/互斥；在 OSS 单机版里只是一个“永远成功”的占位实现。它**不持久化、不释放、不做互斥**，唯一生产调用方是 CQ 服务。
+
+**结构**：
+
+| 类型/函数 | 字段/行为 | 证据 |
+|-----------|-----------|------|
+| `Lease` | `Name string`、`Expiration time.Time`、`Owner uint64` | `v1.8.10:services/meta/data.go:1679` / `v1.12.3:services/meta/data.go:1799` |
+| `DefaultLeaseDuration` | 60s | `v1.12.3:services/meta/config.go:12` |
+| `Client.AcquireLease` | 只填 `Name`/`Expiration`；**`Owner` 保持零值**；恒返回 nil error | `v1.8.10:services/meta/client.go:128` / `v1.12.3:services/meta/client.go:127` |
+| `Leases` / `NewLeases` / `Leases.Acquire` | 带 `mu`、`map[string]*Lease`、60s 续期/拒绝逻辑 | `v1.12.3:services/meta/data.go:1806-1847` |
+| `Leases` 可达性 | OSS 全树无调用方（含测试）；`Client.AcquireLease` 是另一条路径 | 主 12 §7.4 |
+
+**流程**（CQ 的两个触发分支）：
+
+1. `backgroundLoop` 起一个 timer（`RunInterval`），同时监听 `s.RunCh`；两者都会走到 `MetaClient.AcquireLease("continuous_querier")`。
+2. OSS 的 `AcquireLease` 立即返回一个 60s 后过期的结构体；CQ 只判断 `err == nil`，不检查 `Owner`/`Expiration`，也不续期或释放。
+3. 成功后调用 `runContinuousQueries`，遍历所有库的 CQ 并执行；失败（集群版“another node has the lease”）则跳过本轮。
+4. 进程退出/重启不会清理 lease；OSS 也没有任何代码读取 `Expiration`。
+
+**代码**：
+
+```go
+// v1.12.3:services/meta/client.go:127 — AcquireLease（OSS）
+func (c *Client) AcquireLease(name string) (*Lease, error) {
+	l := Lease{
+		Name:       name,
+		Expiration: time.Now().Add(DefaultLeaseDuration),
+	}
+	return &l, nil
+}
+
+// v1.12.3:services/continuous_querier/service.go:226-243 — backgroundLoop 的两个分支
+case req := <-s.RunCh:
+	if !s.hasContinuousQueries() { continue }
+	if _, err := s.MetaClient.AcquireLease(leaseName); err == nil {
+		s.runContinuousQueries(req)
+	}
+case <-t.C:
+	if !s.hasContinuousQueries() { t.Reset(s.RunInterval); continue }
+	if _, err := s.MetaClient.AcquireLease(leaseName); err == nil {
+		s.runContinuousQueries(&RunRequest{Now: time.Now()})
+	}
+	t.Reset(s.RunInterval)
+```
+
+**案例（双进程共享 meta，`EVERY 1h`）**：
+
+- 部署：进程 A、B 配置同一 `meta` 目录（或同一后端），都开启 CQ；CQ `cq_hourly` 为 `CREATE CONTINUOUS QUERY cq_hourly ON db0 BEGIN SELECT mean(usage) INTO db0.autogen.cpu_hourly FROM db0.autogen.cpu GROUP BY time(1h), host END`，`run-interval=1s`。
+- `2026-10-10T11:59:59Z`：A、B 的 `lastRuns` 都是空 map（`v1.12.3:services/continuous_querier/service.go:98/114`），`HasRun=false`，`shouldRunContinuousQuery` 直接返回 `true, now`（`:512-549`）。
+- `12:00:00Z` / `12:00:01Z`：A/B 各自的 timer 分支调 `AcquireLease("continuous_querier")`（`:234-242`）；OSS 实现只填 `Name` 和 `Expiration=now+60s`、`Owner=0`、返回 `nil`（`v1.12.3:services/meta/client.go:127-133`），两边都通过 `err == nil` 检查。
+- 两边各自执行 `SELECT INTO`，目标都是 `db0.autogen.cpu_hourly` 的 `11:00` 桶。CQ 的 `LastRun` 只写本进程的 `s.lastRuns`（`service.go:337-340`），不会跨进程同步。
+- 结果：
+  - **执行次数**：`log-enabled=true`（默认）时，A、B 各打一行 `Finished continuous query`（`service.go:409-417`），共 2 行；开启 `query-stats-enabled=true` 时，监控库 `_internal` 出现 2 个 `cq_query` 点（同一 `db`/`cq` tag、时间戳不同，`:419-426`）。
+  - **写入数据**：同一 series+timestamp 在客户端只会看到一行，**不存在“合并前短暂看到重复 timestamp”**。①查询游标在 cache 与 TSM 时间戳相同时只返回 cache 值，并同时推进两个游标（`tsdb/engine/tsm1/iterator.gen.go:442-470`，`ckey == tkey` 分支 `:454-458`）；②TSM 多 block 用 `Values.Merge` 合并，时间戳相等时丢弃参数 `a` 的值、保留 `b`（`encoding.gen.go:186-224`；ascending 分支 `values.Merge(v)`、descending 分支 `v.Merge(values)`，`file_store.gen.go:120/185`）；③cache `Values()` 返回前再 `Deduplicate()`（`cache.go:554-605`，规则是“时间戳相同时保留 slice 中靠后的值”，`encoding.gen.go:58-89`），snapshot 前也会 `Deduplicate()`（`engine.go:2009`）。因此“两份写入哪个值可见”由 cache/TSM 的合并顺序决定（cache 优先于 TSM；TSM 内按 `Merge` 的参数顺序），但**不会出现两行同 timestamp 的数据**，也不能假设“后写一定生效”。
+  - **写放大**：每小时的聚合被计算并写入 2 次，写请求与 compaction 成本约为单进程的 2 倍。
+- 若 A、B 的 `now` 或读到的源数据快照不同（例如 B 晚 2 分钟启动、期间有新点写入），两边的聚合值可能不同；由于重复值最终会合并，最终值不可预期。**风险是重复计算/写竞争，不是“重复数据”。** OSS 不提供跨进程互斥，运维上必须保证同一 meta 只有一个写入者。单进程内，`RunCh` 与 timer 也可能在同一时刻各触发一次，但二者串行进入 `backgroundLoop`，不会并发。
+
+**风险**：无持久化、无显式 release、`Expiration` 不被消费；多进程重复执行；集群 `Leases` 在 OSS 是死代码（主 07 §11.7、主 12 §7.5）。本区间无差异。
 
 ### 3.2 `meta.pb.go` 的 +3397/−1968 到底是什么
 
@@ -269,7 +448,7 @@ import (
 **语义影响**：
 1. **线格式（wire format）不变**：proto2 optional + 相同的 field number 编码规则。旧 `meta.db` 可被新版直接 `proto.Unmarshal`；新版写出的 `meta.db` 中新增的 field 7/8 在旧版里会成为"未知字段"。
 2. **未知字段在旧版不会长期保留**：`Data.UnmarshalBinary` 解到 `internal.Data` 后，业务层 `data.unmarshal(&pb)` 把内容搬进 Go 结构体 `RetentionPolicyInfo`（没有写窗口字段），下一次 `commit` 时 `rpi.marshal()` 会**重新构造**一个新的 `internal.RetentionPolicyInfo`，未知字段自然丢失。也就是说：**降级到 v1.8.10 并发生任意一次 meta 提交，写窗口配置会被静默抹掉**（见第 5 节）。
-3. **性能路径变了**：gogo 生成的是手写 `MarshalToSizedBuffer`/`Size`，官方生成器走 protoreflect 运行时（带缓存的反射）。meta 每次提交都是**全量序列化**（见 3.1），元数据规模大（数据库/RP/shard group 多）时单次 commit 的 CPU 开销会上升。这是机制推断，仓库内没有基准数据。
+3. **性能路径变了**：gogo 生成的是手写 `MarshalToSizedBuffer`/`Size`，官方生成器走 protoreflect 运行时（带缓存的反射）。meta 每次提交都是**全量序列化**（见 3.1b），元数据规模大（数据库/RP/shard group 多）时单次 commit 的 CPU 开销会上升。这是机制推断，仓库内没有基准数据。
 
 ### 3.3 RP 写入窗口：新字段、新校验、新 SQL
 
@@ -366,6 +545,15 @@ ALTER RETENTION POLICY <rp> ON <db> [DURATION <d>] [REPLICATION <n>]
 - 新版本的 shard group 可能**短于** `ShardGroupDuration`（例如从 07:00 开始而不是 00:00），`SHOW SHARDS` 里看到的 `start_time` 不再是整齐的整点。
 - `CreateShardGroup` 的幂等性判断仍基于 `ShardGroupByTimestamp(timestamp)`，即"该时间点已在某个组里 → 直接返回 nil"，行为未变。
 
+**案例（truncate 后写入）**：RP `autogen`、`ShardGroupDuration=24h`；组 A 原为 `[2026-10-01T00:00Z, 2026-10-02T00:00Z)`，`TruncateShardGroups(2026-10-01T12:00Z)` 之后 `TruncatedAt=2026-10-01T12:00Z`（`v1.12.3:services/meta/data.go:834-857`），因此 `ShardGroupByTimestamp(2026-10-01T18:00Z)` 返回 nil（`:1263-1270`）。
+
+写入 `2026-10-01T18:00Z` 的点：
+
+- **v1.8.10**：`startTime=00:00`、`endTime=10-02T00:00`，不做重叠检查，创建组 `[00:00, 10-02T00:00)`。它与 A 的原始区间完全重叠；`SHOW SHARDS` 新增一行的 `start_time=2026-10-01T00:00:00Z`、`end_time=2026-10-02T00:00:00Z`（`SHOW SHARDS` 打印 `EndTime`，不打印 `TruncatedAt`）。同一个时间点现在落在两个组里，`ShardGroupAt` 的二分结果依赖列表顺序。
+- **v1.12.3**：循环遇到 A（`endI=TruncatedAt=12:00`），`timestamp(18:00)` 不早于 `endI` 且 `endI(12:00) > startTime(00:00)` → `startTime=12:00`；第二个条件不成立。创建组 `[12:00, 10-02T00:00)`。`SHOW SHARDS` 新行 `start_time=2026-10-01T12:00:00Z`、`end_time=2026-10-02T00:00:00Z`。对新点 `ShardGroupByTimestamp(18:00)` 返回新组；再次写入 18:00 不会再建组（`:391-394` 的幂等检查命中）。
+
+两版的 A 都保留原 `EndTime`（10-02），差异只在**新组起点**：旧版 00:00（与 A 重叠 12 小时），新版 12:00（从 A 的截断点开始）。
+
 ### 3.5 `DropShard`：不要覆盖第一次的 `DeletedAt`
 
 ```go
@@ -421,13 +609,22 @@ ALTER RETENTION POLICY <rp> ON <db> [DURATION <d>] [REPLICATION <n>]
 
 > "This corrects that by requiring shards files be deleted before they can be removed from the meta store."
 
-**旧版的失效链条**：
-1. 组到期 → `DeleteShardGroup` 打上 `DeletedAt`（软删除）。
-2. retention 尝试 `TSDBStore.DeleteShard(id)`，但 `sh.Close()` 被活跃读者阻塞（见 3.9），或磁盘删除报错。
-3. 14 天过去，`PruneShardGroups` **不看 shard 是否删掉**，直接把整组从 meta 移除。
-4. 从此 meta 里没有这个 shard，retention 的 `ShardIDs()` 循环永远不会再处理它 → 目录永久残留，磁盘只涨不降。
+**旧版有两条互斥的失败路径，必须分开推演**（统一取 `DeletedAt=2026-10-01T00:30:00Z`、`check-interval=30m`，并**假设 influxd 在 `2026-10-01T00:00:00Z` 启动**）：ticker 是 `run()` 内 `time.NewTicker` 创建的相对定时器（`services/retention/service.go:139-141`；旧版同形，`v1.8.10:services/retention/service.go:75`），**首个 tick 在启动 30m 后**；tick 时刻为 `启动时刻 + n×30m（n≥1）`，启动时刻本身不是 tick，**也不会自动对齐整点/半点**；若在 `00:07` 启动，tick 是 `00:37/01:07/...`，本节所有 `00:30/02:00/10-15T01:00` 需整体平移。
 
-**新版的顺序**：`DeleteShard` 成功 → `DropShardMetaRef` 把该 shard 从组里摘掉 → 组内 shard 清空后，14 天窗口一到才允许修剪。失败要分两类：闸门 / `ShardInUse` / `DeleteShardGroup` 在摘除 `s.shards` 之前失败时，shard 仍在本地，组留在 meta，下一轮重试；`DeleteShard` 在 `delete(s.shards, id)`（`v1.12.3:tsdb/store.go:997`）之后才因 `sh.Index()`、`walkShards`、`sh.Close()`、`os.RemoveAll` 失败时，shard 已不在 `ShardIDs()`，下一轮由 phantom 分支摘掉 `ShardInfo`，组仍按 14 天规则修剪，磁盘目录却成了孤儿（见 §7.2 与主 12 §3.2 的 4 步失败链）。**代价**是摘除前失败或长期 `InUse` 的组可能长期留在 meta（见第 7 节）。
+**A. 读者长期持有 `TSMReader`（`sh.Close()` 阻塞）**
+
+1. `2026-10-01T00:30:00Z` tick：`DeleteShardGroup` 先把组软删除（`DeletedAt=00:30:00`），随后 `DeleteShard(500)` 在 `delete(s.shards,500)`（`v1.8.10:tsdb/store.go:717`）之后执行到 `sh.Close()`（`:802`）。查询持有的 reader 引用让 `refsWG.Wait()` 不返回（`v1.8.10:tsdb/engine/tsm1/reader.go:364-365`）。
+2. 整个 tick 停在 `sh.Close()`，**`PruneShardGroups`（`v1.8.10:services/retention/service.go:150`）不会执行**，排在 500 后面的 shard 也不处理；日志停在 `Deleted shard group`，没有 `Deleted shard`。
+3. 查询在 `2026-10-01T02:00:00Z` 结束后，同一次 tick 继续：`sh.Close()` 返回，`os.RemoveAll(sh.path)`/`os.RemoveAll(sh.walPath)`（`:807/:811`）删掉目录；`PruneShardGroups` 用 `expiration=now-14d=2026-09-17T02:00:00Z` 比较，不晚于 `DeletedAt`，组保留。
+4. 500 已不在 `ShardIDs()`，不再重试；`2026-10-15T01:00:00Z` tick 的 `expiration=2026-10-01T01:00:00Z > DeletedAt`，旧版删组。**目录已在第 3 步删除，这条路径不产生孤儿。**
+
+**B. `DeleteShard` 返回错误（EACCES/EBUSY/`sh.Close()` 失败）**
+
+1. `2026-10-01T00:30:00Z` tick：组软删除后，`DeleteShard(500)` 在 `delete(s.shards,500)` 之后、`sh.Close()`/`os.RemoveAll` 处失败，例如 `remove /var/lib/influxdb/data/telegraf/autogen/500: permission denied`，返回错误。
+2. 旧版只记 `Failed to delete shard` 并置 `retryNeeded=true`，**循环继续走到 `PruneShardGroups`**；此时 14 天未到，组保留。这里必须拆开两件事：`retryNeeded=true` 只控制 tick 末尾那一行汇总日志 `One or more errors occurred during shard deletion and will be retried on the next check`（`v1.8.10:services/retention/service.go:132-156`）；真正的“重试集合”是下一 tick 的 `TSDBStore.ShardIDs()`。500 已从 `s.shards` 摘除，所以那句 “will be retried” 指的是本 tick 其他仍在 `ShardIDs()` 里的 shard，**不包含 500**，500 的磁盘删除**永远不会重试**。
+3. `2026-10-15T01:00:00Z` tick：旧版 `PruneShardGroups` 只看 `DeletedAt`（`v1.8.10:services/meta/client.go:682-695`，没有 `len(sgi.Shards)>0`），删掉整组 → meta 中不再有 500；残留目录成为**孤儿**。`SHOW SHARDS` 早已看不到该组（跳过 `Deleted()`），所以磁盘只涨不降（#24529）。
+
+**新版的顺序**：`DeleteShard` 成功 → `DropShardMetaRef` 把该 shard 从组里摘掉 → 组内 shard 清空后，14 天窗口一到才允许修剪。失败要分两类：闸门 / `ShardInUse` / `DeleteShardGroup` 在摘除 `s.shards` 之前失败时，shard 仍在本地，组留在 meta，下一轮重试（对应 A 的阻塞或可恢复错误）；`DeleteShard` 在 `delete(s.shards, id)`（`v1.12.3:tsdb/store.go:997`）之后才因 `sh.Index()`、`walkShards`、`sh.Close()`、`os.RemoveAll` 失败时，shard 已不在 `ShardIDs()`，**下一轮**由 phantom 分支摘掉 `ShardInfo`（`v1.12.3:services/retention/service.go:283-301`），组仍按 14 天规则修剪，磁盘目录却成了孤儿（见 §7.2 B 与主 12 §3.2 的 4 步失败链）。**新版并没有消除 B 类孤儿**，只是把失败窗口限制在“从 `s.shards` 摘除之后”，并把摘除前失败变成可重试；代价是摘除前失败或长期 `InUse` 的组可能长期留在 meta（见第 7 节）。
 
 ### 3.7 `SetData` 的锁泄漏
 
@@ -452,6 +649,15 @@ ALTER RETENTION POLICY <rp> ON <db> [DURATION <d>] [REPLICATION <n>]
 
 `SetData` 是**恢复备份**的入口（snapshotter 的 `updateMetaStore` → `ossClient.SetData(&data)`）。旧版只要 `commit` 失败（磁盘满、权限、Windows rename 失败），整个节点的 meta 客户端就死锁：后续任何 `Databases()`（读锁）都会挂住，表现为"节点还活着但所有写入/查询卡死"。该修复来自 `956915296a fix: use defer for unlock (#22929)`（2021-11-24），只改 `services/meta/client.go` 一个文件（+1/−2）。它**没有回移到 1.8 线**：v1.8.10 之后的第一个包含它的 tag 是 v1.10.0，因此不能从任何 1.8.x 补丁版本获得；**运维价值极高**。
 
+**案例（meta 目录只读导致旧版死锁）**：
+
+| 时刻 | 动作 | v1.8.10 | v1.12.3 |
+|------|------|---------|---------|
+| T0 | 把 `<meta>` 目录改为只读（或磁盘满） | — | — |
+| T1 | snapshotter 恢复调用 `SetData`；`snapshot` 的 `os.Create("<meta>/meta.dbtmp")` 返回 `open /var/lib/influxdb/meta/meta.dbtmp: permission denied` | `c.mu.Lock()` 后 `commit` 失败直接 `return err`（`v1.8.10:services/meta/client.go:932-943`），**不执行 `c.mu.Unlock()`** | `defer c.mu.Unlock()`（`v1.12.3:services/meta/client.go:917-925`）先释放锁，再返回同一错误 |
+| T2 | `SHOW DATABASES` / 任意写入 / retention/precreator 的 tick | 所有调用 `Databases()`/`Database()` 的路径永久阻塞在 `RLock`（`services/meta/client.go:144-166`）；HTTP 服务无 Read/Write/IdleTimeout（`v1.12.3:services/httpd/service.go:132-134`），客户端超时/断开不会释放该 goroutine，只有重启进程才能释放锁；`/ping`、`/metrics`、`/debug/vars` 不触达 meta，仍可用。进程仍在、端口仍监听 | 读操作正常返回；恢复请求失败但可重试 |
+| T3 | 修复目录权限 | 必须**重启进程**（锁已无法释放）；重启后重新执行恢复 | 无需重启，直接重试 `SetData` |
+
 ### 3.8 `Store.DeleteShard`：六处语义变化
 
 这是整个 shard 生命周期的核心函数。新旧对照（旧 `v1.8.10:tsdb/store.go:698`，新 `v1.12.3:tsdb/store.go:978`）：
@@ -472,6 +678,12 @@ ALTER RETENTION POLICY <rp> ON <db> [DURATION <d>] [REPLICATION <n>]
 ```
 
 这一个返回值改变了 retention 的控制流：新版把 `ErrShardNotFound` 当作**"store 已不再持有该 shard，应去 meta 摘引用"**的信号（`errors.Is(err, tsdb.ErrShardNotFound)`），而不是失败重试。它并不等价于"这是从未存在过的 phantom"：并发 `DROP SHARD`、或上一次 `DeleteShard` 在摘除 `s.shards` 后失败，都会让下一轮落到这里。并且 `SetShardNewReadersBlocked` / `ShardInUse` 在 shard 已不存在时也包装同一个 `ErrShardNotFound`（`v1.12.3:tsdb/store.go:957-962/969-974`），retention 的外层过滤同样会跳过 `DeleteShard` 直接 `DropShardMetaRef`（`v1.12.3:services/retention/service.go:234-235/247-248/263`）。真正"meta 有、本地从未有"的 phantom 不在 `ShardIDs()` 中，只由循环后的 phantom 分支处理（§3.13）。管理面同样受影响：`executeDropShardStatement` 在 `DeleteShard` 返回错误时直接 return（`v1.12.3:coordinator/statement_executor.go:384-390`），因此 `DROP SHARD` 一个本地不存在（或属于其它节点）的 shard 从旧版的幂等成功（并摘掉 meta 引用）变成报错且**不清 meta 引用**；若该组已软删除/过期，稍后由 retention 的 phantom 分支清理。
+
+**案例（`DROP SHARD` 一个本地已不存在的 shard）**：当前 `2026-10-10T12:00:00Z`；meta 中组 `100` `[2026-10-10T00:00Z, 2026-10-11T00:00Z)` 仍为活跃（未 `Deleted`），组内唯一 shard `500`（OSS 每个组固定 1 个 `ShardInfo`）；本地 `<data>/telegraf/autogen/500` 被人工移走，`s.shards` 中没有 500。
+
+- **v1.8.10**：`DROP SHARD 500` → `DeleteShard` 的 `sh == nil` 返回 `nil`（`v1.8.10:tsdb/store.go:700`）→ 继续 `MetaClient.DropShard(500)`。`Data.DropShard` 删掉组内最后一个 shard 并把组的 `DeletedAt` 设为当前时间（`v1.8.10:services/meta/data.go:294-297`）。HTTP 返回 **200**，body `{"results":[{"statement_id":0}]}`；随后 `SHOW SHARDS` **看不到**该组（`coordinator/statement_executor.go:885-890` 跳过 `Deleted()`），meta 中 500 的引用立即消失。
+- **v1.12.3**：`DeleteShard` 返回 `ErrShardNotFound`（`v1.12.3:tsdb/store.go:979-981`），`executeDropShardStatement` 直接 `return err`（`coordinator/statement_executor.go:384-390`），**不会调用 `DropShard`**。HTTP 仍是 **200**（查询结果在 `writeHeader(200)` 之后才产生，`services/httpd/handler.go:793/911`），body 为 `{"results":[{"statement_id":0,"error":"shard not found"}]}`；`SHOW SHARDS` **仍然显示** shard 500。
+- 若该组已经软删除（`DeletedAt` 非零），`SHOW SHARDS` 两版都不显示；旧版立即摘掉 meta 引用，新版留到下一轮 retention 的 phantom 分支（§3.13/§7.2）才摘。管理命令不应把“200 + error 字段”误判为成功。
 
 **(2) 索引类型计数何时递减**
 
@@ -629,7 +841,25 @@ v1.8.10 的 `Store` 里没有 `badShards` 字段（`v1.8.10:tsdb/store.go` 全�
 
 顺带一条可观测性改进：`3c87f524ed` (#25378) 新增启动进度计数（已打开/总数/百分比，`v1.12.3:tsdb/store.go:154/195/562/599`）；日志里的 `Opened shard ... duration` 旧版已有（`v1.8.10:tsdb/store.go:412`），不是新增。
 
+**案例：shard 500 打开失败（T0–T3）**
+
+输入：`db0/autogen` 的 shard 500 目录存在。分两种输入：
+
+- **A（普通 TSM 损坏）**：`<data>/db0/autogen/500/000000001-000000001.tsm` 的 magic/version 被破坏；
+- **B（持续打开失败）**：该 `.tsm` 文件权限为 `000`（或 mmap 失败），`os.OpenFile`/`NewTSMReader` 每次都失败。
+
+| 时刻 | A：普通损坏 | B：权限/持续失败 |
+|------|-------------|------------------|
+| T0 启动 | `loadShards` 并发 `shardLoader.Load()`；`FileStore.Open` 读失败后把文件改名为 `...tsm.bad`，`shard.Open` 返回 `NewShardError` | `os.OpenFile` 返回 `permission denied`，**不改名**，`shard.Open` 返回 `NewShardError` |
+| T1 日志/注册 | 日志 `Cannot read corrupt tsm file, renaming` + `Failed to open shard`，错误 `[shard 500] cannot read corrupt file ...: init: error reading magic number of file: EOF`；`registerShard` 写入 `badShards`，shard 500 不在 `s.shards` | 日志 `Failed to open shard`，错误 `[shard 500] error calling OpenFile on ".../000000001-000000001.tsm" in FileStore.Open: open ...: permission denied`；同样写入 `badShards` |
+| T2 写入（时间戳落在 shard 500 区间） | `WriteToShard`→`ErrShardNotFound`→`CreateShard` 命中 `badShards` 且 `force=false` → 错误 `not attempting to open shard 500; [shard 500] cannot read corrupt file ...`；日志 `Write failed creating shard`（`coordinator/points_writer.go:551`）；HTTP **500** JSON + `X-InfluxDB-Error` | 错误 `not attempting to open shard 500; [shard 500] error calling OpenFile ... permission denied`；HTTP 500，同上 |
+| T3 重启 | **重启后不再失败**：`.tsm.bad` 不匹配 `*.tsm` glob（`file_store.go:600-613`），shard 500 以空 file store 打开并注册；写入恢复 204，但原 TSM 数据已丢失（`.bad` 保留供取证） | **重启仍失败**：权限未修，`FileStore.Open` 再次报错；`badShards` 清空后第一次写入会真正重试打开，失败后回到 `not attempting to open shard 500; ...` |
+
+恢复：A 需从备份恢复 `.tsm`（或接受该 shard 数据丢失）；B 需修复权限/解除 mmap 限制后重启。`ClearBadShardList()` 没有生产调用方（仅测试，`tsdb/store_test.go:291/322`），且 `ReopenShard(force=true)` 要求 shard 已在 `s.shards` 中（`tsdb/store.go:833-837`），启动即失败的 shard 不满足，故进程内无法自救（§7.5）。**注意**：旧稿“TSM 损坏→重启仍失败”的说法只对 B 成立；A 的 `.bad` 改名让重启自动绕过损坏文件（`file_store.go:649-668`）。
+
 ### 3.11 `DeleteSeries`：锁、RP 过滤与并发度
+
+> **跨层归属**：series 删除的引擎与 series-file 机制（`Engine.deleteSeriesRange`、`SeriesFile.DeleteSeriesID`、`FlushSegments`）owner 是 02 §3.11，案例见 02 §6.2；本节只保留 retention/`DELETE` 调用方看到的锁、RP 过滤与并发度结论。
 
 ```go
 // v1.8.10:tsdb/store.go:1330 — 手工 RUnlock，三条返回路径各写一次
@@ -662,113 +892,26 @@ v1.8.10 的 `Store` 里没有 `badShards` 字段（`v1.8.10:tsdb/store.go` 全�
 - **按 RP 过滤**（`8eaa24d813 feat(tsm): Allow for deletion of series outside default rp (#25312)`）：`shardFilterFn = ComposeShardFilter(byDatabase(database), byRetentionPolicy(rp))`（`v1.12.3:tsdb/store.go:1713`）。旧版 `DELETE FROM db.rp.measurement` 会扫该 DB 下**所有** RP 的 shard。
 - **并发度可配**（`eb3bc7069f feat: configurable DELETE concurrency (#23055)`）：`limiter.NewFixed(1)` → `limiter.NewFixed(s.EngineOptions.Config.MaxConcurrentDeletes)`（`v1.8.10:tsdb/store.go:1347` / `v1.12.3:tsdb/store.go:1732`），默认仍为 1（`tsdb/config.go:75`）。
 
-### 3.12 purger 重写：从"全局写锁"到 sync.Map（#27146 / #26762）
+**案例：同库两个 RP 的 `DELETE`**
 
-旧版（`v1.8.10:tsdb/engine/tsm1/file_store.go:1376`）：
+输入：`db0` 有 `rp1`（shard 3）与 `rp2`（shard 4）；两边都写入同一 series `cpu,host=a`（`POST /write?db=db0&rp=rp1` / `rp=rp2`），各 1 点。
 
-```go
-type purger struct {
-	mu        sync.RWMutex
-	fileStore *FileStore
-	files     map[string]TSMFile
-	running   bool
-	logger    *zap.Logger
-}
+请求：`POST /query`，表单 `q=DELETE FROM db0.rp1.cpu`。
 
-func (p *purger) add(files []TSMFile) {
-	p.mu.Lock()
-	for _, f := range files { p.files[f.Path()] = f }
-	p.mu.Unlock()
-	p.purge()
-}
+| 版本 | shard 过滤 | 实际执行 | 结果 |
+|------|------------|----------|------|
+| v1.8.10 | `filterShards(byDatabase("db0"))`（`v1.8.10:tsdb/store.go:1341`），不看 source 的 RP | walk shard 3 与 shard 4；两边的 measurement 名都是 `cpu` | rp1 与 rp2 的 `cpu,host=a` 都被删除；`SELECT * FROM db0.rp1.cpu`、`...rp2.cpu` 均为空 |
+| v1.12.3 | `ComposeShardFilter(byDatabase("db0"), byRetentionPolicy("rp1"))`（`tsdb/store.go:1697-1714`） | 只 walk shard 3 | 仅 rp1 被删除；rp2 的 `cpu,host=a` 保留 |
 
-func (p *purger) purge() {
-	p.mu.Lock()                       // 进入 goroutine 前先占锁置位
-	if p.running { p.mu.Unlock(); return }
-	p.running = true
-	p.mu.Unlock()
-	go func() {
-		for {
-			p.mu.Lock()                       // 整个扫描 + Close + Remove 都在写锁内
-			for k, v := range p.files {
-				if !v.InUse() {
-					if err := v.Close(); err != nil {
-						p.logger.Info("Purge: close file", zap.Error(err))
-						continue              // 保留在 map 里，1 秒后重试，日志无限刷
-					}
-					if err := v.Remove(); err != nil {
-						p.logger.Info("Purge: remove file", zap.Error(err))
-						continue
-					}
-					delete(p.files, k)
-				}
-			}
-			if len(p.files) == 0 { p.running = false; p.mu.Unlock(); return }
-			p.mu.Unlock()
-			time.Sleep(time.Second)
-		}
-	}()
-}
-```
+混合 RP：`DELETE FROM db0.rp1.cpu,db0.rp2.cpu` 在新版返回错误 `mixed retention policies not supported, wanted "rp1" got "rp2"`（`tsdb/store.go:1704-1708`）→ HTTP 400；旧版不校验，照常删除两个 shard。`DELETE FROM db0.cpu`（不写 RP）时 `rp == ""` 不加 RP 谓词（`:1712-1714`），两版都扫全库所有 RP。
 
-新版（`v1.12.3:tsdb/engine/tsm1/file_store.go:1599`）：
+### 3.12 purger（跨层摘要：owner 04 §3.15）
 
-```go
-type purger struct {
-	files   gensyncmap.Map[string, TSMFile]   // sync.Map 泛型封装
-	mu      sync.Mutex                        // 只保护 running
-	running bool
-	logger  *zap.Logger
-}
+**归属**：purger 的结构、`gensyncmap.Map` 改造、`add`/`purge`/`hasFiles` 的竞态与失败重试策略，owner 是 04 §3.15（完整代码与案例见 04 §6.5）。本节只回答“retention 为什么受它影响”。
 
-func (p *purger) add(files []TSMFile) {
-	if len(files) == 0 { return }             // #26762：空批直接返回
-	var fileNames []string
-	for _, f := range files {
-		fileName := f.Path()
-		fileNames = append(fileNames, fileName)
-		p.files.Store(fileName, f)
-	}
-	p.purge(fileNames)
-}
+**与 retention 的接口**：retention 的 `Store.DeleteShard` 在删完 series/索引后调用 `sh.Close()` → `FileStore.Close`；被查询占用的 TSM 文件会先 rename 成 `.tsm.tmp`，再 `purger.add` 延迟删除（`v1.12.3:tsdb/engine/tsm1/file_store.go:1599`）。旧版 purger 在整个扫描 + `Close` + `Remove` 期间持 `RWMutex`，而 `add` 在 `FileStore.replace` 持写锁时调用，于是磁盘慢 I/O 会反向阻塞 compaction/替换路径；新版用 `sync.Map`，`mu` 只保护 `running`。
 
-func (p *purger) purge(fileNames []string) {
-	p.mu.Lock(); defer p.mu.Unlock()
-	if p.running { /* 已在跑，文件已入 map，直接返回 */ return }
-	p.running = true
-	go func() {
-		var purgeCount, failCount int
-		defer func() {                        // 结束汇总：Info(removed)，有失败再 Warn
-			p.logger.Info("removed", zap.Int("files", purgeCount))
-			if failCount > 0 { p.logger.Warn("failed to remove", zap.Int("files", failCount)) }
-		}()
-		for p.hasFiles() {                    // hasFiles 在锁内顺手把 running 置为 false
-			p.files.Range(func(k string, v TSMFile) bool {
-				if !v.InUse() {
-					if err := v.Close(); err != nil { failCount++ }
-					else if err := v.Remove(); err != nil { failCount++ }
-					else { purgeCount++ }
-					p.files.Delete(k)         // 成功失败都删，不再重试
-				}
-				return true
-			})
-			time.Sleep(time.Second)
-		}
-	}()
-}
-```
-
-关键差异：
-
-| 维度 | v1.8.10 | v1.12.3 | 影响 |
-|------|---------|---------|------|
-| 并发保护 | 一个 `RWMutex` 覆盖"遍历 + InUse + Close + Remove" | `sync.Map` 无锁遍历，`mu` 只保护 `running` | 不再阻塞 `FileStore` 的提交/读路径 |
-| 失败处理 | `continue` → 留在 map，每秒重试并 `Info` 打日志 | 从 map 删除，`failCount++`，结束时一行 `Warn` | 消除无限日志与无效重试 |
-| 空批次 | 每次 compaction 都开 operation 日志 | `len(files)==0` 直接返回 | 降日志噪声 |
-| 日志级别 | 失败 `Info`，无成功日志 | 失败 `Error`，成功 `Debug`，汇总 `Info/Warn` | 可观测性更好 |
-| 退出条件 | `len(files)==0` 时在锁内置 `running=false` | `hasFiles()` 在锁内检查并置位 | 消除 `add` 与 goroutine 退出之间的竞态 |
-
-注意 `gensyncmap.Map` 是仓库内新增的泛型 `sync.Map` 封装（`pkg/data/gensyncmap`），属于 Go 1.18+ 泛型化的配套改造。
+**本区间结论**：机制从“一把大锁”变为“短临界区 + 失败即出队”，retention 删除后的空间回收不再容易拖住 compaction；代价是失败文件在本进程内不再重试（7.4，详见 04 §7 第 8 条）。版本差异一行：`v1.8.10:tsdb/engine/tsm1/file_store.go:1376` → `v1.12.3:tsdb/engine/tsm1/file_store.go:1599`（`d5a48e0662` #27146、`e883e8bec3` #26762）。
 
 ### 3.13 retention 服务：从"一次遍历"到"五阶段 + phantom 自愈"
 
@@ -790,83 +933,35 @@ func (p *purger) purge(fileNames []string) {
 - **`Open()` 增加前置校验**：`DropShardMetaRef == nil` 直接返回错误（`v1.12.3:services/retention/service.go:107`），避免"服务启动了但永远不会摘 meta 引用"的静默失效。
 - **错误处理更细**：任一步返回 `ErrShardNotFound` 时**继续**去 `DropShardMetaRef`（本地已无该 shard，含并发删除；见 §3.8(1)）；其他错误才 `retryNeeded = true`。重试是否有效取决于失败位置：闸门 / `ShardInUse` / 摘除前失败时 shard 仍在 `ShardIDs()`，下一轮可重来；`DeleteShard` 摘除后的失败会让 shard 从 `ShardIDs()` 消失，下一轮由循环后的 phantom 分支摘引用（§7.2）。被 `InUse` 跳过的 shard 也在下一轮重试，且**不会**被误判为 phantom（`delete(deletedShardIDs, id)` 发生在错误判断之前，`v1.12.3:services/retention/service.go:219`）。
 
-### 3.14 #27114 到底改了什么：把"每条 series 一次 fsync"改成"每分区一次 fsync"
+### 3.14 #27114（跨层摘要：owner 02 §3.11）
 
-这条 PR 的标题是 "Logging and fsync delay for retention deletion"，但它**没有改 `services/retention/service.go` 一行**，改的是 retention 调用的那条删除链路（`tsdb/store.go`、`tsdb/series_file.go`、`tsdb/series_partition.go`、`tsdb/engine/tsm1/engine.go`）。
+**归属**：`DeleteSeriesID(id, flush bool)`、`FlushSegments(partitionIDs)`、`NoFlush` 常量、每 1 万条进度日志与失败日志的完整实现，owner 是 02 §3.11，数值案例见 02 §6.2。本节只保留“retention 为什么需要批量 fsync”的结论。
 
-**(1) `DeleteSeriesID` 增加 `flush` 参数**
+**结论**：旧版 `SeriesPartition.DeleteSeriesID` 只做 `segment.Flush()`（bufio → 内核，**不 fsync**），成本是 N 条 series 各一次显式 flush、0 次 fsync；新版把 tombstone 写入改为 `NoFlush`，循环结束后按分区收集 `partitionIDs`，`FlushSegments` 每个分区只对 **active segment** fsync 一次（`SeriesFilePartitionN=8`，`v1.12.3:tsdb/series_file.go:211-238`），成本变为 ≤8 次 fsync。收益是删除百万级 series 的 shard 时 I/O 次数从 O(N) 降到 O(分区数)，retention 不再长时间卡在删除阶段。
 
-```go
-// v1.8.10:tsdb/series_partition.go:317
-func (p *SeriesPartition) DeleteSeriesID(id uint64) error {
-	...
-	// Write tombstone entry.
-	_, err := p.writeLogEntry(AppendSeriesEntry(nil, SeriesEntryTombstoneFlag, id, nil))
-	if err != nil { return err }
+**边界**：`FlushSegments` 失败只记 `error while flushing a series file segment`，不阻断删除、不触发 `retryNeeded`；批内因写满而轮转出的旧 segment 仍可能未 fsync（02 §3.11）。调用方只有 `Store.DeleteShard` 与 `Engine.deleteSeriesRange` 两条生产路径。
 
-	// Flush active segment write.
-	if segment := p.activeSegment(); segment != nil {
-		if err := segment.Flush(); err != nil { return err }   // 只刷用户态缓冲，不 fsync
-	}
-	p.index.Delete(id)
-	return nil
-}
-
-// v1.12.3:tsdb/series_partition.go:334
-func (p *SeriesPartition) DeleteSeriesID(id uint64, flush bool) error {
-	...
-	if flush {
-		if segment := p.activeSegment(); segment != nil {
-			if err := segment.Flush(); err != nil {
-				return fmt.Errorf("unable to flush segment %s: %w", segment.file.Name(), err)
-			}
-		}
-	}
-	p.index.Delete(id)
-	return nil
-}
-```
-
-**(2) 新增批量刷盘入口**
-
-```go
-// v1.12.3:tsdb/series_file.go:34
-	// Flush lets us know when to fsync
-	Flush = true
-	// NoFlush lets us know when to not fsync
-	NoFlush = false
-
-// v1.12.3:tsdb/series_file.go:203
-func (f *SeriesFile) DeleteSeriesID(id uint64, flush bool) (*SeriesPartition, error) {
-	p := f.SeriesIDPartition(id)
-	if p == nil { return nil, ErrInvalidSeriesPartitionID }
-	return p, p.DeleteSeriesID(id, flush)
-}
-
-// v1.12.3:tsdb/series_file.go:211
-func (f *SeriesFile) FlushSegments(partitionIDs map[int]struct{}) error {
-	// 每个分区一个 goroutine：p.mu.Lock() → segment.Flush() → Unlock
-	// 错误收集到 errCh，最后 errors.Join
-}
-```
-
-**(3) 两处生产调用方改成"先 NoFlush、最后统一 FlushSegments"，另有一处测试调用**
-
-- `Store.DeleteShard`：`v1.12.3:tsdb/store.go:1083` + `:1108`
-- `Engine.deleteSeriesRange`（DELETE / DROP SERIES）：`v1.12.3:tsdb/engine/tsm1/engine.go:1858` + `:1878`
-- `#27114` 同时把 `influx_inspect verify` 的**测试**调用改为 `tsdb.Flush`；生产侧只有 `Store.DeleteShard` 与 `Engine.deleteSeriesRange` 两条删除路径，均改为 `NoFlush` + `FlushSegments`
-
-**(4) 附带日志**
-
-- 每 10,000 条：`DeleteShard: 10000 series deleted`，字段含 `db/shard_id/deleted/remaining/total/elapsed`（`v1.12.3:tsdb/store.go:1095`）。
-- 每条失败：`cannot delete series in shard`，含 `series_id/shard_id/series_file_path`（`v1.12.3:tsdb/store.go:1084-1092`）。旧版**完全忽略** `sfile.DeleteSeriesID(id)` 的返回值。
-- 分区刷盘失败：`error while flushing a series file segment`（`v1.12.3:tsdb/store.go:1110`）。该错误只记日志、**不阻断删除也不触发 retryNeeded**：`Store.DeleteShard` 继续 `sh.Close()`/`RemoveAll`，`Engine.deleteSeriesRange` 直接返回 nil（`tsdb/engine/tsm1/engine.go:1878-1885`）；tombstone 可能未落盘，删除仍宣告成功。
-
-**收益机制**（不编数字）：旧成本 ≈ `N_series × fsync`；新成本 ≈ `min(N_series, 8) × fsync`（`SeriesFilePartitionN = 8`，`tsdb/series_file.go:32`）+ `N_series` 次内存写入。当 shard 含百万级 series 时，这是数量级差异，也是"retention 看起来卡住"的直接原因之一。`Engine.deleteSeriesRange` 同理，影响 `DELETE FROM` / `DROP SERIES` 的响应时间。
+**版本差异一行**：`v1.8.10:tsdb/series_partition.go:317` → `v1.12.3:tsdb/series_partition.go:334`、`tsdb/series_file.go:203/211`（`1420aaf2bc` #27114/#27129）。
 
 ### 3.15 CQ：调度与 DST 未变，SELECT INTO 写回受 `PointsWriter` 写窗口影响
 
-`services/continuous_querier/service.go` 在本区间的净变化只有 **+13 / −1 行**（`git diff --numstat v1.8.10 HEAD`）：一个 `Diagnostics()` 桩函数 + 一个 import + 一处 `cq_query` 写失败日志。逐项确认：
+#### 3.15a 角色与结构
+
+**角色**：`continuous_querier.Service` 周期性执行 `CREATE CONTINUOUS QUERY` 定义的降采样查询，把 `SELECT ... INTO` 的结果写回目标 RP。它不拥有查询引擎或写路径，只负责“何时跑、跑哪条、进度记在哪”。
+
+**结构**：
+
+| 字段 | 作用 | 证据 |
+|------|------|------|
+| `MetaClient` | `AcquireLease` / `Databases` / `Database` | `v1.12.3:services/continuous_querier/service.go:45-49` |
+| `QueryExecutor` | 执行 `SELECT INTO`，实际写回由 `coordinator` 完成 | `:86`；`coordinator/statement_executor.go:566` |
+| `Monitor` | 可选写 `cq_query` 统计点（`durationNs`/`pointsWrittenOK`/`startTime`/`endTime`） | `:73-76`、`:418-428` |
+| `RunInterval` / `RunCh` | 定时触发与外部按需触发 | `:89-91`、`:216-245` |
+| `lastRuns map[string]time.Time` | 每个 CQ 的上次运行时间，key = `db` + `\x1f` + `name`；**只在内存** | `:97-99`、`:302-307` |
+| `stats` / `Statistics()` | `queryOk`、`queryFail` 两个计数 | `:34-35`、`:162-171` |
+| `Diagnostics()` | 空实现，仅为满足 `monitor.Monitor` 接口 | `:175-177` |
+
+**调度与 DST 差异**：下表逐项确认“CQ 自身未变”的边界；DST 的 `GROUP BY time(1d) offset` 修复在查询引擎，不在 CQ 服务（CQ 的窗口仍用基于 Unix 秒的 `truncate()`）。
 
 | 关注点 | v1.8.10 | v1.12.3 | 结论 |
 |--------|---------|---------|------|
@@ -875,58 +970,86 @@ func (f *SeriesFile) FlushSegments(partitionIDs map[int]struct{}) error {
 | `shouldRunContinuousQuery`（EVERY/FOR 判定） | `service.go:500` | `service.go:512` | 未变 |
 | `ExecuteContinuousQuery` 的 `LastRun` 计算 | `service.go:331` | `service.go:338` | 未变 |
 | `startTime`/`endTime` 窗口 | `service.go:352-353` | `service.go:359-360` | 未变 |
-| `AcquireLease` 调用 | `service.go:223/232` | `service.go:230/239`（同结构） | 未变（OSS 恒成功） |
-| SELECT INTO 写回 | `BufferedPointsWriter`(10000) → `PointsWriter`（无写窗口） | 同一链路，但 `MapShards` 新增 `WriteWindow`、`WriteToShard(WriteContext)`、`Subscriber.Send` | 见下方说明：可能丢点并计 `QueryFail` |
+| `AcquireLease` 调用 | `service.go:223/232` | `service.go:230/239` | 未变（OSS 恒成功，见 3.1c） |
+| SELECT INTO 写回 | `BufferedPointsWriter`(10000) → `PointsWriter`（无写窗口） | 同一链路，但 `MapShards` 新增 `WriteWindow`、`WriteToShard(WriteContext)`、`Subscriber.Send` | 可能丢点并计 `QueryFail`（3.15b/3.15c） |
 
-> **写回并不在 CQ 服务文件里**：`ExecuteContinuousQuery` 只发查询；`SELECT INTO` 由 `coordinator/statement_executor.go:566` 的 `BufferedPointsWriter`（容量 10000）承接，`Flush()` → `PointsWriter.WritePointsInto` → `WritePointsPrivileged`（`points_writer.go:454-460/474-538`）。本区间在 `MapShards` 新增 `WriteWindow`（`points_writer.go:211-245`）：当 `SELECT INTO` 的目标 RP 设置 `PAST/FUTURE LIMIT` 后，CQ 按 `FOR` 补算的历史点会在 `:346-352` 被丢弃，`WritePointsPrivileged` 返回 `PartialWriteError`（`:517-521`），`BufferedPointsWriter.Flush` 上抛（`statement_executor.go:608-610`），`runContinuousQueryAndWriteResult` 的 `res.Err` 使 CQ 失败（`continuous_querier/service.go:390-394`），循环记 `QueryFail` 并打 `Error executing query`（`:271-273`）。注意 `LastRun` 在执行查询**之前**就写入 `s.lastRuns`（`:337-340`），写窗口丢弃导致的 `res.Err` 不会回退进度：被丢弃区间**不会自动补算**，除非显式 `RESAMPLE FOR` 或手工回填。因此"逐字未变"只对 CQ 服务自身的调度/窗口计算成立。
+#### 3.15b 流程：timer/RunCh → lease → SELECT INTO → 写窗口
 
-> 关于 DST：`d60741b506 fix: GROUP BY queries with offset that crosses a DST boundary fail (#25082)` 修的是**查询引擎**里 `GROUP BY time(1d) offset` 的窗口计算，不在 CQ 服务里。CQ 的窗口截断仍是基于 Unix 时间戳的 `truncate()`，与 v1.8.10 一致。详见 `[05 Downsampling](../05_downsampling_spec.md)`。
-
-新增内容只有两块：
-
-```go
-// v1.12.3:services/continuous_querier/service.go:175
-// Required for Monitor interface. Currently does not return any
-// diagnostic values.
-func (s *Service) Diagnostics() (*diagnostics.Diagnostics, error) {
-	return &diagnostics.Diagnostics{}, nil
-}
-
-// v1.12.3:services/continuous_querier/service.go:423
-		if err := s.Monitor.WritePoints(models.Points{p}); err != nil {
-			log.Error("failed storing continuous query statistics",
-				zap.String("name", cq.Info.Name), logger.Database(cq.Database), zap.Error(err))
-		}
-```
-
-后者来自 `bfccddc7b6 fix: log errors in continuous query statistics storage (#23822)`：旧版 `s.Monitor.WritePoints(models.Points{p})` 的返回值被直接丢弃，`cq_query` 统计写失败时无任何痕迹。
-
-`Diagnostics()` 是 `monitor.Monitor` 注册服务的必要条件（`monitor/service.go` 在 `f75be56eee` 中同步改动），**它返回空诊断**，真正的 CQ 数据走 `Statistics()`。
-
-#### `/debug/vars` 里的 `cq`（#26874）
+1. `Open()` 启动一个 `backgroundLoop` goroutine；`Close()` 关闭 `stop` 并 `wg.Wait()`（`:121-151`）。
+2. `backgroundLoop` 在 `stop`、`RunCh`、timer 三个分支中选择；`RunCh` 分支来自公开的 `Run(database,name,t)`（`:180-213`），用于手工立即执行。
+3. 两个触发分支都先 `hasContinuousQueries()`；没有 CQ 直接跳过，不获取 lease。
+4. `AcquireLease("continuous_querier")`：OSS 恒成功；失败（集群版）则跳过本轮（3.1c）。
+5. `runContinuousQueries` 遍历 `MetaClient.Databases()`，对每个匹配的 CQ 调 `ExecuteContinuousQuery`；错误时 `Error executing query` + `QueryFail++`，成功且实际执行时 `QueryOK++`（`:261-280`）。
+6. `ExecuteContinuousQuery`：从 `lastRuns` 取进度 → 补默认目标 RP → 取 `GROUP BY` interval/offset → `shouldRunContinuousQuery` 决定是否跑 → **先把 `LastRun` 推进并写回 `lastRuns`**（`:337-340`）→ 计算 `[startTime,endTime)` → 执行查询。
+7. `runContinuousQueryAndWriteResult` 把 CQ 包成 `influxql.Query` 交给 `QueryExecutor`；`SELECT INTO` 由 `coordinator/statement_executor.go:566` 的 `BufferedPointsWriter`（容量 10000）承接，`Flush()` → `PointsWriter.WritePointsInto` → `WritePointsPrivileged`（`points_writer.go:454-460/474-538`）。
+8. 目标 RP 设置 `PAST/FUTURE LIMIT` 时，`MapShards` 的 `WriteWindow.WithinWindow` 会把越界点 `AddDropped` 后 `continue`（`points_writer.go:346-352`）；若仍有有效点被写入，`WritePointsPrivileged` 在等待 shard 之前构造 `PartialWriteError`（`:517-521`），`BufferedPointsWriter.Flush` 上抛（`statement_executor.go:608-610`），`res.Err` 使 CQ 失败（`service.go:390-394`）。
+9. 失败不会回退 `LastRun`：第 6 步已经推进进度，因此被写窗口丢弃的区间**不会自动补算**。
 
 ```go
-// v1.12.3:services/httpd/handler.go:2452
-		if s.Name == "cq" {
-			jv, err := parseCQStatistics(&s.Statistic)   // 直接返回 s.Values
-			...
-			_, err = fmt.Fprintf(w, "\"cq\": %s", data)
-			continue
-		}
+// v1.12.3:services/continuous_querier/service.go:216-245（节选）
+case req := <-s.RunCh:
+	if !s.hasContinuousQueries() { continue }
+	if _, err := s.MetaClient.AcquireLease(leaseName); err == nil {
+		s.runContinuousQueries(req)
+	}
+case <-t.C:
+	if !s.hasContinuousQueries() { t.Reset(s.RunInterval); continue }
+	if _, err := s.MetaClient.AcquireLease(leaseName); err == nil {
+		s.runContinuousQueries(&RunRequest{Now: time.Now()})
+	}
+	t.Reset(s.RunInterval)
 ```
 
-旧版没有这个分支，`cq` 走通用路径：`json.Marshal(models.Statistic)` 后以 `"cq": {...}` 输出，内容是 `{"name":"cq","tags":{},"values":{...}}`。新版只输出 `values` 本身：
-
-```json
-// v1.8.10
-"cq": {"name":"cq","tags":{},"values":{"queryOk":12,"queryFail":0}}
-// v1.12.3
-"cq": {"queryOk":12,"queryFail":0}
+```go
+// v1.12.3:services/continuous_querier/service.go:337-340 — 先推进进度，再执行查询
+cq.LastRun = truncate(now.Add(-offset), resampleEvery).Add(offset)
+s.lastRuns[id] = cq.LastRun
 ```
 
-`cq` 只有 `queryOk` / `queryFail` 两个键（`v1.12.3:services/continuous_querier/service.go:34-35`），没有 `queryOK`（大写 K），也没有 `QueryDurationNs` 之类的耗时字段。监控脚本若按 `.cq.values.queryOk` 取值，升级后要改为 `.cq.queryOk`；按 `.cq.values.queryOK` 取值在两版都取不到。
+#### 3.15c 案例：`FOR 6h` 补算遇到目标 RP `PAST LIMIT 1h`
 
-另外 `SHOW CONTINUOUS QUERIES` 增加了库级鉴权（`71b3d06494 fix: require database authorization to see continuous queries (#22283)`）：
+**输入**：
+
+```sql
+CREATE RETENTION POLICY hot ON db0 DURATION 24h REPLICATION 1 PAST LIMIT 1h;
+CREATE CONTINUOUS QUERY cq_cpu ON db0
+  RESAMPLE EVERY 1h FOR 6h
+BEGIN
+  SELECT mean(usage_user) INTO db0.hot.cpu
+  FROM db0.autogen.cpu GROUP BY time(1h)
+END;
+```
+
+**时序**（UTC，offset=0）：上一轮 `LastRun=11:00`，当前 tick `now=12:00`。
+
+| 步骤 | 计算/动作 | 结果 |
+|------|-----------|------|
+| 1 | `shouldRunContinuousQuery` | `nextRun=12:00`，`run=true` |
+| 2 | `resampleFor=6h`、`resampleEvery=1h` | — |
+| 3 | `startTime = truncate(12:00+1h-6h-1ns,1h)` | `06:00` |
+| 4 | `endTime = truncate(12:00+1h-1h,1h)` | `12:00` |
+| 5 | 查询 `[06:00,12:00)` | 6 个 1h 桶：06:00、07:00、08:00、09:00、10:00、11:00 |
+| 6 | `LastRun=12:00` 写入 `lastRuns` | 进度已推进 |
+| 7 | 写回时 `NewWriteWindow(hot)`：`now≈12:00`、`PastWriteLimit=1h` | 下界 `11:00`（若 tick 在 12:00:00 之后几毫秒触发，11:00 桶也会落在下界之前） |
+| 8 | 06:00-10:00 的 5 个桶 `WithinWindow=false`（tick 延迟时 11:00 也被丢，`Dropped=6`） | `AddDropped`；仍在下界内的桶正常写入 |
+| 9 | `PartialWriteError` 上抛 | `BufferedPointsWriter.Flush` 返回错误 → `res.Err` → `QueryFail++`，日志 `Error executing query` |
+| 10 | 下一轮 13:00 | 查询 `[07:00,13:00)`，下界 `12:00`；07:00-11:00 再次被丢，12:00 桶是否写入取决于写回是否恰在整点（毫秒延迟会把它也丢）。**06:00 的桶永远不会再进入查询窗口** |
+
+**预期输出/观测**：`/debug/vars` 的 `cq.queryFail` 每轮 +1（输出形状见 06 §3.12）；服务器日志出现 `Error executing query`；`db0.hot.cpu` 中只有写窗口下界内的桶（理想整点写回时是 11:00；有毫秒延迟时可能一个都不剩），06:00-10:00 缺失。该 CQ 会持续“补算 6h、丢掉大部分桶”，直到目标 RP 的 `PAST LIMIT` 被调大。
+
+**恢复**：先 `ALTER RETENTION POLICY hot ON db0 PAST LIMIT 8h`（v1.12.3 支持；多留 1h 余量，避免整点毫秒差），下一轮 CQ 的写窗口下界变为 `now-8h`，07:00 之后的桶可以被接受；06:00 桶已不在 `FOR 6h` 窗口内，需要把 `RESAMPLE FOR` 临时调大（或停机手工执行同一条 `SELECT INTO`）才能补回。v1.8.10 没有写窗口，同一 CQ 不会出现这个失败。
+
+#### 3.15d 风险
+
+- **不自动重试**：`LastRun` 在执行查询前推进，写窗口丢弃/查询失败都不会回退；`RESAMPLE FOR` 只扩大每次查询窗口，不会让已经滑出窗口的桶复活。
+- **无资源隔离**：CQ 与用户查询共用 `QueryExecutor`/`PointsWriter`，大 `SELECT INTO` 会挤占用户查询（主 05 §7.1）。
+- **lease 无互斥**：OSS `AcquireLease` 恒成功，多进程共享 meta 时同一 CQ 可能重复执行（3.1c）。
+- **`lastRuns` 非持久化**：重启后进度清零，首轮可能重新计算一个较大窗口；是否重复写入取决于目标 RP 的写窗口与时间边界（主 05 §7.2）。
+- **统计写失败仍不重试**：`Monitor.WritePoints` 失败现在打 `Error`（`:423-428`），不回滚 CQ 结果。
+
+#### `SHOW CONTINUOUS QUERIES` 的库级鉴权
+
+`SHOW CONTINUOUS QUERIES` 增加了库级鉴权（`71b3d06494 fix: require database authorization to see continuous queries (#22283)`）：
 
 ```go
 // v1.8.10:coordinator/statement_executor.go:648
@@ -943,41 +1066,183 @@ func (e *StatementExecutor) executeShowContinuousQueriesStatement(ctx *query.Exe
 	}
 ```
 
-非管理员用户升级后会**看不到**自己无权限的库里的 CQ —— 这是有意的安全修复，但会改变既有脚本的输出。
+非管理员用户升级后只能看到自己有权限的库里的 CQ；这是有意的安全修复，但会改变既有脚本输出。附注：`CreateContinuousQuery` 的名称比较在本区间改为大小写不敏感（`strings.EqualFold`，`2529799abb`，`v1.12.3:services/meta/data.go:507`）。
 
-> 附注：`CreateContinuousQuery` 的名称比较在本区间改为大小写不敏感（`strings.EqualFold`，`2529799abb`，`v1.12.3:services/meta/data.go:507`）。
+**案例：普通用户的 `SHOW CONTINUOUS QUERIES`**
 
-### 3.16 snapshotter / precreator / subscriber
+输入：`auth-enabled=true`；`db0` 有 `cq_cpu`、`db1` 有 `cq_mem`；`alice` 是 admin，`bob` 只有 `db0` 的 READ，`carol` 只有 `db1` 的 READ，`dave` 无任何权限。
 
-**snapshotter：没有功能变化。** 全区间改动只有 `ioutil.ReadAll` → `io.ReadAll`、注释里的空 `//` 行，以及测试里 `tcp.NewMux(tcp.MuxLogger(os.Stderr))`。
-
-- **IDMap 握手未变**：`respondIDMap` 仍是 `[BackupMagicHeader(8) + npairs(8)]` 头部，再写 `(from,to)` 对（`v1.8.10:services/snapshotter/service.go:249` / `v1.12.3:services/snapshotter/service.go:249`，行号与实现均未动）。
-- **备份路径未变**：`writeMetaStore` 仍调用 `MetaClient.MarshalBinary()` 取 `meta.db` 的 protobuf 字节，按 `[BackupMagicHeader(8) | len(metaBlob)(8)] | metaBlob | len(nodeJSON)(8) | nodeJSON` 的顺序写出（`v1.12.3:services/snapshotter/service.go:267-301`，与 v1.8.10 相同）。因为 3.2 的 wire format 兼容，**旧版本备份可以被新版本恢复**。
-- **恢复路径未变**：`updateMetaStore` → `meta.Data.UnmarshalBinary` → `ossClient.Data()`（取当前 Data 作为合并基座）→ `ImportData`（合并而非替换）→ `SetData` → `createNewDBShards` → `respondIDMap(IDMap)`（`v1.12.3:services/snapshotter/service.go:181-221`）。失败语义分两类：解码失败、非 OSS 客户端、`ImportData` 失败会**先回一个空 IDMap** 再返回错误（`:185/:193/:203`）；`SetData` 与 `createNewDBShards` 失败则**不发任何响应**、直接返回错误（`:209-217`），客户端只能从连接关闭判错；只有全部成功才回 IDMap。**`SetData` 成功、`createNewDBShards` 失败是非原子半完成态**：meta 已提交到 `meta.db` 但客户端收不到 IDMap；重试时 `ImportData → importOneDB` 因目标库已存在返回 `database already exists`（`v1.12.3:services/meta/data.go:916`），只回空 IDMap，恢复卡死，需人工清理已导入的库/元数据。`ImportData`/`importOneDB` 在区间内**没有改动**，因此恢复出来的 RP 会带上备份文件里的写窗口字段（如果有）；但从 v1.8.10 备份恢复到 v1.12.3 时字段为 0（不限制）。另外恢复链路**非原子**：`Data()` 取克隆到 `SetData` 之间若有正常 meta commit，`SetData` 会用旧基座覆盖新提交（丢失更新）；恢复期间应避免并发元数据变更，建议停机恢复。
-
-**precreator：零改动。** `git diff v1.8.10 HEAD -- services/precreator` 为空。
-
-**subscriber：整体重写（虽然不在本题主线，但它是 meta 变更的主要消费者，必须交代）。**
-
-| 维度 | v1.8.10 | v1.12.3 |
+| 用户 | v1.8.10 | v1.12.3 |
 |------|---------|---------|
-| 数据入口 | `Service.Points() chan<- *WritePointsRequest`（`service.go:228`），由 `PointsWriter.subPoints` 直接投递 | `Service.Send(*WritePointsRequest)` → `subscriptionRouter.Send`（`service.go:608`） |
-| 分发 | `run()` 单 goroutine 遍历所有订阅，按 `db/rp` 匹配 | `subscriptionRouter` 维护 `map[dbrp][]*chanWriter`（`service.go:586`）；`Send` 的读锁覆盖"查表 + 整批 `NewWriteRequest` 序列化 + 逐 writer 分发"（`:608-627`），锁粒度 O(points)，`Update`/`Close` 的写锁会被整批序列化阻塞 |
-| 背压 | 只有 `WriteBufferSize` 条数上限；`run()` 里 channel 满 → `WriteFailures++`（不打日志），`PointsWriter` 投递到 `s.points` 失败 → `SubWriteDrop++` | 条数上限 + **字节上限** `TotalBufferBytes`（新配置，`config.go:49`）；两种丢弃都计 `WriteFailures` 并打 `Warn`（`service.go:449`）；`SubWriteDrop` 指标被删除。**`total-buffer-bytes != 0` 且订阅数归零时 `int64(TotalBufferBytes/len(s.subs))` 整数除零 panic（`:373`）**，见 7.14 |
-| 序列化 | `coordinator.WritePointsRequest.Points`（`models.Point` 切片）逐个 `p.String()` | **一次**把整批 points 拼成 line protocol（`NewWriteRequest`，`service.go:42`），HTTP 走 `WriteRawCtx` |
-| 点校验 | 无 | `models.ValidPointStrings` 过滤非法点（#21558 非 UTF-8 修复的上游），计入 `writeFailures` |
-| 关闭 | `close(s.points)` + `close(s.closing)` | `router.Close()` + `close(s.closing)` + `wg.Wait()` + 逐个 `cw.Close()`，可重复调用（`CancelAndClose()` 只用于退订，`service.go:387/478`）；但 `router.Close()` 先于 `s.mu`/`close(s.closing)`，与已通过 `closing` 检查的 `updateSubs` 存在窗口——`router.Update` 遇 `!ready` 直接 panic（`:175-195`/`:629-634`），见 7.14 |
-| 指标 | `pointsWritten/writeFailures/createFailures` | 新增 `memUsage`（`service.go:250`） |
-| 写失败日志 | `c.logger.Info(err.Error())` | `Write failed` 来自 `d2f874b411`；`Write rejected, queue over byte limit` / `queue full` 来自 `eea87ba94c` (#25589) |
+| alice (admin) | db0、db1 两行 | db0、db1 两行 |
+| bob (READ db0) | **db0、db1 两行**（无过滤） | 只有 db0 一行 |
+| carol (READ db1) | db0、db1 两行 | 只有 db1 一行 |
+| dave (无权限) | db0、db1 两行 | 空结果集（HTTP 200，无 row） |
 
-注意：`PointsWriter` 侧的 `SubWriteDrop` 统计被**删除**（`statSubWriteDrop` 在 v1.12.3 已不存在），丢弃计数改由 subscriber 自己的 `writeFailures` 承担。
+`CoarseAuthorizer` 在 `auth-enabled=false` 时是 `query.OpenCoarseAuthorizer`（`services/httpd/handler.go:742-748`），`AuthorizeDatabase` 恒 true，所以关闭认证时两版都返回全部行；只有开启认证后才会出现上表差异。源码：`v1.12.3:coordinator/statement_executor.go:654-670`、`v1.8.10:coordinator/statement_executor.go:648-660`。
+
+> `/debug/vars` 中 `cq` 的扁平化、输出样例与截断风险统一由 06 §3.12/§6.4 维护；本篇只声明 CQ 统计字段是 `queryOk`/`queryFail`（`v1.12.3:services/continuous_querier/service.go:34-35`），不再重复 JSON 形状。
+
+### 3.16 后台服务（snapshotter / subscriber / precreator）
+
+三个后台服务都通过 `MetaClient` 读取或监听 meta：snapshotter 处理备份/恢复，subscriber 消费 `changed` 通道做写扇出，precreator 只调用 `PrecreateShardGroups`。本区间只有 subscriber 被整体重写，另外两个仅有 `ioutil`→`io` 等无行为变化。
+
+#### 3.16a Snapshotter：备份/恢复 meta 与 shard
+
+**角色**：`services/snapshotter` 是备份/恢复的 TCP 服务，处理 `influxd-ctl`/`influx_inspect` 的请求；它不在写入/查询热路径上，但恢复会直接调用 `meta.Client.SetData`。
+
+**结构**：
+
+| 组件 | 作用 | 证据 |
+|------|------|------|
+| `Service.Node` | 备份时写入 node JSON | `v1.12.3:services/snapshotter/service.go:46` |
+| `MetaClient` | `MarshalBinary`（备份）；`Data`/`SetData`（恢复） | `:33-37`、`:39-43` |
+| `TSDBStore` | `BackupShard`/`ExportShard`/`RestoreShard`/`SetShardEnabled`/`CreateShard` | `:50-61` |
+| `RequestType` | 0 shard backup、1 metastore backup、2 series file backup、3 db info、4 rp info、5 shard export、6 metastore update、7 shard update | `:442-474` |
+| `writeMetaStore` | `[magic 8][len(metaBlob) 8] + metaBlob + [len(nodeJSON) 8] + nodeJSON` | `:267-301` |
+| `updateMetaStore` | 解码 → `Data()` 克隆 → `ImportData` → `SetData` → `createNewDBShards` → `respondIDMap` | `:181-221` |
+
+**流程**：
+
+- **备份**：客户端发 1 字节请求类型 + JSON `Request`；服务端 `handleConn` 读类型，`RequestMetastoreBackup` 走 `writeMetaStore`，先 `MarshalBinary`，再按上述帧格式写 conn。
+- **恢复**：`RequestMetaStoreUpdate` 带上 `UploadSize` 字节的 meta blob；`updateMetaStore` 先 `UnmarshalBinary`，再取当前 `Data()` 作为合并基座，`ImportData` 在副本上合并并重编号 shard/shard group，`SetData` 提交，`createNewDBShards` 为每个新库建 shard，最后 `respondIDMap` 回 `(旧 ID, 新 ID)` 对。
+- **失败语义**：解码失败、非 OSS 客户端、`ImportData` 失败会先回空 IDMap 再返回错误；`SetData`/`createNewDBShards` 失败**不发任何响应**，客户端只能从连接关闭判错。
+
+```go
+// v1.12.3:services/snapshotter/service.go:181-221（节选，错误分支已合并）
+md := meta.Data{}
+if err := md.UnmarshalBinary(bits); err != nil {
+    if rerr := s.respondIDMap(conn, map[uint64]uint64{}); rerr != nil { return rerr }
+    return fmt.Errorf("failed to decode meta: %s", err)
+}
+ossClient, ok := s.MetaClient.(OSSMetaClient)
+if !ok {
+    if rerr := s.respondIDMap(conn, map[uint64]uint64{}); rerr != nil { return rerr }
+    return fmt.Errorf("updateMetaStore only supported for OSS")
+}
+data := ossClient.Data()
+IDMap, newDBs, err := data.ImportData(md, backupDBName, restoreDBName, backupRPName, restoreRPName)
+if err != nil {
+    if rerr := s.respondIDMap(conn, map[uint64]uint64{}); rerr != nil { return rerr }
+    return err
+}
+if err := ossClient.SetData(&data); err != nil { return err }
+if err := s.createNewDBShards(data, newDBs); err != nil { return err }
+return s.respondIDMap(conn, IDMap)
+```
+
+**案例：`SetData` 成功、`createNewDBShards` 失败后的重试卡死**（时间均为 UTC）：
+
+| 时刻 | 输入/动作 | 结果与可观察输出 |
+|------|-----------|------------------|
+| T0 | 备份文件含 DB `telegraf`（RP `autogen`，shard `500`）；目标 meta 的 `MaxShardID=500`（已有一个 500） | 目标节点没有 `telegraf` |
+| T1 | `data := ossClient.Data()`；`ImportData(md, "telegraf", "", "", "")` | `importOneDB` 先 `CreateDatabase("telegraf")`，再 `data.MaxShardID++`（`v1.12.3:services/meta/data.go:958`）→ 新 shard `501`；返回 `IDMap{500:501}`、`newDBs=["telegraf"]` |
+| T2 | `ossClient.SetData(&data)` | 成功：`meta.db` 已含 `telegraf` 和 shard `501`（`services/meta/client.go:917-927`） |
+| T3 | `createNewDBShards(data, ["telegraf"])` → `CreateShard("telegraf","autogen",501,true)`（`services/snapshotter/service.go:226-244`） | 若 WAL 目录只读，`os.MkdirAll("/mnt/ro/wal/telegraf/autogen/501")` 返回 `mkdir /mnt/ro/wal/telegraf/autogen/501: read-only file system`；`updateMetaStore` 直接 `return err`，**不调用 `respondIDMap`** |
+| T4 | 客户端 `UpdateMeta` 的 `io.ReadAll(conn)` | TCP 连接被服务端关闭，读回 `n=0, err=nil` → 返回 `updating metadata on influxd service failed: err=<nil>, n=0`（`services/snapshotter/client.go:53-56`）；服务端 `handleConn` 用 `Logger.Info` 打印同一底层错误（`service.go:115-118`） |
+| T5 | 用户原样重试 | `ImportData` 命中 `data.Database("telegraf") != nil` → `importOneDB` 返回 `database already exists`（`services/meta/data.go:916-918`）；`updateMetaStore` 先回 `[magic 0x59590101][0]` 的 16 字节（`service.go:249-258`），客户端 `npairs==0` → `DB metadata not changed. database may already exist`（`client.go:65-68`） |
+| T6 | 继续重试 | 永远停在 T5；必须人工 `DROP DATABASE telegraf`（连同 shard 501）或修复 meta 后才能重来 |
+
+**风险**：非原子半完成（`SetData` 与 `createNewDBShards` 之间无回滚）；`Data()` 克隆到 `SetData` 之间若有正常 commit，`SetData` 会用旧基座覆盖新提交（丢失更新），恢复期间应停机；从 v1.8.10 备份恢复时 RP 写窗口字段为 0（不限制），反向降级会在第一次 commit 丢失新字段。本区间快照/恢复实现**无功能变化**，只有 `ioutil`→`io` 与注释调整；详细流程见主 07 §8。
+
+#### 3.16b Subscriber：meta changed 消费者与写扇出
+
+**角色**：`services/subscriber` 监听 meta 变更，把写入按 `db/rp` 路由到已配置的订阅端点（HTTP/HTTPS/UDP）。它是 `PointsWriter` 写路径上的同步扇出点，也是 `changed` 通道的唯一生产消费者。
+
+**结构**：
+
+| 组件 | 作用 | 证据 |
+|------|------|------|
+| `Service` | `MetaClient`、`NewPointsWriter`、`subs map[subEntry]*chanWriter`、`router` | `v1.12.3:services/subscriber/service.go:108-127` |
+| `subscriptionRouter` | `map[dbrp][]*chanWriter` + `RWMutex` + `ready` | `:586-600` |
+| `chanWriter` | 每个订阅一个（或 `WriteConcurrency` 个）writer；`writeRequests` 队列 + `queueLimit` 字节上限 | `:413-446` |
+| `WriteRequest` | 一次序列化整批 line protocol + `pointOffsets` | `:32-56` |
+| 字节配额 | `total-buffer-bytes` 按订阅数均分到每个 `chanWriter.queueLimit` | `:371-379` |
+
+**流程**：
+
+1. `PointsWriter` 在写路径同步调用 `Subscriber.Send(*WritePointsRequest)`（`coordinator/points_writer.go:511-514`）。
+2. `subscriptionRouter.Send` 持读锁：查 `map[dbrp][]*chanWriter` → `NewWriteRequest` 一次把整批点序列化成 line protocol（过滤 `models.ValidPointStrings`）→ 逐 writer `Write`（`service.go:608-627`）。
+3. `chanWriter.Write` 先按字节数 `queueSize` 判上限；超限则 `WriteFailures++` + `Warn("Write rejected, queue over byte limit")` 并丢弃；`writeRequests` 满则 `Warn("Write rejected, queue full")`。
+4. `chanWriter.Run` 从队列取 `WriteRequest`，调 `pw.WritePointsContext`；失败 `WriteFailures++` + `Warn("Write failed")`，成功累加 `PointsWritten`。
+5. meta 变更：`waitForMetaUpdates` 等待 `changed`，收到后重新取通道并 `updateSubs`；`updateSubs` 增删 `s.subs`，计算新的 `memoryLimit`，`router.Update` 后关闭旧 writer。
+
+```go
+// v1.12.3:services/subscriber/service.go:608-627（节选）
+s.mu.RLock()
+defer s.mu.RUnlock()
+if !s.ready { return }
+writers := s.m[dbrp{db: request.Database, rp: request.RetentionPolicy}]
+if len(writers) == 0 { return }
+writeReq, numInvalid := NewWriteRequest(request, s.Logger)
+atomic.AddInt64(s.writeFailures, numInvalid)
+for _, w := range writers { w.Write(writeReq) }
+```
+
+**案例：`total-buffer-bytes` 非 0 且删除最后一个订阅 → 整数除零 panic**：
+
+- 配置：`total-buffer-bytes=104857600`（100 MiB），两个订阅 `subA`、`subB`。
+- 第一轮 `updateSubs`：`memoryLimit = 104857600/2 = 52428800`，两个 `chanWriter.queueLimit` 都是 52,428,800。
+- `DROP SUBSCRIPTION subB`：`toClose` 含 `subB`，先 `delete(s.subs, subB)`，此时 `len(s.subs)=1` → `memoryLimit=104857600/1`，正常。
+- `DROP SUBSCRIPTION subA`：`delete(s.subs, subA)` 后 `len(s.subs)=0`，执行 `int64(s.conf.TotalBufferBytes / len(s.subs))`（`:373`）→ **integer divide by zero panic**；调用链在 `waitForMetaUpdates` goroutine（`:255-268`，无 recover），Go 运行时终止进程。
+- 期望：`total-buffer-bytes=0`（默认）时不进入除法，不会 panic；非 0 时应先判 `len(s.subs)==0` 并把 `memoryLimit` 置 0/1。
+
+**风险**：丢弃只打 `Warn` 且不重试（7.11）；`Close` 与 `router.Update` 的竞态可 panic（7.14）；`Send` 的读锁覆盖整批序列化与分发，订阅多/批量大时阻塞 `updateSubs`；`SubWriteDrop` 指标被删除，丢弃计数只剩 subscriber 的 `writeFailures`。订阅是整体重写，详细流程见主 07 §12.1。
+
+#### 3.16c Precreator：预创建下一个 shard group（零改动）
+
+**角色**：在 shard group 到期前预创建“下一个”组，避免写入时临时建组。它只调用 `MetaClient.PrecreateShardGroups(now, cutoff)`，不直接改 `Data`。
+
+**结构/流程**：
+
+| 项 | 值/行为 | 证据 |
+|----|---------|------|
+| `Service.checkInterval` | 默认 10m | `v1.12.3:services/precreator/config.go:13` |
+| `Service.advancePeriod` | 默认 30m | `:17` |
+| `runPrecreation` | `time.After(checkInterval)` 循环；串行调用 `precreate(now)` | `v1.12.3:services/precreator/service.go:72-86` |
+| `precreate` | `cutoff = now.Add(advancePeriod).UTC()` → `PrecreateShardGroups(now, cutoff)` | `:89-92` |
+| meta 判定 | 取每个 RP 最后一个组；`!Deleted() && EndTime.Before(cutoff) && EndTime.After(now)` 才创建 `EndTime+1ns` 的下一组 | `v1.12.3:services/meta/client.go:766-800` |
+
+```go
+// v1.12.3:services/precreator/service.go:89-92
+func (s *Service) precreate(now time.Time) error {
+	cutoff := now.Add(s.advancePeriod).UTC()
+	return s.MetaClient.PrecreateShardGroups(now, cutoff)
+}
+
+// v1.12.3:services/meta/client.go:775-781（条件）
+g := rp.ShardGroups[len(rp.ShardGroups)-1]
+if !g.Deleted() && g.EndTime.Before(to) && g.EndTime.After(from) {
+	nextShardGroupTime := g.EndTime.Add(1 * time.Nanosecond)
+	if sg, _ := data.ShardGroupByTimestamp(di.Name, rp.Name, nextShardGroupTime); sg == nil {
+		createShardGroup(data, di.Name, rp.Name, nextShardGroupTime)
+	}
+}
+```
+
+**案例**：RP `autogen`、`ShardGroupDuration=24h`、最后一个组 `[2026-10-10T00:00Z, 2026-10-11T00:00Z)`。`advance-period=30m`，`check-interval=10m`：
+
+- `now=2026-10-10T23:30Z` → `cutoff=2026-10-11T00:00Z`；`EndTime.Before(cutoff)` 为 false（相等），**不创建**。
+- `now=23:40Z` → `cutoff=00:10Z`；`EndTime.Before(cutoff)` true 且 `EndTime.After(now)` true → 创建以 `2026-10-11T00:00:00.000000001Z` 为时间戳的新组，`CreateShardGroup` 截断为 `[00:00Z, 次日00:00Z)`，新组 ID/Shard ID 各 +1。
+- 若 `check-interval` 过大、越过 `EndTime` 后才触发，则 `EndTime.After(now)` 为 false，不会补建；写入路径会在需要时自行建组。
+
+**零改动证据**：
+
+| 检查 | 命令 | 结果 |
+|------|------|------|
+| 工作树 vs v1.8.10 | `git diff --stat v1.8.10 HEAD -- services/precreator` | 空（0 文件、0 行） |
+| 变更文件清单 | `git diff --name-status v1.8.10 HEAD -- services/precreator` | 空 |
+| 目录文件 | `services/precreator/{service.go,config.go,config_test.go,service_test.go,README.md}` | 两版相同 |
+| 相关 commit | `git log --oneline v1.8.10..HEAD -- services/precreator` | 无 |
+
+**风险**：`time.After` 是“上一轮结束后再等 10m”，不是固定 ticker；`precreate` 慢时实际周期 >10m；只检查最后一个组，若该组已删除或无组则跳过；时钟回拨/时区已由 UTC 规避。本区间无差异，详见主 12 §5。
 
 ## 4. 优化与收益
 
 | # | 优化 | 机制 | Commit / PR | 证据 |
 |---|------|------|-------------|------|
 | 1 | retention 不再被慢查询卡死 | 读者闸门 + 单次 `ShardInUse` 检查 + 跳过而非等待（下轮重试） | `b4bd607eef` (#25055) | `v1.12.3:services/retention/service.go:234-255` |
-| 2 | 大 shard 删除从 O(N) 次 fsync 降到 O(1) 次/分区 | `NoFlush` tombstone + `FlushSegments` 并行刷 8 个分区 | `1420aaf2bc` (#27114/#27129) | `v1.12.3:tsdb/series_file.go:211`、`tsdb/store.go:1108` |
+| 2 | 大 shard 删除的写盘从 O(N) 次 flush 降到 O(1) 次/分区（并按分区 fsync ≤8 次） | `NoFlush` tombstone + `FlushSegments` 并行刷 8 个分区 | `1420aaf2bc` (#27114/#27129) | `v1.12.3:tsdb/series_file.go:211`、`tsdb/store.go:1108` |
 | 3 | 删除过程可观测 | 每 1 万条一条 Info（含 remaining/total/elapsed），每条失败带 series_id | `1420aaf2bc` | `v1.12.3:tsdb/store.go:1095` |
 | 4 | 成功路径不再产生孤儿 shard 文件 | meta 修剪前要求 `len(Shards)==0`；每个 shard 删完立即 `DropShard`；摘除后失败仍可能留孤儿（§7.2） | `7bd3f89d18` (#24530) | `v1.12.3:services/meta/data.go:476` |
 | 5 | phantom shard 自愈 | "meta 有、本地无"的过期 shard 直接摘引用 | `7bd3f89d18` + `c168cc5aca` (#26527) | `v1.12.3:services/retention/service.go:283` |
@@ -992,11 +1257,11 @@ func (e *StatementExecutor) executeShowContinuousQueriesStatement(ctx *query.Exe
 | 14 | shard group 不重叠 | 与现有组求差集 | `3c811bcd81` (#22601) | `v1.12.3:services/meta/data.go:403-430`（收缩条件 422-429） |
 | 15 | 启动进度可见 | `StartupProgress` 已打开/总数/百分比（打开耗时旧版已有） | `3c87f524ed` (#25378) | `v1.12.3:tsdb/store.go:562/599` |
 | 16 | DELETE 并发可调 | `MaxConcurrentDeletes`（默认仍 1） | `eb3bc7069f` (#23055) | `v1.12.3:tsdb/config.go:75/170` |
-| 17 | 写入热路径减负 | subscriber 每批只序列化一次 line protocol；路由查表 O(1)，但读锁覆盖整批序列化与分发（3.16） | subscriber 重写 | `v1.12.3:services/subscriber/service.go:42/608` |
+| 17 | 写入热路径减负 | subscriber 每批只序列化一次 line protocol；路由查表 O(1)，但读锁覆盖整批序列化与分发（3.16b） | subscriber 重写 | `v1.12.3:services/subscriber/service.go:42/608` |
 | 18 | 订阅内存可封顶 | `total-buffer-bytes` 按订阅数均分，超限丢弃并告警；**订阅数归零时整数除零 panic**（`:373`，见 7.14） | #21752 系列 | `v1.12.3:services/subscriber/service.go:372/449` |
 | 19 | 恢复备份不再死锁 | 见 #11 | — | `v1.12.3:services/meta/client.go:917` |
 
-**没有基准数据的地方只描述机制**：仓库里没有 `retention deletion` 或 `purger` 的 benchmark。可以确定的是复杂度层面的变化（fsync 次数从 O(N) → O(分区数)、锁持有时长从 O(文件数) → O(1)），而不是具体百分比。
+**没有基准数据的地方只描述机制**：仓库里没有 `retention deletion` 或 `purger` 的 benchmark。可以确定的是复杂度层面的变化（flush 次数从 O(N) → O(分区数)、fsync 次数从 0 → ≤8（每分区一次）、锁持有时长从 O(文件数) → O(1)），而不是具体百分比。
 
 ## 5. 行为变化与兼容性
 
@@ -1014,16 +1279,16 @@ func (e *StatementExecutor) executeShowContinuousQueriesStatement(ctx *query.Exe
 | `subWriteDrop` 指标 | `coordinator` 不再输出该字段（`v1.12.3:coordinator/points_writer.go` 中 `statSubWriteDrop` 已删除） | 是（监控面板） |
 | `SHOW CONTINUOUS QUERIES` | 非管理员只能看到自己有权限的库 | 是（有意的安全修复） |
 | `SHOW MEASUREMENTS ON *.*` / `ON db.*` | 支持通配；输出多出 `database`、`retention policy` 两列（`v1.12.3:coordinator/statement_executor.go:732-834`） | 轻微 |
-| `FUTURE` / `PAST` 成为 SQL 关键字 | `CREATE/ALTER RETENTION POLICY` 支持 `FUTURE LIMIT` / `PAST LIMIT`；理论上影响把 `future`/`past` 当 measurement 名的写法（**待核实**，未做端到端验证） | 待核实 |
+| `FUTURE` / `PAST` 成为 SQL 关键字 | `CREATE/ALTER RETENTION POLICY` 支持 `FUTURE LIMIT` / `PAST LIMIT`；influxql v1.4.1 的 tokenizer 大小写不敏感（`token.go:326-331`），`future`/`past` 映射为 `FUTURE`/`PAST`（`:96/:116`），`ParseIdent` 只接受 `IDENT`（`parser.go:476-483`），`FROM` 的 `parseSegmentedIdents` 逐段调用它（`:510-545`）。因此未加引号的 measurement 名在 v1.12.3 解析失败：`SELECT * FROM future` → `found FUTURE, expected identifier at line 1, char 15`；`SELECT * FROM db.rp.past` → `found PAST, expected identifier at line 1, char 21`；写成 `"future"`/`"past"` 正常。v1.8.10 的 influxql v1.1.1-0.20200828144457 没有这两个 token，四种写法都正常（两个版本各跑一次解析验证） | 是（依赖未加引号的 `future`/`past` 查询/写入脚本） |
 | retention 服务 `Open()` | 若嵌入式调用未设置 `DropShardMetaRef`，**启动直接报错**（`v1.12.3:services/retention/service.go:107`） | 是（仅嵌入式/企业集成） |
-| 订阅配置 | 新增 `total-buffer-bytes`，默认 0 = 不限制，行为与旧版一致；但非 0 且订阅数归零时会除零 panic（3.16、7.14） | 否（默认兼容；启用后见风险） |
+| 订阅配置 | 新增 `total-buffer-bytes`，默认 0 = 不限制，行为与旧版一致；但非 0 且订阅数归零时会除零 panic（3.16b、7.14） | 否（默认兼容；启用后见风险） |
 | `DROP SHARD <id>`（本地不存在或属其它节点） | 旧版 `DeleteShard` 返回 nil 并继续 `MetaClient.DropShard`（成功、清 meta）；新版返回 `ErrShardNotFound`，语句直接报错且不清 meta（`v1.8.10:tsdb/store.go:700`、`v1.12.3:tsdb/store.go:979`、`coordinator/statement_executor.go:384-390`） | 是（幂等重试脚本开始报错） |
 | 已软删除组的修剪时机 | 从"14 天到点就删"变成"14 天且 shard 全部删完" | 否（更安全，但见风险） |
 
 ### 5.2 运维视角的变化
 
 1. **磁盘回收更快**：以前"retention 卡住 → 老数据不删 → 磁盘涨"的两个根因（`Shard.Close` 阻塞、14 天无条件修剪）都被处理；现在会看到 `retention_delete_shard` 的 operation 日志，能直接看到"哪个 shard 因为 in-use 被跳过"。
-2. **`meta.db` 可能变大**：写窗口字段让每个 RP 多写 4 字节（field 7/8 即使为 0 也会被 `proto.Int64(0)` 显式写入，`v1.12.3:services/meta/data.go:1301-1308`），而且"删不掉的组"会长期留在 meta 里。大集群应关注 `meta.db` 体积与提交延迟。
+2. **`meta.db` 体积变化的两个独立来源**：①写窗口字段让每个 RP 的 `RetentionPolicyInfo` 固定多 4 字节（field 7/8 即使为 0 也会被 `proto.Int64(0)` 写成 `tag + 0x00`，`v1.12.3:services/meta/data.go:1301-1308`）；②摘除前失败或被 `ShardInUse` 长期挡住的组永不满足 `len(Shards)==0`，其 `ShardGroupInfo` 记录不会被修剪，文件体积随新 shard group 创建线性增长且不回落。注意**重试通常不写 meta**：`DeleteShardGroup` 已成功、失败发生在 `DeleteShard` 之前时，后续 tick 只重试本地删除、不产生 commit（除非同一 tick 还有其他组首次软删除或可修剪）；但 `DeleteShardGroup` 自身失败时组仍是未删除状态，下一 tick 会重试软删除并可能产生一次 commit（见 §7.2 A）。大集群应关注 `meta.db` 体积与提交延迟。
 3. **新增日志关键字**：`Drop phantom shard references`、`Expired phantom shard detected during retention check`、`can not delete an in-use shard`、`group's shards will be removed from local storage if found`（注意最后这条有 bug，见 7.3）。
 4. **不再有 `Purge: close file` / `Purge: remove file` 的 Info 刷屏**：改为**每个失败文件**一条 `Error("close file failed"/"remove file failed")`、随后汇总一条 `Warn("failed to remove")`；每个文件只尝试一次（有界），失败即出队不再重试（`v1.12.3:tsdb/engine/tsm1/file_store.go:1659-1674`）。
 
@@ -1036,37 +1301,41 @@ func (e *StatementExecutor) executeShowContinuousQueriesStatement(ctx *query.Exe
 - DB `telegraf`，RP `autogen`，`DURATION 7d`，`ShardGroupDuration = 24h`
 - ShardGroup `100`：`[2026-10-01T00:00Z, 2026-10-02T00:00Z)`，组内唯一 shard `500`
 - 本地磁盘：`<data>/telegraf/autogen/500/`（TSM）与 `<wal>/telegraf/autogen/500/`（WAL）
-- 当前时间 `2026-10-10T00:30Z`，此时有一个长查询持有 shard 500 的 `TSMReader` 引用
+- retention `check-interval=30m`（`v1.12.3:services/retention/config.go:19`）；**假设 influxd 于 `2026-10-10T00:00Z` 启动**，ticker 是相对定时器（`services/retention/service.go:139-141`），tick 为 `00:30/01:00/02:00/...`（首个 tick 在启动 30m 后；启动在其他时刻则整体平移）
+- 当前时间 `2026-10-10T00:30Z`；`EndTime+7d=2026-10-09T00:00Z < now` → 组过期
 
 **到期判定**（两版一致，`RetentionPolicyInfo.ExpiredShardGroups`）：
 
 ```go
-// v1.12.3:services/meta/data.go:1275 — ExpiredShardGroups（跳过与条件在 1278-1281）
-if rpi.ShardGroups[i].Deleted() { continue }   // 已软删除的组不再参与到期判定
+// v1.12.3:services/meta/data.go:1275-1287
+if rpi.ShardGroups[i].Deleted() { continue }
 if rpi.Duration != 0 && rpi.ShardGroups[i].EndTime.Add(rpi.Duration).Before(t) { ... }
-// 2026-10-02T00:00Z + 7d = 2026-10-09T00:00Z < 2026-10-10T00:30Z → 过期
 ```
 
-**v1.8.10 的推演**
+**路径 A：读者长期持有 shard 500 的 `TSMReader`**
 
-| 时刻 | 动作 | 结果 |
-|------|------|------|
-| 10-10 00:30 | `DeleteShardGroup(telegraf, autogen, 100)` | 组被打上 `DeletedAt=10-10T00:30Z` |
-| 10-10 00:30 | `TSDBStore.DeleteShard(500)` → `sh.Close()` | **阻塞**在等待读者 `Unref`；retention 的主循环停住，**其他所有 shard 也不再被处理** |
-| 10-24 00:31 | 下一轮或后续某轮 `PruneShardGroups`（若进程重启过、或阻塞已解除） | `expiration = now-14d = 10-10T00:31Z`，严格晚于 `DeletedAt=10-10T00:30Z` → `expiration.After(DeletedAt)` 为真 → **整组被删除**，即使 shard 500 的目录还在 |
-| 之后 | retention 遍历 `ShardIDs()` | `deletedShardIDs` 里已没有 500（组没了） → 磁盘上 `.../500/` 永久残留 |
+| 时刻 | v1.8.10 | v1.12.3 |
+|------|---------|---------|
+| 10-10 00:30 | `DeleteShardGroup` → `DeletedAt=00:30`；`DeleteShard(500)` 先 `delete(s.shards,500)`（`tsdb/store.go:717`），然后 `sh.Close()`（`:802`）阻塞在 `refsWG.Wait()` | `DeleteShardGroup` → `DeletedAt=00:30`；`SetShardNewReadersBlocked(500,true)`；`ShardInUse(500)` 为 true |
+| 10-10 00:30 | **整个 tick 停住**：`PruneShardGroups`（`services/retention/service.go:150`）不执行，后续 shard 不处理；日志只有 `Deleted shard group` | 返回 `can not delete an in-use shard`（`:250`）；defer 解除闸门并打 `Unblocking new readers for shard after delete failed`；operation 内 `Error deleting shard`，随后 `One or more errors occurred during shard deletion and will be retried on the next check`；**继续处理下一个 shard**，组因 `len(Shards)>0` 保留 |
+| 10-10 02:00 | 查询结束，同一次 tick 继续：`sh.Close()` 返回，`os.RemoveAll`（`:807/:811`）删目录；`Prune` 的 `expiration=2026-09-26T02:00:00Z` 不晚于 `DeletedAt`，组保留 | 下一轮 tick：`InUse=false` → `DeleteShard` 成功（`Deleted shard`）→ `DropShardMetaRef(500)`（`Dropping shard meta references`），组内 shard 清空 |
+| 10-24 01:00 | `expiration=2026-10-10T01:00:00Z > DeletedAt` → 旧版删组；目录已在 02:00 删除 | `expiration` 同样晚于 `DeletedAt` 且 `len(Shards)==0` → 删组；目录已删除 |
 
-**v1.12.3 的推演**
+结论：路径 A 下**旧版不会产生孤儿**；它的问题是整轮 retention 被一个慢查询冻结（#25054），新版用“跳过并下轮重试”换取吞吐。
 
-| 时刻 | 动作 | 结果 |
-|------|------|------|
-| 10-10 00:30 | `DeleteShardGroup` | `DeletedAt=10-10T00:30Z` |
-| 10-10 00:30 | `SetShardNewReadersBlocked(500, true)` | `newReaderBlockCount=1`，新查询拿不到 shard 500 |
-| 10-10 00:30 | `ShardInUse(500)` | `true`（老查询还持有引用）→ `unblock` → 返回 `can not delete an in-use shard` → `retryNeeded=true`，**继续处理下一个 shard** |
-| 10-10 01:00 | 老查询结束，下一轮 | `InUse=false` → `DeleteShard(500)` → `DeleteSeriesID(NoFlush)`…`FlushSegments` → `os.RemoveAll(path/walPath)` → `DropShardMetaRef(500)` → `DropShard` 把 500 从组里摘掉，组内 shard 数变 0 |
-| 10-24 01:00 | `PruneShardGroups` | `expiration = 10-10T01:00Z`，`DeletedAt=10-10T00:30Z`，`expiration.After(DeletedAt)=true` 且 `len(Shards)==0` → 删除组记录 |
+**路径 B：`DeleteShard` 返回错误（EACCES/EBUSY/Close 失败）**
 
-**关键差异**：旧版把"组记录"和"磁盘文件"的生命周期**解耦**了（记录可以比文件先消失）；新版**强制文件先消失**。这直接对应 `#24529`（磁盘只涨不降）。
+| 时刻 | v1.8.10 | v1.12.3 |
+|------|---------|---------|
+| 10-10 00:30 | `DeleteShardGroup` → `DeletedAt=00:30`；`DeleteShard(500)` 在 `delete(s.shards,500)`（`:717`）后失败（如 `remove /var/lib/influxdb/data/telegraf/autogen/500: permission denied`），打 `Failed to delete shard`，`retryNeeded=true` | 同样在 `delete(s.shards,500)`（`v1.12.3:tsdb/store.go:997`）后失败；打 `Error deleting shard` + `Unblocking ...`，`retryNeeded=true` |
+| 10-10 00:30 | **继续执行 `PruneShardGroups`**；14 天未到，组保留。500 已不在 `ShardIDs()`，后续不再重试 | 继续执行 prune；组因 `len(Shards)>0` 保留。500 已不在 `ShardIDs()` |
+| 10-10 01:00 | — | 下一 tick 的 phantom 分支：500 仍在 `deletedShardIDs`、不在 `ShardIDs()`、`isOSS()` 为真 → `Warn("Expired phantom shard detected during retention check, removing from metadata")` + `DropShardMetaRef(500)`；组内 shard 立即清空（不必等 14 天） |
+| 10-24 01:00 | 旧版 `PruneShardGroups` 不看 `Shards`（`v1.8.10:services/meta/client.go:682-695`）→ 删组 → meta 无 500，目录孤儿 | 新版 `len(Shards)==0` 满足 → 删组 → **目录同样是孤儿** |
+| 之后 | `SHOW SHARDS` 无该组；磁盘 `.../500/` 永久残留 | 同左；新版只是把 meta 引用摘除提前到 phantom 分支，孤儿窗口仍存在 |
+
+两版 tick 末尾的 `One or more errors occurred during shard deletion and will be retried on the next check` 都**不包含**刚失败的 500：它只汇总本轮的其他失败；500 已从 `s.shards` 摘除，下一轮 `ShardIDs()` 不含它，磁盘删除不会重试（新版的重试动作发生在下一 tick 的 phantom 分支，见上一行）。
+
+**关键差异**：旧版在路径 A（阻塞）下不修剪、在路径 B（报错）下才产生孤儿，两种后果不能串成一条因果链；新版把路径 A 变成可重试的跳过，把路径 B 的“摘除前失败”变成组保留重试，但**没有消除“摘除后失败”的孤儿**（§7.2 B、主 12 §3.2）。真正避免孤儿的前提是 `DeleteShard` 在磁盘删除成功后才返回成功；失败位置恰好是 `delete(s.shards, id)` 之后时，代码已无法回滚。
 
 ### 6.2 案例二：一次 meta commit 的完整字节流（含写窗口）
 
@@ -1145,16 +1414,18 @@ partial write: dropped 0 points outside retention policy of duration 24h0m0s
 
 ### 6.3 案例三：phantom shard 自愈
 
-**场景**：meta 里 ShardGroup `100` 已软删除（`DeletedAt=10-01`），shard `500` 的目录因为一次误删/迁移**已经不存在**，但 meta 仍记着它。
+**场景**（UTC）：DB `telegraf`、RP `autogen`、`DURATION 7d`；ShardGroup `100` 为 `[2026-10-01T00:00Z, 2026-10-02T00:00Z)`，组内唯一 shard `500`。retention 服务在 `2026-10-08T00:00Z` 启动，`check-interval=30m`，tick 落在 `:00/:30`。`ExpiredShardGroups` 用严格 `EndTime.Add(Duration).Before(t)`（`v1.12.3:services/meta/data.go:1281`；旧版同形 `v1.8.10:services/meta/data.go:1175`），`EndTime+7d = 2026-10-09T00:00Z`，所以 **`10-09T00:00` 这个时刻不满足严格 `Before`，首次发现到期的是 `10-09T00:30` tick**；该 tick 的 `DeleteShardGroup` 把 `DeletedAt` 置为 `2026-10-09T00:30Z`（`v1.12.3:services/meta/data.go:460-468`，取 `time.Now().UTC()`）。前提：shard `500` 的 `<data>/telegraf/autogen/500` 与 WAL 目录在进程启动前已被人工删除，因此 `TSDBStore.ShardIDs()` 不含 500，但 meta 仍记着它。OSS 的 `CreateShardGroup` 每个组固定只建一个 `ShardInfo`（`v1.12.3:services/meta/data.go:437-441`），所以这里没有“同组其他活 shard”。
 
-- **v1.8.10**：retention 只遍历本地存在的 `ShardIDs()`（`v1.8.10:services/retention/service.go:131-146`），500 不在其中，`deletedShardIDs[500]` 从未被消费；14 天后 `PruneShardGroups` 仍会整组删除（旧版只要 `DeletedAt` 过期就删，不检查组内是否还有 shard），同组其他活 shard 的目录因此成为孤儿。
-- **v1.12.3**：
-  1. `ShardIDs()` 不含 500 → 第一个循环跳过；
-  2. `deletedShardIDs` 里仍剩 500 → 进入 phantom 分支（`v1.12.3:services/retention/service.go:283`）；
-  3. `isOSS()` 为真 → `log.Warn("Expired phantom shard detected during retention check, removing from metadata")` → `DropShardMetaRef(500, owners)`；
-  4. 组内 shard 清空 → 14 天后正常修剪。
+| 时刻 | v1.8.10 | v1.12.3 |
+|------|---------|---------|
+| `10-09T00:30` tick | `DeletedShardGroups()` 为空；`ExpiredShardGroups(10-09T00:30)` 命中组 100 → `DeleteShardGroup`，`DeletedAt=10-09T00:30`；`deletedShardIDs={500}`；`ShardIDs()` 不含 500，本地删除循环跳过；`PruneShardGroups` 的 `expiration=09-25T00:30` 不晚于 `DeletedAt` → 保留 | 前四步相同；随后 phantom 分支命中（`v1.12.3:services/retention/service.go:283-301`），`isOSS()` 为真（`NodeID()==ossNodeID==math.MaxUint64`，`:34`）→ `log.Warn("Expired phantom shard detected during retention check, removing from metadata")` → `DropShardMetaRef(500)` 把 shard 500 从组内清空；`PruneShardGroups` 因 `DeletedAt` 未满 14 天仍保留组记录 |
+| `10-09T00:30` 起 | `SHOW SHARDS` 仍显示 500（组内 `Shards` 未清空） | `SHOW SHARDS` 不再显示 500；组记录仍在 `SHOW SHARD GROUPS` 中，直到被修剪 |
+| `10-23T00:30` tick | `expiration = 10-23T00:30 - 14d = 10-09T00:30`，与 `DeletedAt` 相等；`!expiration.After(...)` 为真 → 不修剪 | 同左：相等不修剪（新版 `PruneShardGroups` 还要求 `len(Shards)==0`，此时已满足） |
+| `10-23T01:00` tick | `expiration=10-09T01:00 > DeletedAt` → 旧版**无条件删除整个组**（`v1.8.10:services/meta/client.go:682-695` 的循环只判 `DeletedAt`，不看 `Shards`），shard 500 的 `ShardInfo` 随之消失 | `expiration=10-09T01:00 > DeletedAt` 且 `len(Shards)==0` → 修剪空组（`v1.12.3:services/meta/data.go:476-495`、`v1.12.3:services/meta/client.go:680-690`） |
 
-这条路径同时解释了 `#26527` 的动机：在**集群**里，"本地没有"不等于"不存在"，所以新版用 `owners` 判断，避免每个节点都对着别人的 shard 刷警告。
+**结论**：两版都不会凭空产生磁盘孤儿（磁盘本来就没有目录）。差异只是 meta 中 shard 引用的消失时间：新版在 `10-09T00:30`（软删除的同一 tick），旧版要等到 `10-23T01:00` 组修剪；**新版早约 14 天**。旧稿的“旧版 10-24 才修剪”是把 `DeletedAt` 错记为 10-10 再与 14 天窗口相加的结果；按严格 `Before` 和 30m tick，正确的节点是 `10-09T00:30` / `10-23T01:00`。`ShardGroupDeletedExpiration=-2*7*24h` 见 `v1.12.3:services/meta/client.go:35`。
+
+- **要展示“孤儿”必须换场景**：① 数据盘未挂载/`WALDir` 配错时，本地所有 shard 都不在 `ShardIDs()`，过期组的 meta 引用会在第一次检查就被摘掉，磁盘恢复后目录无人清理（§7.6）；② Enterprise 多 shard 组里只删掉部分 shard 的 owner。OSS 单 shard 场景本身不会产生磁盘孤儿。
 
 ## 7. 仍存在的风险
 
@@ -1173,23 +1444,23 @@ partial write: dropped 0 points outside retention policy of duration 24h0m0s
 
 对比旧版（`v1.8.10:tsdb/store.go:727-735`）：旧代码在 `defer` 里**持有 `s.mu`** 才调用 `removeIndexType`；新版把它移出了临界区，而 `s.databases` 是普通 `map`、`databaseState.indexTypes` 也是普通 `map`。这与 `CreateShard`/`loadShards`（都持 `s.mu` 写 `s.databases`）构成**数据竞争**；如果并发的 `DeleteDatabase`（`v1.12.3:tsdb/store.go:1210` 的 `delete(s.databases, name)`）已把该 db 从 map 删除，这里还会对 `nil` 的 `*databaseState` 调方法（`removeIndexType` 只判了 `d.indexTypes != nil`，没有判 receiver）。`DeleteDatabase` 的早退只看 `s.databases`（`v1.12.3:tsdb/store.go:1145-1151`），而 `DeleteShard` 只从 `s.shards` 摘除（`:997`），因此该竞争在 `DROP DATABASE` 与 retention 删除并发时可达；`DeleteDatabase` 还会 `walkShards`→`Close`，窗口足以覆盖。生产上仍应避免"retention 删 shard"与 `DROP DATABASE/RP` 并发。
 
-### 7.2 retention 删除失败的两种后果：meta.db 膨胀 vs 孤儿目录
+### 7.2 retention 删除失败的两种后果：meta 记录不修剪 vs 孤儿目录
 
 3.6 的修复把"修剪"绑死在"shard 全部删除成功"上，但 `DeleteShard` 在 `delete(s.shards, id)`（`v1.12.3:tsdb/store.go:997`）**之前**还是**之后**失败，后果完全不同：
 
-**A. 摘除前失败 / 长期无法进入删除**——组永久留在 meta，meta.db 膨胀：
+**A. 摘除前失败 / 长期无法进入删除**——组永久留在 meta，`meta.db` 不回落：
 
 - 查询长期持有引用（`ShardInUse` 恒为 true，`v1.12.3:services/retention/service.go:247-251`）；
 - `DeleteShardGroup` 或闸门操作本身失败（`service.go:196-199/234-235`）。
 
-表现：每 `check-interval`（默认 30 分钟，`v1.12.3:services/retention/config.go:19`）一行 `Error deleting shard` / `Unblocking new readers for shard after delete failed`，`meta.db` 持续增大，而 `SHOW SHARDS` **看不到**这些组（它跳过 `sgi.Deleted()`，`v1.12.3:coordinator/statement_executor.go:887`），容易"看不见但一直在"。排查应看日志中的 `retention_delete_shard` operation。
+表现：每 `check-interval`（默认 30 分钟，`v1.12.3:services/retention/config.go:19`）一行 `Error deleting shard` / `Unblocking new readers for shard after delete failed`。对**已软删除**的组，`SHOW SHARDS` 看不到它们（它跳过 `sgi.Deleted()`，`v1.12.3:coordinator/statement_executor.go:887`）；若失败的是 `DeleteShardGroup` 本身，组仍是未删除状态，`SHOW SHARDS` 仍会显示它，并在下一 tick 重试软删除。**重试通常不会让 `meta.db` 逐 tick 变大**：一旦 `DeleteShardGroup` 成功，该组被 `Deleted()` 过滤（`services/meta/data.go:1278-1282` 的 `ExpiredShardGroups`），后续 tick 只重试本地删除、不再产生 commit（`services/retention/service.go:263-268`；除非同一 tick 有其他组首次软删除或 `PruneShardGroups` 修剪掉旧组）；但 `DeleteShardGroup` 自身失败时下一 tick 会再次提交软删除，可能产生一次 commit。每次 commit 都是全文件重写，大小只由数据内容决定（`services/meta/client.go:948-964`）。真正的后果是这些组的 `ShardGroupInfo` 永不修剪（`data.PruneShardGroups` 要求 `len(Shards)==0`，`services/meta/data.go:476-495`），文件体积随新 shard group 创建线性增长且不回落。量化：每个 RP 固定 +4 字节（field 7/8 的 `tag+0x00`，§6.2），每个保留组按实际 `ShardGroupInfo` 序列化大小累加。排查应看日志中的 `retention_delete_shard` operation。
 
 **B. 摘除后失败**——组仍会修剪，磁盘目录成孤儿：
 
 - 文件系统错误（`os.RemoveAll` 返回 EACCES/EBUSY，NFS 上常见，`v1.12.3:tsdb/store.go:1133-1135`）；
 - 索引损坏导致 `sh.Index()` / `walkShards` 失败（`:1016-1019/1035-1038`）；
 - `sh.Close()` 失败（`:1128-1130`）；
-- `FlushSegments` 失败：只记 `error while flushing a series file segment`，tombstone 可能未持久化，但删除继续并宣告成功（3.14(4)）。
+- `FlushSegments` 失败：`DeleteSeriesID(id, NoFlush)` 只把 tombstone 写进分区 active segment 的缓冲；`FlushSegments` 只对该 active segment `Flush()`（fsync，`tsdb/series_file.go:211-238`），失败时 `DeleteShard` 只打 `error while flushing a series file segment`（`tsdb/store.go:1108-1114`）并继续 `DropShardMetaRef`、最终返回 nil。后果：该次删除的 tombstone 在失败后未 fsync，若进程在后续 flush 前崩溃，重启后这些 series ID 仍可能存在；但对应 shard 已被摘除/修剪，它们成为不可查询的残留 series 记录（3.14；机制细节见 02 §3.11）。
 
 shard 已不在 `ShardIDs()`，下一轮由 phantom 分支 `DropShardMetaRef` 摘掉 `ShardInfo`（`service.go:284-300`），组内 shard 清空后按 14 天规则正常修剪；但 `data/<db>/<rp>/<id>` 与 WAL 目录已无人清理（主 12 §3.2 的 4 步失败链）。这也是 §7.12 并发场景的同一后果。
 
@@ -1231,25 +1502,15 @@ shard 已不在 `ShardIDs()`，下一轮由 phantom 分支 `DropShardMetaRef` �
 
 ### 7.7 每次 `DropShard` 都是一次完整的 meta 提交
 
-`Client.DropShard`（`v1.12.3:services/meta/client.go:660`）走 `Clone → DropShard → commit`，即**每个 shard 一次 `meta.db` 全量重写 + fsync**。旧版 retention 从不调用它，提交只来自每个到期组的 `DeleteShardGroup` 与末尾可能一次 `PruneShardGroups`；新版在此之上每个 shard 再加一次 `DropShard` 提交；但 **OSS 每个到期组固定只有 1 个 `ShardInfo`**（`v1.12.3:services/meta/data.go:437-440`），所以每轮是 1 次 `DeleteShardGroup` + 1 次 `DropShard`（至多再加 1 次 `PruneShardGroups` 提交；组刚软删除未满 14 天通常无变更），企业版多 shard 组才是 1+N 次提交。在大 meta（几十万 shard group）场景下，retention 检查会造成明显的写放大。这是"正确性换 IO"的取舍，未被批量化。
+`Client.DropShard`（`v1.12.3:services/meta/client.go:660`）走 `Clone → DropShard → commit`，即**每个 shard 一次 `meta.db` 全量重写 + fsync**。旧版 retention 从不调用它，提交只来自每个到期组的 `DeleteShardGroup` 与末尾可能一次 `PruneShardGroups`；新版在此之上每个 shard 再加一次 `DropShard` 提交；但 **OSS 每个到期组固定只有 1 个 `ShardInfo`**（`v1.12.3:services/meta/data.go:437-440`），所以**每个到期且只含 1 个 `ShardInfo` 的组**产生 1 次 `DeleteShardGroup` commit + 1 次 `DropShard` commit；一个 tick 处理 N 个组就是 N+N 次。`PruneShardGroups` 仅当本 tick 至少修剪掉一个组（`changed==true`）时才 commit，否则 0 次（`services/meta/client.go:680-690`、`services/meta/data.go:476-495`）；“组刚软删除未满 14 天”只说明该组自身不满足条件，同库其他更老的组仍可能触发这次提交。企业版多 shard 组才是 1+N 次提交。在大 meta（几十万 shard group）场景下，retention 检查会造成明显的写放大。这是"正确性换 IO"的取舍，未被批量化。
 
 ### 7.8 protobuf 运行时与降级
 
 见 3.2：反射式序列化让每次 commit 更贵；降级到 v1.8.10 会在第一次提交后丢失写窗口字段（`Data.marshal()` 会重建所有 RP，任一提交即丢失）。**跨大版本回滚前应备份 `meta.db`**。
 
-### 7.9 `/debug/vars` 的 `cq` 分支会中断响应，返回 200 的截断 JSON
+### 7.9 `/debug/vars` 的 `cq` 截断（跨层摘要：owner 06 §3.12）
 
-```go
-// v1.12.3:services/httpd/handler.go:2452-2458
-		if s.Name == "cq" {
-			jv, err := parseCQStatistics(&s.Statistic)
-			if err != nil {
-				h.httpError(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-```
-
-`parseCQStatistics` 在 `len(s.Values)==0` 时返回 error（`v1.12.3:services/httpd/handler.go:2728`）。该分支位于 stats 循环（`:2451`）中，而 `serveExpvar` 在循环前已 `fmt.Fprintln(w, "{")` 并写出 `system`/`build` 等板块（`:2323/2326`），响应头此时已隐式发送 **200**；`httpError` 的 `writeHeader(500)` 成为 superfluous 写头。客户端收到的是 **200 + 不完整（截断）JSON**，不是 500，监控端会解析失败。若要真正返回 500，需先缓冲整个响应再统一写出。目前 CQ 的 `Statistics()` 总是填充 values，触发面仅为返回 name=cq 且 values 为空的企业扩展。
+`parseCQStatistics` 在 `len(Values)==0` 时返回 error；`serveExpvar` 在写出 `{` 与 `system`/`build` 等板块后才进入 stats 循环，此时响应头已隐式 200，后续 `httpError` 的 500 是 superfluous，客户端收到 **200 + 截断 JSON**（`v1.12.3:services/httpd/handler.go:2452-2458`、`:2728-2734`）。该风险的代码路径、触发面与案例 owner 是 06 §3.12/§6.4；05 只说明 CQ 的 `Statistics()` 总会填 `queryOk`/`queryFail`，OSS 下不会主动触发，企业扩展返回空 values 时才可达。
 
 ### 7.10 DELETE 仍然默认串行
 
@@ -1265,7 +1526,7 @@ shard 已不在 `ShardIDs()`，下一轮由 phantom 分支 `DropShardMetaRef` �
 
 ### 7.13 `Subscriptions` 不是深拷贝，`DropSubscription` 原地改共享数组
 
-§3.1 的前提是"写操作在副本上修改"，但 `Data.Clone()` 对 RP 只做浅层的 `RetentionPolicyInfo.clone()`：
+§3.1a 的前提是"写操作在副本上修改"，但 `Data.Clone()` 对 RP 只做浅层的 `RetentionPolicyInfo.clone()`：
 
 ```go
 // v1.12.3:services/meta/data.go:1347-1358
@@ -1285,12 +1546,84 @@ rpi.Subscriptions = append(rpi.Subscriptions[:i], rpi.Subscriptions[i+1:]...)
 2. `snapshot` 失败时 `cacheData` 指针虽未换、内容已变：**内存与磁盘分叉**，之后任意一次成功 commit 会把这次"失败并返回错误"的删除持久化。
 3. 长时间持有快照的读者（如 snapshotter 的 `Data()`）与上述原地写构成 data race。
 
+**时间线（T0–T2）**：
+
+| 时刻 | 动作 | 内存 | 磁盘 |
+|------|------|------|------|
+| T0 | `DROP SUBSCRIPTION "s1" ON "db0"."rp0"` → `Client.Update` → `data := c.cacheData.Clone()` | 副本的 RP 与旧 cache 共享 `Subscriptions` 底层数组 | `meta.db` 仍是旧内容 |
+| T1 | `DropSubscription` 在副本上 `append(s[:0], s[1:]...)` | 共享数组被原地左移；旧 cache 的 slice header 仍是 `len=2`，内容变成 `[s2, s2]`（最后一个元素重复）；副本 `len=1` | 未变 |
+| T2a | `commit` 成功 | 指针换成副本（`[s2]`），旧快照继续持有被污染的数组 | 写入 `[s2]` |
+| T2b | `snapshot` 失败、`commit` 返回错误 | 指针仍是旧 cache，但旧 cache 已是 `[s2,s2]`；下一次任意成功 commit 会把这次“失败”的删除持久化 | 仍是 `[s1,s2]`，与内存分叉 |
+
+**修复代码**（`Data.Clone` 深拷贝，或 `DropSubscription` 不改共享数组）：
+
+```go
+// 方案 A：clone 时深拷贝（v1.12.3:services/meta/data.go:1347-1358）
+if rpi.Subscriptions != nil {
+    other.Subscriptions = append([]SubscriptionInfo(nil), rpi.Subscriptions...)
+}
+
+// 方案 B：DropSubscription 构造新切片（v1.12.3:services/meta/data.go:599-602）
+subs := make([]SubscriptionInfo, 0, len(rpi.Subscriptions)-1)
+subs = append(subs, rpi.Subscriptions[:i]...)
+subs = append(subs, rpi.Subscriptions[i+1:]...)
+rpi.Subscriptions = subs
+```
+
+注意 `slices.Delete` 仍会原地搬移并清零尾部，不能单独用它修这个问题。
+
 旧版实现相同（`v1.8.10:services/meta/data.go:514-526/1237`），因此这是文档把"通常成立的原子性"写成无条件保证，不是版本回归。运营含义：`DROP SUBSCRIPTION` 返回错误时不要假定订阅仍在，应重试并核对 `SHOW SUBSCRIPTIONS`。
 
 ### 7.14 `total-buffer-bytes` 的除零 panic 与关闭竞态
 
 - **除零 panic**：`updateSubs` 在 `createdNew || len(toClose) > 0` 分支里执行 `int64(s.conf.TotalBufferBytes / len(s.subs))`（`v1.12.3:services/subscriber/service.go:371-373`），**没有判空**。两条可达路径：① 删除最后一个订阅（前面的循环已 `delete(s.subs, se)`，`toClose` 非空）；② 内存中无订阅、新订阅全部创建失败（`createdNew=true`，`s.subs` 仍空）。panic 发生在 `waitForMetaUpdates` 的调用链上（`:255-268`，无 recover）或 `Open` 期间，Go 运行时直接终止进程。触发前提是配置了非 0 的 `total-buffer-bytes`。
 - **关闭竞态**：`Close()` 先 `router.Close()`（置 `ready=false`），再取 `s.mu`/`close(s.closing)`（`:175-195`）。若 `updateSubs` 已持锁并通过 `closing` 检查，随后调用 `router.Update`，会命中 `!ready` 的 `panic("...must not call update after close")`（`:629-634`）。关闭期间应避免同时触发 meta 变更；代码侧应调整顺序或让 `Update` 返回错误。
+
+**除零时间线（T0–T2，`total-buffer-bytes=1048576`）**：
+
+| 时刻 | 动作 | 状态 |
+|------|------|------|
+| T0 | 只有订阅 `s1`；`DROP SUBSCRIPTION s1` 触发 `WaitForDataChanged`，`updateSubs` 取 `s.mu`，`closing` 未关闭 | `s.subs={s1}` |
+| T1 | `delete(s.subs, se)` 删除最后一个订阅，`toClose={s1}` | `s.subs` 为空，`createdNew=false` |
+| T2 | `createdNew` 为假、`len(toClose)>0` 为真 → `int64(1048576 / len(s.subs))` = `int64(1048576 / 0)` | `panic: runtime error: integer divide by zero`；`waitForMetaUpdates` 无 recover（`:255-268`），进程退出 |
+
+另一条同样可达：`Open()` 时内存无订阅、所有 `createSubscription` 都失败（例如 destination 非法），`createdNew=true` 且 `s.subs` 为空，`Open` 直接 panic。
+
+**关闭竞态时间线（T0–T2）**：
+
+| 时刻 | 动作 | 状态 |
+|------|------|------|
+| T0 | `updateSubs` 已持有 `s.mu`，通过 `closing` 检查，正在计算新增/删除 | `router.ready=true` |
+| T1 | 并发 `Close()` 先执行 `s.router.Close()`（不取 `s.mu`） | `router.ready=false` |
+| T2 | `updateSubs` 调 `s.router.Update(...)` | `router.Update` 见 `!ready`，`panic("must be created with NewServer before calling update, must not call update after close")`（`:629-634`）；进程退出 |
+
+**修复代码**：
+
+```go
+// services/subscriber/service.go:369-375 — 除零保护
+if createdNew || len(toClose) > 0 {
+    memoryLimit := int64(0)
+    if s.conf.TotalBufferBytes != 0 && len(s.subs) > 0 {
+        memoryLimit = int64(s.conf.TotalBufferBytes / len(s.subs))
+        if memoryLimit == 0 {
+            memoryLimit = 1
+        }
+    }
+    s.router.Update(s.subs, memoryLimit)
+}
+
+// services/subscriber/service.go:175-195 — 先置 closing（持 s.mu），再关 router
+s.mu.Lock()
+// ... 原 closing 检查与 close(s.closing) ...
+s.mu.Unlock()
+s.router.Close()
+```
+
+`updateSubs` 持有 `s.mu` 期间 `Close` 无法置 `closing`；`Close` 置位后，新的 `updateSubs` 在 `:317-323` 的 `closing` 检查处直接返回，因此 `router.Update` 不会再与 `router.Close` 竞争。
+
+### 7.15 CQ 补算点被写窗口丢弃后不会自动补算
+
+`ExecuteContinuousQuery` 在真正执行查询之前就把 `LastRun` 推进并写入 `s.lastRuns`（`v1.12.3:services/continuous_querier/service.go:337-340`）。如果目标 RP 设置了 `PAST LIMIT`，`MapShards` 会把 `FOR` 回补的历史点当作 `WriteWindowLowerBound` 丢弃（`coordinator/points_writer.go:346-352`），`WritePointsPrivileged` 返回 `PartialWriteError`（`:517-521`），CQ 记 `QueryFail` 并打 `Error executing query`（`service.go:271-273/390-394`）。由于进度已推进，下一轮窗口整体右移，被丢弃的桶不会再进入查询范围；`RESAMPLE FOR` 只扩大单次查询窗口，不会突破目标 RP 当前的写窗口。案例与数值见 3.15c。缓解：先调大目标 RP 的 `PAST LIMIT`（必要时同时调大 `RESAMPLE FOR`），或停机手工补写；不要依赖 CQ 自动重试。
 
 ## 8. 证据索引
 
@@ -1341,6 +1674,14 @@ rpi.Subscriptions = append(rpi.Subscriptions[:i], rpi.Subscriptions[i+1:]...)
 | SHOW SHARDS expiry | `coordinator/statement_executor.go:821` | `coordinator/statement_executor.go:896` | `8fa4d82ce7` #21795 |
 | shard group 无 shard 报错 | `coordinator/points_writer.go:237` 直接 `ShardFor` | `coordinator/points_writer.go:353` | `694607a22c` #25719 |
 | PartialWriteError | `tsdb/shard.go:113` | `tsdb/shard.go:121` | `31b41a6a2d` #26257 |
+| Lease 结构 | `services/meta/data.go:1679` | `services/meta/data.go:1799` | — |
+| Leases/Acquire（集群，OSS 无调用方） | `services/meta/data.go:1686/1704` | `services/meta/data.go:1806/1824` | — |
+| CQ Service 结构/lastRuns | `services/continuous_querier/service.go:83` | `services/continuous_querier/service.go:84` | — |
+| CQ LastRun 推进 | `services/continuous_querier/service.go:331` | `services/continuous_querier/service.go:338-340` | — |
+| CQ backgroundLoop lease | `services/continuous_querier/service.go:223/232` | `services/continuous_querier/service.go:230/239` | — |
+| precreator 零改动 | `services/precreator/*` | 同左 | 无 commit |
+| snapshotter 恢复合并 | `services/snapshotter/service.go:181-221` | `services/snapshotter/service.go:181-221` | 未变 |
+| subscriber 除零点 | — | `services/subscriber/service.go:373` | #21752 系列 |
 | subscriber 路由 | `services/subscriber/service.go:228/233` | `services/subscriber/service.go:586/608` | 订阅重写 |
 | subscriber 字节配额 | — | `services/subscriber/config.go:49`、`services/subscriber/service.go:372/449` | #21752 系列 |
 | snapshotter IDMap | `services/snapshotter/service.go:249` | `services/snapshotter/service.go:249` | 未变 |
@@ -1351,4 +1692,5 @@ rpi.Subscriptions = append(rpi.Subscriptions[:i], rpi.Subscriptions[i+1:]...)
 ### 交叉引用
 
 - 新版本行为详解：[04 Background Tasks](../04_background_tasks_spec.md)、[05 Downsampling](../05_downsampling_spec.md)、[06 Cluster Communication](../06_cluster_communication_spec.md)、[07 State Machine](../07_state_machine_spec.md)、[12 Background Services](../12_background_services_spec.md)
-- 相邻版本差异篇目：`01_write_engine_diff.md`（compaction 与 TSM）、`02_index_diff.md`（TSI / series file）
+- 相邻版本差异篇目：[01 写入路径](01_write_path_diff.md)（写路径/写窗口）、[02 索引与 series](02_index_series_diff.md)（TSI / series file，3.11/3.14 的 owner）、[04 存储与 compaction](04_storage_compaction_diff.md)（purger，3.12 的 owner）
+- retention 与 shard 生命周期的完整状态机：主 12 §6.1；CQ 的 lease 使用：主 07 §5/§11.7、主 12 §7.5；快照/恢复：主 07 §8；订阅扇出：主 07 §12.1。

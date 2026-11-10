@@ -447,6 +447,7 @@ sequenceDiagram
         FS->>FS: obs.FileUnlinking(file.Path())
         alt file.InUse() — 有查询正在使用
             FS->>Old: Rename(file → file.tmp)
+            FS->>FS: os.Remove(旧 .tombstone) — 锁内立即删除
             FS->>FS: 加入 inuse 切片
         else 无查询使用
             FS->>Old: Close() + Remove()
@@ -461,7 +462,7 @@ sequenceDiagram
 ```
 
 **关键设计**:
-- **InUse 保护**: 如果旧文件正在被查询使用（`Ref() > 0`），不会立即删除，而是重命名为 `.tsm.tmp`（`TmpTSMFileExtension`）并连同其 tombstone 一起交给 `purger` 延迟清理
+- **InUse 保护**: 如果旧文件正在被查询使用（`Ref() > 0`），不会立即删除，而是重命名为 `.tsm.tmp`（`TmpTSMFileExtension`）并把文件句柄交给 `purger` 延迟清理；对应的 tombstone 文件在**锁内立即 `os.Remove`**，不交给 purger
 - **Observer 回调**: `FileFinishing` 和 `FileUnlinking` 是 Enterprise 复制的钩子，OSS 版本是 no-op；`FileFinishing`/`FileUnlinking` 的错误会直接返回
 - **原子性**: 新文件的 rename/open 在**锁外**完成；只有“替换文件列表”在写锁内完成。锁内失败会返回错误，旧列表保持不变，并不是整个 `replace` 都在写锁内。
 
