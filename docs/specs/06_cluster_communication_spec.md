@@ -2335,27 +2335,28 @@ func (s *Shard) saveFieldsAndMeasurements(fieldsToSave []*FieldCreate) (int, err
 ```mermaid
 flowchart TD
     A["Shard.WritePoints(points)"] --> B["validateSeriesAndFields"]
-    B --> C{"field 名为 time?"}
-    C -->|"是"| D["Dropped=0，不剥字段，点继续（不建字段元数据）"]
-    C -->|"否"| E{"字符串长度 > 1 MiB?"}
+    B --> C{"点除 time 外还有有效 field?"}
+    C -->|"否（time 是唯一 field）"| TD["Dropped=1，整点丢弃"]
+    C -->|"是（time 随点保留，不剥离）"| E{"字符串长度 > 1 MiB?"}
     E -->|"是"| F["Dropped=1，整点丢弃"]
     E -->|"否"| G{"类型冲突?"}
     G -->|"是"| F
     G -->|"否"| H["创建/复用 field，点继续"]
     F --> I["已识别的新 field 仍写入 fields.idxl"]
-    D --> J["engine.WritePoints 写入全部 field（含 time）"]
-    H --> J
+    TD --> I
+    H --> J["engine.WritePoints 写入全部 field（含 time）"]
 ```
 
 | 条件 | Dropped | 点是否继续写入 | 证据 |
 |------|---------|----------------|------|
-| field 名为 `time` | 0 | 是（**不剥离**；仅不创建字段元数据，field 仍随 point 写入 Cache/WAL） | `tsdb/field_validator.go:45-56`；`tsdb/engine/tsm1/engine.go:1364-1366` |
+| 点**只有** field 名为 `time`（无其他有效 field） | 1 | 否，整点丢弃（`validField=false` → `dropped++` + `continue`） | `tsdb/shard.go:688-705` |
+| 点含其他有效 field，且 field 中有名为 `time` 的项 | 0 | 是（**不剥离**；仅不创建 `time` 字段元数据，field 仍随 point 写入 Cache/WAL） | `tsdb/field_validator.go:45-57`；`tsdb/engine/tsm1/engine.go:1364-1366` |
 | 字符串值 > 1 MiB（`MaxFieldValueLength=1048576`） | 1 | 否，整点丢弃 | `tsdb/field_validator.go:12,27-39` |
 | 类型冲突 `ErrFieldTypeConflict` | 1 | 否，整点丢弃 | `tsdb/field_validator.go:65-73`；`tsdb/shard.go:719-726` |
 | 其它建 field 错误 | 1 | 否 | `tsdb/field_validator.go:74-79` |
 | `dataType == influxql.Unknown` | — | 该 field 被静默跳过（不校验、不创建） | `tsdb/field_validator.go:56-58` |
 
-**关键行为**: Field 类型冲突**不是**"只跳过冲突的 field"。`ValidateAndCreateFields` 返回 `PartialWriteError{Dropped: 1}`，`validateSeriesAndFields` 在 `Dropped > 0` 时直接 `continue`，该点不进入 `points[j]`，因此**整个 Point 被丢弃**（`tsdb/shard.go:719-726`）。只有 field 名为 `time` 时 `Dropped=0`；字段不会被删除，engine 也不再跳过它（v1.8.10 在 engine 层跳过，v1.12.3 删除该逻辑），因此该 field 会以 key `time` 写入 Cache/WAL，只是不进入 `fields.idx`——这与错误文本 "has been stripped" 不符，属于已知行为变化/待回归项。
+**关键行为**: Field 类型冲突**不是**"只跳过冲突的 field"。`ValidateAndCreateFields` 返回 `PartialWriteError{Dropped: 1}`，`validateSeriesAndFields` 在 `Dropped > 0` 时直接 `continue`，该点不进入 `points[j]`，因此**整个 Point 被丢弃**（`tsdb/shard.go:719-726`）。只有点**还含其他有效 field** 时 `Dropped=0`（`time` 不剥离，见 `tsdb/field_validator.go:45-57`）；若 `time` 是唯一 field，则 `validField=false`、`dropped++` 并 `continue`，整点丢弃（`tsdb/shard.go:688-705`）。字段不会被删除，engine 也不再跳过它（v1.8.10 在 engine 层跳过，v1.12.3 删除该逻辑），因此该 field 会以 key `time` 写入 Cache/WAL，只是不进入 `fields.idx`——这与错误文本 "has been stripped" 不符，属于已知行为变化/待回归项。
 
 > engine 层的 `seriesTypeMap` 冲突只跳过单个 field（`tsdb/engine/tsm1/engine.go:1372-1391`），但正常写入路径已在 shard 层拦下。被丢弃点上已识别的新 field 仍会创建并写入 `fields.idxl`（仅限排在冲突字段之前、已迭代到的 field），因此 `SHOW FIELD KEYS` 可能看到"从未成功写入过数据"的字段。
 

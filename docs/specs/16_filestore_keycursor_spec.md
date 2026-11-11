@@ -311,7 +311,7 @@ func (f *FileStore) Close() error {
 }
 ```
 
-### 2.6 FileStore.Replace — 原子替换文件
+### 2.6 FileStore.Replace — 两阶段替换（非原子）
 
 ```go
 // tsdb/engine/tsm1/file_store.go:896 — replace
@@ -464,10 +464,10 @@ sequenceDiagram
 **关键设计**:
 - **InUse 保护**: 如果旧文件正在被查询使用（`Ref() > 0`），不会立即删除，而是重命名为 `.tsm.tmp`（`TmpTSMFileExtension`）并把文件句柄交给 `purger` 延迟清理；对应的 tombstone 文件在**锁内立即 `os.Remove`**，不交给 purger
 - **Observer 回调**: `FileFinishing` 和 `FileUnlinking` 是 Enterprise 复制的钩子，OSS 版本是 no-op；`FileFinishing`/`FileUnlinking` 的错误会直接返回
-- **原子性**: 新文件的 rename/open 在**锁外**完成；只有“替换文件列表”在写锁内完成。锁内失败会返回错误，旧列表保持不变，并不是整个 `replace` 都在写锁内。
+- **原子性**: **两阶段、非原子**。新文件的 rename/open 在**锁外**完成；只有“替换文件列表”在写锁内完成。锁内失败会返回错误，但已关闭/删除/改名的旧文件不会回滚，并不是整个 `replace` 都在写锁内。
 
 **失败语义**:
-- 旧文件保持不变：锁内循环在真正 `f.files = active` 之前就返回错误。
+- `f.files`（内存列表）保持不变：锁内循环在真正 `f.files = active` 之前就返回错误。但已关闭/删除/改名的旧文件**不会回滚**，`f.files` 可能仍指向已失效 reader（`ReadBytes` 返回 `ErrTSMClosed`），进程内可能静默少数据，直到重启重扫目录。
 - 失败的新文件被 rename 回 `.tsm.tmp`，由调用方删除；**已经打开的先前 reader 不会被关闭**（源码如此），调用方需按返回值处理。
 - `InUse()` 的文件 rename 成 `.tsm.tmp` 后由 purger 在查询结束后删除；对应的 tombstone 文件在锁内立即 `os.Remove`。
 - `SyncDir` 失败会让 `replace` 返回错误，此时 `f.files = active` **尚未执行**，内存中的文件列表保持旧值；但循环里已经 `Close/Remove`（或 rename 成 `.tsm.tmp`）的旧文件不会回滚，磁盘状态与内存列表可能短暂不一致，调用方应按失败处理。

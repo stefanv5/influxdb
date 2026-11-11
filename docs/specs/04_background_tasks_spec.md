@@ -216,7 +216,7 @@ func (c *Compactor) WriteSnapshot(cache *Cache, logger *zap.Logger) ([]string, e
 2. 解锁：`snapshot.Deduplicate()`；
 3. 无锁：`Compactor.WriteSnapshot(snapshot)`；
 4. `e.mu.RLock()`：`FileStore.Replace(nil, newFiles)` + `Cache.ClearSnapshot(true)` + `WAL.Remove(closedFiles)`；
-5. 解锁。任一步失败时 defer `ClearSnapshot(false)`，并删除全部 `newFiles`。
+5. 解锁。任一步失败时 defer `ClearSnapshot(false)`；`FileStore.Replace` 失败会逐个 `os.Remove` 传入的 `newFiles`（已 rename 成 `.tsm` 的会删除失败并只打日志），但 `Compactor.WriteSnapshot` 返回错误时**不删除**其已写出的 `.tsm.tmp`（含 `errSnapshotsDisabled` 分支丢弃的文件列表），只能等下次启动 `Engine.cleanup` 清理。
 
 #### 步骤 6-15: TSM Compaction 主循环
 
@@ -2333,8 +2333,9 @@ func (k *tsmBatchKeyIterator) chunkFloat(dst blocks) blocks {
 **EncodeFloatArrayBlock** 编码过程:
 1. 时间戳：自适应 TimeEncoder（Delta + 十进制 Scale + Simple8b/RLE/Raw）
    - 首字节 = 高 4 位编码类型（0=Raw, 1=PackedSimple, 2=RLE）| 低 4 位 log10(divisor)
-   - 随后 8B 首个 delta；其余 delta 除以 divisor 后进 Simple8b/RLE/Raw
-   - 证据: timestamp.go:46-49、165-176
+   - Packed/RLE 的 8B 都是首时间戳；RLE 随后是 uvarint(delta/divisor)+uvarint(count)；
+     Raw 是 N×8B 原时间戳（无首 delta 头）；Packed 其余 delta/divisor 进 Simple8b
+   - 证据: timestamp.go:85-117、141-179、181-192、194-217
 2. float 值：Gorilla XOR（float.go:17-19、77-90）
    - 值段首字节 = floatCompressedGorilla << 4（0x10）
    - 以 math.NaN()（0x7FF8000000000001）作为流结束哨兵，因此 NaN 不能作为数据值

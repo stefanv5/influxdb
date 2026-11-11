@@ -582,7 +582,7 @@ type SeriesIndex struct {
 | 53 | 8 | IDOffsetMap.Offset |
 | 61 | 8 | IDOffsetMap.Size |
 
-`SeriesIndexHeaderSize = 4 + 1 + 8×6 = 69` 字节。文件体只有两张 RHH 表，每元素
+`SeriesIndexHeaderSize = 4 + 1 + 8×8 = 69` 字节。文件体只有两张 RHH 表，每元素
 16 字节（`SeriesIndexElemSize = 16`）：
 
 - KeyIDMap：`[offset 8B][id 8B]`，共 `Capacity × 16B`
@@ -1920,7 +1920,7 @@ flowchart TD
 | 元素 | 布局 | 源码 |
 |------|------|------|
 | `MeasurementBlockElem` | flag(1B) + tagBlock.offset(8B) + tagBlock.size(8B) + name(uvarint len + N) + seriesN(uvarint) + seriesDataSize(uvarint) + series data | `measurement_block.go:430-475` |
-| `MeasurementBlockTrailer` | version(2B) + data offset/size(16B) + hash offset/size(16B) + sketch offset/size(16B) + tSketch offset/size(16B) = 66B | `measurement_block.go:32-40` |
+| `MeasurementBlockTrailer` | data offset/size(16B) + hash offset/size(16B) + sketch offset/size(16B) + tSketch offset/size(16B) + version(2B，最后) = 66B | `measurement_block.go:32-40` |
 | `TagBlockKeyElem` | flag(1B) + data.offset/size(8+8) + hashIndex.offset/size(8+8) + key(uvarint len + N) | `tag_block.go:282-315` |
 | `TagBlockValueElem` | flag(1B) + value(uvarint len + N) + seriesN(uvarint) + dataSize(uvarint) + data/bitmap | `tag_block.go:406-430` |
 | `TagBlockTrailer` | 6×8B offset/size + size(8B) + version(2B) = 58B | `tag_block.go:437-445` |

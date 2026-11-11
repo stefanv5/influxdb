@@ -346,24 +346,28 @@ sequenceDiagram
         loop 每个本地 Shard
             alt Shard ID 在 deletedShardIDs 中
                 Run->>TSDB: SetShardNewReadersBlocked(id, true)
-                Run->>TSDB: ShardInUse(id)
-                alt 闸门 / InUse 自身失败（非 NotFound）
-                    Run->>TSDB: SetShardNewReadersBlocked(id, false)（defer）
-                    Run->>Run: retryNeeded = true，下轮重试
-                else 仍有 reader 使用
-                    Run->>TSDB: SetShardNewReadersBlocked(id, false)（defer）
-                    Note over Run: 本轮跳过，等待下次检查
-                else 没有 reader 使用
-                    Run->>TSDB: DeleteShard(id)
-                    TSDB->>Disk: 删除 Shard 文件和 WAL
-                    alt 返回 ErrShardNotFound（本地已无该 shard，含并发删除）
-                        Note over Run: 不算失败，继续摘 meta 引用
-                        Run->>Meta: DropShardMetaRef(id, owners)
-                    else 返回其他错误（非 NotFound）
+                alt 闸门自身失败（非 NotFound）
+                    Run->>Run: retryNeeded = true，下轮重试（defer 未注册，不 unblock）
+                else 加闸成功（defer 已注册）
+                    Run->>TSDB: ShardInUse(id)
+                    alt InUse 自身失败（非 NotFound）
                         Run->>TSDB: SetShardNewReadersBlocked(id, false)（defer）
-                        Run->>Run: retryNeeded = true；下轮由 phantom 分支摘引用
-                    else 删除成功
-                        Run->>Meta: DropShardMetaRef(id, owners)
+                        Run->>Run: retryNeeded = true，下轮重试
+                    else 仍有 reader 使用
+                        Run->>TSDB: SetShardNewReadersBlocked(id, false)（defer）
+                        Note over Run: 本轮跳过，等待下次检查
+                    else 没有 reader 使用
+                        Run->>TSDB: DeleteShard(id)
+                        TSDB->>Disk: 删除 Shard 文件和 WAL
+                        alt 返回 ErrShardNotFound（本地已无该 shard，含并发删除）
+                            Note over Run: 不算失败，继续摘 meta 引用
+                            Run->>Meta: DropShardMetaRef(id, owners)
+                        else 返回其他错误（非 NotFound）
+                            Run->>TSDB: SetShardNewReadersBlocked(id, false)（defer）
+                            Run->>Run: retryNeeded = true；下轮由 phantom 分支摘引用
+                        else 删除成功
+                            Run->>Meta: DropShardMetaRef(id, owners)
+                        end
                     end
                 end
             end
@@ -579,6 +583,7 @@ for id, info := range deletedShardIDs {
 - defer 的条件是 `rErr != nil && !errors.Is(rErr, tsdb.ErrShardNotFound)`：
   - 失败 (非 ErrShardNotFound) → 解除阻塞，下轮重试。
   - `ErrShardNotFound` → **特意图省略**解除阻塞 (shard 已不在 store，`SetShardNewReadersBlocked` 也会失败)。
+- **闸门自身失败**发生在 defer 注册之前（`:234-236`），因此不会执行 unblock；只有加闸成功后的失败才走 defer。
 - `ShardInUse` 返回 true 时返回 `errors.New("can not delete an in-use shard")`，
   由 defer 解除阻塞（因为这是 `rErr != nil` 路径，且错误不是 `ErrShardNotFound`）。
 - 成功路径 (`rErr == nil`) 不解除阻塞——shard 已删除，阻塞标记随 shard 一起消失。
@@ -650,8 +655,9 @@ func (data *Data) PruneShardGroups(expiration time.Time) bool {
 ShardGroupDeletedExpiration = -2 * 7 * 24 * time.Hour  // -14 天
 ```
 
-> **小白解释**: 软删除后，元数据还要保留 14 天。为什么？因为集群中的其他节点可能还没来得及
-> 物理删除自己的 Shard 文件。14 天的缓冲期确保所有节点都有足够时间完成清理。
+> **小白解释**: 软删除后，元数据还要保留 14 天。为什么？注意 14 天**不是**“给其他节点物理删除文件”的缓冲期：
+> `len(Shards)==0` 已经要求所有节点完成 `DeleteShard` + `DropShardMetaRef`，只要组里还剩任一 `ShardInfo`，
+> 过多久都不会修剪。14 天是在清空后继续保留墓碑，给运维留出排查窗口（与 §11.5 一致）。
 
 ### 2.7 Phase 4: 错误处理与重试
 
@@ -1908,6 +1914,11 @@ CreateShard 可能频繁返回 `ErrShardDeletion`。
 
 - 同 shard 上在途的 `DeleteSeries` / `DeleteMeasurement`（罕见）；
 - `sh.Close()` 等待 `Shard.mu` 上的在途写入；
+- **TSI 索引迭代器**：`SHOW SERIES`/`SHOW MEASUREMENTS`/`SHOW TAG VALUES`/series 展开持有的 `LogFile`/`IndexFile` 引用
+  由 `Partition.RetainFileSet()` 管理，但**不计入** `SetShardNewReadersBlocked`/`ShardInUse`；`DeleteShard` 的
+  `sh.Close()` → `index.Close()` → `Partition.Close()` 会在 `wg.Wait()` 上等待这些迭代器（`tsdb/shard.go:412-433`、
+  `tsdb/index/tsi1/partition.go:388-413`）。retention 是单 goroutine 串行遍历，慢索引查询可以让**整个 tick** 停住
+  （05 §3.9/§7.16）；
 - 高基数时 `SeriesIDSet.Diff()` 与 `FlushSegments` 的耗时。
 
 **影响**: `DeleteShard` 完成前，`pendingShardDeletes` 持续时间变长；
@@ -2007,14 +2018,14 @@ flowchart TD
     H -->|"否"| J["DeleteShard(id)"]
     J -->|"nil 或 ErrShardNotFound"| K["DropShardMetaRef(id, owners)"]
     J -->|"其他 error"| L["retryNeeded = true<br/>本轮保留 meta ref；下轮 phantom 摘除"]
-    K --> M["Phase 3: 遍历 deletedShardIDs 的剩余项"]
+    K --> M["Phase 2b: 遍历 deletedShardIDs 的剩余项"]
     L --> M
     M --> N["phantom: 只做 DropShardMetaRef<br/>不碰磁盘"]
-    N --> O["Phase 4: PruneShardGroups()"]
+    N --> O["Phase 3: PruneShardGroups()"]
 ```
 
 > 注意 Phase 2 的 `SetShardNewReadersBlocked`/`ShardInUse` 只对**本地仍在**的 shard 生效；
-> 本地不存在的 shard 走 Phase 3，Phase 3 不会尝试 `DeleteShard`。
+> 本地不存在的 shard 走 Phase 2b（phantom），Phase 2b 不会尝试 `DeleteShard`。阶段编号在 §2.3/§2.4-§2.7 与 §14 流程图之间保持“Phase 2 本地删除（含 2b phantom）、Phase 3 修剪、Phase 4 错误处理”。
 
 接口是**节选**（仅列出本节涉及的方法）；完整定义见 §2.1：
 
@@ -2075,7 +2086,7 @@ flowchart TD
 
 1. `DeletedShardGroups()` 仍返回含 shard 42 的组，于是 `deletedShardIDs[42]` 被填入。
 2. 本地 `ShardIDs()` 不含 42 → Phase 2 的循环根本不会碰到它。
-3. Phase 3 遍历剩余项，OSS 分支（`isOSS()`）直接 `DropShardMetaRef(42, owners=[])`
+3. Phase 2b 遍历剩余项，OSS 分支（`isOSS()`）直接 `DropShardMetaRef(42, owners=[])`
    → `meta.Client.DropShard(42)` 删除 `ShardInfo`；磁盘上没有对应目录，无需删除。
 4. 组内最后一个 `ShardInfo` 被移除时，`DropShard` 会副作用置 `DeletedAt`（`data.go:313-321`）。
 

@@ -599,7 +599,7 @@ Data.Clone()  [data.go:759, 导出, 指针接收者]
     └── Privileges map (深拷贝)
 ```
 
-**为什么需要深拷贝？** 写操作在副本上修改，不影响已经拿到旧版本 `cacheData` 的 goroutine。注意这不是“无锁读”：Client 的读方法仍会 `RLock()`，Copy-on-Write 的作用是让读锁内取到的快照在写方 commit/swap 之后仍然稳定。**例外是 `Subscriptions`**：`RetentionPolicyInfo.clone()` 只深拷贝 `ShardGroups`，`DropSubscription` 用 `append(s[:i], s[i+1:]...)` 原地搬移共享底层数组，因此 `DROP SUBSCRIPTION` 会改动旧快照，且 `snapshot` 失败时内存与磁盘会分叉（详见 [v1.8.10-vs-v1.12.3/05](../v1.8.10-vs-v1.12.3/05_meta_background_diff.md) 7.13）。
+**为什么需要深拷贝？** 写操作在副本上修改，不影响已经拿到旧版本 `cacheData` 的 goroutine。注意这不是“无锁读”：Client 的读方法仍会 `RLock()`，Copy-on-Write 的作用是让读锁内取到的快照在写方 commit/swap 之后仍然稳定。**例外是 `Subscriptions`**：`RetentionPolicyInfo.clone()` 只深拷贝 `ShardGroups`，`DropSubscription` 用 `append(s[:i], s[i+1:]...)` 原地搬移共享底层数组，因此 `DROP SUBSCRIPTION` 会改动旧快照，且 `snapshot` 失败时内存与磁盘会分叉（详见 [v1.8.10-vs-v1.12.3/05](v1.8.10-vs-v1.12.3/05_meta_background_diff.md#713-subscriptions-不是深拷贝dropsubscription-原地改共享数组) 7.13）。
 
 #### 步骤 6: Data 上的变更方法
 

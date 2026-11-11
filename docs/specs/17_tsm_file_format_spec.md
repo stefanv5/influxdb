@@ -188,9 +188,9 @@ const (
 
 | 输入特征 | 编码类型 | 首字节位域 / 关键常量 |
 |---|---|---|
-| 时间戳 delta 全相等且 len>1 | `timeCompressedRLE` (2) | `2<<4 \| log10(divisor)`，随后 8B t0 + 8B delta |
-| 时间戳 delta 最大值 ≤ `simple8b.MaxValue` | `timeCompressedPackedSimple` (1) | `1<<4 \| log10(divisor)`，8B 首 delta + Simple8b |
-| 时间戳 delta 最大值 > `1<<60-1` | `timeUncompressed` (0) | `0<<4`，逐 8B |
+| 时间戳 delta 全相等且 len>1 | `timeCompressedRLE` (2) | `2<<4 \| log10(divisor)`，随后 8B 首时间戳 + uvarint(delta/divisor) + uvarint(count) |
+| 时间戳 delta 最大值 ≤ `simple8b.MaxValue` | `timeCompressedPackedSimple` (1) | `1<<4 \| log10(divisor)`，8B 首时间戳 + Simple8b(Δts[1:]/divisor) |
+| 时间戳 delta 最大值 > `1<<60-1` | `timeUncompressed` (0) | `0<<4`，N×8B 原时间戳（无首 delta 头） |
 | float 值 | Gorilla XOR | `0x10`；`math.NaN()`（`0x7FF8000000000001`）作哨兵 |
 | int/uint 值 | Simple8b / RLE / Raw | 首字节 `0/1/2 << 4` + 8B 首值 |
 | bool 值 | bit-packed | `booleanCompressedBitPacked << 4` + uvarint 数量 |
@@ -283,7 +283,7 @@ encodedBlock (hex, 已跳过 4B CRC):
   byte 0      = 0x00 → BlockFloat64
   byte 1      = 0x09 → uvarint tsLen = 9
   bytes 2..10 = ts 段 9B: 首字节 0x1?（高 4 位=1 Simple8b，低 4 位=log10(divisor)）
-                + 8B 首个 delta
+                + 8B 首时间戳（reduce() 只差分 i>0，deltas[0] 仍是时间戳）
   bytes 11..  = values 段: 首字节 0x10（floatCompressedGorilla<<4）
                 + Gorilla 位流 + math.NaN() 哨兵
 
@@ -302,7 +302,7 @@ DecodeFloatBlock(block):
   tb, vb, err := unpackBlock(block)  // tb=9B, vb=Gorilla 流
   tdec.Init(tb)                      // TimeDecoder，不是 IntegerDecoder
   vdec.SetBytes(vb)                  // FloatDecoder: Gorilla XOR
-  // 边界: ts 段至少 9B（1B 编码头 + 8B 首 delta）；values 段以 0x10 开头、以 NaN 哨兵结尾
+  // 边界: ts 段至少 9B（1B 编码头 + 8B 首时间戳）；values 段以 0x10 开头、以 NaN 哨兵结尾
 ```
 
 关键边界行为：
@@ -319,7 +319,10 @@ DecodeFloatBlock(block):
 ```
 首字节 = (编码类型 << 4) | log10(divisor)
   编码类型: 0=timeUncompressed, 1=timeCompressedPackedSimple, 2=timeCompressedRLE
-随后 8B 首个 delta；其余 delta/divisor 进 Simple8b（或 RLE/Raw）
+分类型体（reduce() 只对 i>0 做差分，deltas[0] 仍是原时间戳）:
+  Packed(1): 8B 首时间戳(BE) + Simple8b(Δts[1:]/divisor)
+  RLE(2):    8B 首时间戳(BE) + uvarint(delta/divisor) + uvarint(count，含首点总数)
+  Raw(0):    N×8B 原时间戳(BE)，没有“首个 delta”头
 阈值: delta 最大值 > simple8b.MaxValue (1<<60 - 1) → Raw
 ```
 
@@ -348,7 +351,8 @@ DecodeFloatBlock(block):
 **string values**（`batch_string.go:70-89`）:
 
 ```
-首字节高 4 位 = stringCompressedSnappy(1) + Snappy 压缩的拼接字符串
+首字节高 4 位 = stringCompressedSnappy(1) + Snappy( uvarint(len₁)‖s₁ ‖ uvarint(len₂)‖s₂ ‖ … )
+（每个字符串带 uvarint 长度前缀，否则无法切分变长串）
 ```
 
 **阈值/常量**（`writer.go:88-104`）:
@@ -370,8 +374,8 @@ flowchart LR
     D --> TS["ts(tsLen B)"]
     D --> V["values(剩余字节)"]
     TS --> E1["TimeEncoder.Bytes()<br/>首字节: 编码类型<<4 | log10(divisor)"]
-    E1 --> E2["首 delta(8B)"]
-    E1 --> E3["Simple8b / RLE / Raw 尾部"]
+    E1 --> E2["Packed/RLE: 8B 首时间戳<br/>Raw: 无 8B 头"]
+    E1 --> E3["Packed: Simple8b<br/>RLE: 2×uvarint<br/>Raw: N×8B 时间戳"]
     V --> F1["FloatEncoder.Bytes()<br/>0x10 头 + Gorilla XOR"]
     F1 --> F2["NaN 哨兵结束"]
 ```
@@ -1605,8 +1609,8 @@ flowchart TD
 ```
 Manifest JSON = {"dir":"/shard","entries":[{"filename":"000000001-000000001.tsm","size":4096}]}
 写入:
-  uint32 manifestLen = 69
-  69 bytes manifest JSON
+  uint32 manifestLen = 79
+  79 bytes manifest JSON
 
 TimeSpan key = "cpu,host=web#!~#value", ranges = 1
   uint16 keyLen = 21

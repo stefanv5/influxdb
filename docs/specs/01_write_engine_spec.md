@@ -653,12 +653,15 @@ func (l *WAL) writeToLog(entry WALEntry) (int, error) {
 **Segment 滚动**:
 
 ```go
-// tsdb/engine/tsm1/wal.go:466 — rollSegment
-func (l *WAL) rollSegment() {
+// tsdb/engine/tsm1/wal.go:466 — rollSegment（v1.12.3）
+func (l *WAL) rollSegment() error {
     if l.currentSegmentWriter == nil ||
-       l.currentSegmentWriter.size > DefaultSegmentSize {  // 10MB
-        l.newSegmentFile()
+       l.currentSegmentWriter.size > l.SegmentSize {  // 默认为 DefaultSegmentSize=10MiB，可由 wal-segment-size 配置
+        if err := l.newSegmentFile(); err != nil {
+            return fmt.Errorf("error opening new segment file for wal (2): %v", err)
+        }
     }
+    return nil
 }
 
 // tsdb/engine/tsm1/wal.go:561 — newSegmentFile
@@ -1019,7 +1022,7 @@ func (a Values) Deduplicate() Values {
 ```
 
 ```go
-// tsdb/engine/tsm1/writer.go:81 — MagicNumber
+// tsdb/engine/tsm1/writer.go:82 — MagicNumber；:85 — Version
 MagicNumber uint32 = 0x16D116D1
 Version     byte   = 1
 ```

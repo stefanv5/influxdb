@@ -81,7 +81,7 @@ type Service struct {
     https     bool             // 是否启用 HTTPS
     cert      string           // TLS 证书路径 (初始证书，reload 时可能换)
     key       string           // TLS 私钥路径
-    insecureCert bool          // 是否忽略证书文件权限检查 (service.go:81)
+    insecureCert bool          // 是否忽略证书/私钥文件权限检查（不是 InsecureSkipVerify；service.go:81）
     limit     int              // 最大连接数限制
     tlsConfig *tls.Config      // TLS 配置
     err       chan error        // 致命错误通道
@@ -195,7 +195,7 @@ type Config struct {
     HTTPSEnabled            bool              // 是否启用 HTTPS
     HTTPSCertificate        string            // TLS 证书路径
     HTTPSPrivateKey         string            // TLS 私钥路径
-    HTTPSInsecureCertificate bool             // 是否允许不安全/自签名证书
+    HTTPSInsecureCertificate bool             // 是否忽略证书/私钥文件权限检查（不是 InsecureSkipVerify）
     MaxRowLimit             int               // 非分块查询最大行数 (0=不限)
     MaxConnectionLimit      int               // 最大连接数
     SharedSecret            string            // JWT 共享密钥

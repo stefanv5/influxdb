@@ -7,7 +7,7 @@
 > - 区间：527 commits，602 files，+79,310 / −45,239
 > - 本文件覆盖目录（`query/`、`storage/reads/`、`storage/flux/`、`tsdb/cursors/`、`tsdb/engine/tsm1/array_cursor*`）：
 >   93 files，+30,372 / −9,998；涉及 69 个提交（含 array cursor 相关 tsm1 文件）。
-> - NEW 的当前工作树只额外包含 docs 提交（当前 8 个），代码与 `f3d5cb68ab` 相同。
+> - NEW 的当前工作树只额外包含若干 docs 提交（当前触及 `docs/specs/` 的为 8 个、全部 docs 提交为 10 个；数量随文档演进），代码与 `f3d5cb68ab` 相同。
 >
 > 引用格式：旧 `v1.8.10:path:line`，新 `v1.12.3:path:line`（即当前工作树行号）。
 > 新版本行为的详细讲解见 [03 查询引擎](../03_query_engine_spec.md)、
@@ -68,7 +68,7 @@
 | 20 | `GROUP BY time` + DST | `end += offset` 在时区修正之后 | 先加 offset 再做时区修正（#25082） | DST 回退窗口不再丢行 | `v1.8.10:query/iterator.go:864` / `v1.12.3:query/iterator.go:860` |
 | 21 | 多语句错误结果 | `send` 覆盖 `StatementID`，`ErrNotExecuted` 数量少 1 | 显式传 `StatementID`，循环从 `i+1` 到末尾 | 结果条数与 ID 修正 | `v1.8.10:query/execution_context.go:93`、`query/executor.go:383` / `v1.12.3:query/execution_context.go:93`、`query/executor.go:432` |
 | 22 | `SHOW QUERIES` | 5 列，无按库鉴权过滤 | 6 列（+`user`），按 READ 权限过滤（#27196） | 越权泄漏修复 | `v1.8.10:query/task_manager.go:152` / `v1.12.3:query/task_manager.go:34`、`:144` |
-| 23 | 编译期 panic | 直接 panic | `Compile` defer recover，返回 `likely malformed statement...` | 畸形语句变错误而非进程崩溃 | `v1.8.10:query/compile.go:106` / `v1.12.3:query/compile.go:106`、`:118`-`:128` |
+| 23 | 编译期 panic | 直接调用 `Compile` 时 panic（HTTP 路径由 `Executor.recover` 兜底返回 `statement_id=-1` 的 error） | `Compile` defer recover，返回 `likely malformed statement...` | 直接调用从 panic 变 error；HTTP 路径两版都不崩溃进程 | `v1.8.10:query/compile.go:106` / `v1.12.3:query/compile.go:106`、`:118`-`:128` |
 | 24 | 窗口 mean/count 的整数精度 | 无窗口 mean 下推（能力区间内新增） | 初版 `float64` 累加，后改为 int64/uint64 原生累加（#21334） | 大整数不再丢精度 | `v1.12.3:storage/reads/array_cursor.gen.go:2030`、`:2146`；commit `4cf19f8254` |
 | 25 | 结果序列化 | `SeriesFrame.data_type` 已写（gen.go 10 处）；空 series 先建后删 | 类型改由 `startSeries(dataType,tags)` 填；有数据才建；新增 `MultiPointsFrame`/`DataTypeMulti` | 空 series 不再占位；双聚合新增一条 oneof 分支 | `v1.8.10:storage/reads/response_writer.gen.go:40` / `v1.12.3:storage/reads/response_writer.go:205`、`:216`、`storage/reads/response_writer.gen.go:89` |
 
@@ -92,9 +92,9 @@ flowchart TB
         I3 --> I4["query.Select"]
         I3 --> I2["ExecutionContext.send / Send"]
         I2 --> I2R
-        I4 --> I5["query.Prepare"] --> I6["buildCursor"]
+        I4 --> I5["query.Prepare"] --> I5b["preparedStatement.Select (select.go:113)"] --> I6["buildCursor"]
         I6 --> I7["有 call：buildExprIterator / buildCallIterator"]
-        I6 -. "无 call" .-> I7b["buildAuxIterator"]
+        I6 -. "无 call（buildAuxIterator 内部含 Merge :823 / Limit :846）" .-> I7b["buildAuxIterator"]
         I7b --> I7c["NewIteratorScanner → newScannerCursor"]
         I7 --> I8["引擎层（每个 series）：NewCallIterator → Reduce/Stream"]
         I8 --> I8b["NewParallelMergeIterator（同一 TagSet 内）"]
@@ -192,24 +192,30 @@ sequenceDiagram
                     C-->>H: 立即返回 Query（异步执行）
                     W->>Q: tryExec → Executing
                     alt tryExec 失败（已取消/关闭）
-                        W->>Q: setErr（codes.Internal）
+                        W->>Q: setErr（参数 codes.Internal；parentCtx 已取消时改写为 Canceled/context.Canceled）
                     else
                         W->>C: q.c.createAllocator(q)
                         W->>Q: q.recordUnusedMemory()
                         W->>P: program.Start(ctx, alloc)
-                        P-->>W: exec
-                        W->>Q: q.pump(exec, ctx.Done())
-                        loop pump
-                            X-->>Q: Results()
-                            Q-->>H: results channel
+                        alt Start 失败
+                            W->>Q: setErr(err)
+                        else
+                            P-->>W: exec
+                            W->>Q: q.pump(exec, ctx.Done())
+                            loop pump
+                                X-->>Q: Results()
+                                Q-->>H: results channel
+                            end
                         end
                     end
                     H->>Q: Cancel()（defer 注册，函数返回时执行）
                     H->>Q: Done()
                     Q->>Q: transitionTo(Finished) → cancel()
                     Q->>Q: 排空 results 直到 close
-                    Q->>Q: exec.Done() → stats → runtimeErrs → deps.Finish() → finish()
-                    Q->>Q: MemoryManager.Release() → recordUnusedMemory() → countQueryRequest()
+                    Q->>Q: exec.Done() → stats → runtimeErrs → deps.Finish()
+                    Q->>C: finish(q)
+                    Q->>Q: MemoryManager.Release() → recordUnusedMemory()
+                    Q->>C: countQueryRequest(q, label)
                 end
             end
         end
@@ -415,9 +421,11 @@ func (ctx *ExecutionContext) send(result *Result) error {
 而补发未执行语句的循环又从当前 `i` 开始、到 `len-1` 结束：
 
 ```go
-// v1.8.10:query/executor.go:383
+// v1.8.10:query/executor.go:383-390
 for ; i < len(query.Statements)-1; i++ {
-	if err := ctx.send(&Result{StatementID: i, Err: ErrNotExecuted}); ...
+	if err := ctx.send(&Result{StatementID: i, Err: ErrNotExecuted}); err == ErrQueryAborted {
+		return
+	}
 }
 ```
 
@@ -426,9 +434,11 @@ for ; i < len(query.Statements)-1; i++ {
 并在需要时显式传 ID（`query/executor.go:383` 的 normalizer 分支），循环改为：
 
 ```go
-// v1.12.3:query/executor.go:432
+// v1.12.3:query/executor.go:432-439
 for i++; i < len(query.Statements); i++ {
-	if err := ctx.send(&Result{StatementID: i, Err: ErrNotExecuted}); ...
+	if err := ctx.send(&Result{StatementID: i, Err: ErrNotExecuted}); err == ErrQueryAborted {
+		return
+	}
 }
 ```
 
@@ -444,6 +454,8 @@ for i++; i < len(query.Statements); i++ {
 | v1.12.3 | `0` / nil、`1` / 执行错误、`2` / `ErrNotExecuted` | 补发循环 `i++` 后从 3 开始，最后一条得到 ID 2 |
 
 旧版结果条数也是 3，但 ID 序列是 `0,1,1`，客户端按 ID 对齐会错位；新版是 `0,1,2`。
+
+**仍绕过 `ctx.send` 的两个早退**：系统 measurement 拒绝（`_series`/`_fieldKeys` 等，`query/executor.go:362-365`）与 `RewriteStatement` 失败（`:373-377`）仍直接 `results <- &Result{Err: err}`，不设置 `StatementID`（零值 0），也不经 `send`。当第 2 条及以后语句命中这两个分支时，客户端看到的仍是 ID 0（与第 1 条重复），随后补发循环从 `i++` 开始给剩余语句 `ErrNotExecuted`（`query/executor.go:432-439`）。只有 normalize 与执行错误走 `ctx.send(&Result{StatementID:i})`（`:383-415`），因此上面的 `0,1,2` 实例只覆盖 normalize 与执行错误两条路径。
 
 另外，区间内 `FineAuthorizer` 新增了 `OptimizeSeriesRead` 钩子（`2cf2103cc4` #25207）：
 接口定义在 `query/executor.go:93`-`:94`，`openAuthorizer`/`voidAuthorizer` 的实现是 no-op
@@ -491,12 +503,19 @@ var queryFieldNames []string = []string{"qid", "query", "database", "duration", 
 新版的三个入口：
 
 ```go
-// v1.12.3:query/select.go:258
+// v1.12.3:query/select.go:258 — buildExprIterator 的外层 switch expr.Name
 case "count_hll", "derivative", "non_negative_derivative", ..., "elapsed":
 ...
+```
+
+```go
+// v1.12.3:query/select.go:273 — 上述分支内的二级 switch expr.Name
 case "count_hll":
-	return NewCountHllIterator(input, opt)      // v1.12.3:query/select.go:274
-// v1.12.3:query/select.go:516
+	return NewCountHllIterator(input, opt)      // v1.12.3:query/select.go:274-275
+```
+
+```go
+// v1.12.3:query/select.go:516-517 — b.callIterator（buildCallIterator）内的分发
 case "min", "max", "sum", "first", "last", "mean", "sum_hll", "merge_hll":
 	return b.callIterator(ctx, expr, opt)
 ```
@@ -584,15 +603,19 @@ case "min", "max", "sum", "first", "last", "mean", "sum_hll", "merge_hll":
 **(a) `SHOW SERIES CARDINALITY`：精确 → 近似（带 FROM/WHERE 时）**
 
 ```go
-// v1.12.3:query/statement_rewriter.go:219 — 新增 HLL 分支
+// v1.12.3:query/statement_rewriter.go:220-241 — 新增 HLL 分支
 if !stmt.Exact && stmt.Dimensions == nil && stmt.Limit == 0 && stmt.Offset == 0 {
 	return &influxql.SelectStatement{
-		Fields: []*influxql.Field{{Expr: &influxql.Call{
-			Name: "count_hll",
-			Args: []influxql.Expr{&influxql.Call{Name: "sum_hll",
-				Args: []influxql.Expr{&influxql.VarRef{Val: "_seriesKey"}}}},
-			Alias: "cardinality estimation",
-		}}},
+		Fields: []*influxql.Field{{
+			Expr: &influxql.Call{
+				Name: "count_hll",
+				Args: []influxql.Expr{&influxql.Call{
+					Name: "sum_hll",
+					Args: []influxql.Expr{&influxql.VarRef{Val: "_seriesKey"}},
+				}},
+			},
+			Alias: "cardinality estimation", // Alias 是 influxql.Field 的字段，不属于 influxql.Call
+		}},
 		Sources: rewriteSources2(stmt.Sources, stmt.Database),
 		...
 	}, nil
@@ -602,7 +625,7 @@ if !stmt.Exact && stmt.Dimensions == nil && stmt.Limit == 0 && stmt.Offset == 0 
 旧版没有这段，非 EXACT 查询落到 `count(distinct(_seriesKey))`（精确、耗内存）：
 
 ```go
-// v1.8.10:query/statement_rewriter.go:207
+// v1.8.10:query/statement_rewriter.go:206-211
 Expr: &influxql.Call{Name: "count", Args: []influxql.Expr{
 	&influxql.Call{Name: "distinct", Args: []influxql.Expr{&influxql.VarRef{Val: "_seriesKey"}}},
 }},
@@ -836,9 +859,10 @@ default: panic("invalid aggregate")
 **时间范围语义**（commit `8edf7a4e2f`）：
 
 ```go
-// v1.12.3:storage/reads/array_cursor.go:78
-// The range of the cursor is [start, end). ...
-// we translate the time range from [start, stop) to [start, stop].
+// v1.12.3:storage/reads/array_cursor.go:79-91
+// The range of the cursor is [start, end)...
+// When we construct the CursorRequest, we translate the time range
+// from [start, stop) to [start, stop]...
 req: cursors.CursorRequest{Ascending: asc, StartTime: start, EndTime: end - 1}
 ```
 
@@ -980,14 +1004,17 @@ PushDownBareAggregateRule → PushDownGroupAggregateRule`，共 11 条。
 
 ```mermaid
 flowchart LR
-    A["FromNode"] -->|"FromStorageRule"| B["ReadRangePhysSpec / ReadGroupPhysSpec"]
-    B -->|"Range / Filter / Group"| C["ReadRange + datatypes.Predicate"]
+    A["FromNode"] -->|"FromStorageRule"| B["FromStorage（logical，FromStorageProcedureSpec）"]
+    B -->|"PushDownRangeRule"| B1["ReadRangePhysSpec"]
+    B -->|"PushDownGroupRule"| B2["ReadGroupPhysSpec"]
+    B1 -->|"Range / Filter"| C["ReadRange + datatypes.Predicate"]
     C -->|"window(every, period) + agg"| D["PushDownWindowAggregateRule"]
     C -->|"裸聚合"| E["PushDownBareAggregateRule"]
     D --> F["ReadWindowAggregatePhysSpec"]
+    E --> EB["ReadWindowAggregatePhysSpec（WindowEvery=MaxInt64；与 F 同一物理节点、窗口参数不同）"]
     F -->|"duplicate(_start/_stop) + window(inf)"| G["PushDownWindowAggregateByTimeRule"]
     G --> H["TimeColumn=_stop / _start"]
-    B -->|"ReadGroup + agg"| I["PushDownGroupAggregateRule"]
+    B2 -->|"ReadGroup + agg"| I["PushDownGroupAggregateRule"]
     I --> J["ReadGroupPhysSpec.AggregateMethod"]
 ```
 
@@ -1081,7 +1108,7 @@ func (cr *colReader) Floats(j int) *array.Float { ... }   // CheckColType + 类�
 ```go
 // v1.12.3:storage/flux/window.go:20
 func splitWindows(ctx context.Context, alloc memory.Allocator, in flux.Table, selector bool, f func(t flux.Table) error) error
-// v1.12.3:storage/flux/reader.go:694
+// v1.12.3:storage/flux/reader.go:695-700
 if timeColumn == "" {
 	tableFn := f
 	f = func(table flux.Table) error {
@@ -1359,10 +1386,12 @@ func (c *floatArrayDescendingCursor) reset(seek, end int64, cacheValues Values, 
 **角色/owner**：把 `*influxql.SelectStatement` 编译成 `query.Statement`，负责字段表达式校验、
 时间/分组/填充选项、`OnlySelectors` 判定和函数分发。它不创建游标，也不执行查询。
 
-**结构**：`compiledStatement` 保存 `Options IteratorOptions`、`OnlySelectors`、`FunctionCalls`、
-`HasDistinct`、`InheritedInterval`、`HasAuxiliaryFields`；`compiledField` 按表达式类型分发到
-`compileSymbol`/`compileCall`/`compileCountHll`（`query/compile.go:106-115`）。
-`CompileOptions` 由 `Prepare` 传入（`query/select.go:81-88`）。
+**结构**：`compiledStatement` 保存 `Options CompileOptions`、`OnlySelectors`、`FunctionCalls`、
+`HasDistinct`、`InheritedInterval`、`HasAuxiliaryFields`（`query/compile.go:27-93`）。
+字段表达式由 `compiledField.compileExpr` 按类型分发（`:252-316`）：`*influxql.Call` 走
+`compileFunction`（默认分支 `:315`，定义 `:390`；`count_hll` 特判到 `compileCountHll`，`:309-310`/`:787`），
+`VarRef`/通配/正则在 `compileExpr` 内联处理（置 `HasAuxiliaryFields`/`AllowWildcard` 后返回，`:252-272`），**不调用** `compileSymbol`；后者由 `compileFunction`/`compileCountHll` 等调用（`:368`、`:796`）。`CompileOptions` 由 `Prepare` 传入
+（`query/select.go:81-88`）。
 
 **流程**：
 
@@ -1371,19 +1400,22 @@ flowchart LR
     A["influxql.ParseStatement"] --> B["query.Compile (compile.go:106)"]
     B --> C["newCompiler + stmt.Clone"]
     C --> D["preprocess：时间/分组/fill"]
-    D --> E["compile：字段表达式"]
-    E --> F{"表达式类型"}
+    D --> E["compile → compiledField.compileExpr (compile.go:252)"]
+    E --> F{"compileExpr 按表达式类型"}
     F -->|"Call count_hll"| G["compileCountHll：1 个参数 (compile.go:787)"]
-    F -->|"其他 Call"| H["compileCall 分发"]
-    F -->|"VarRef/通配"| I["compileSymbol"]
+    F -->|"其他 Call"| H["compileFunction 分发 (compile.go:315/390)"]
+    F -->|"VarRef/通配/Regex"| I["内联置 HasAuxiliaryFields / AllowWildcard 后 return nil (compile.go:252-272)"]
     G --> J["compiledStatement"]
     H --> J
     I --> J
+    G -.->|"内部调用"| K["compileSymbol (compile.go:368)"]
+    H -.->|"内部调用"| K
+    K --> J
 ```
 
 **代码卡**：
 
-- `v1.12.3:query/compile.go:106-128`：`Compile`；`:118-127` 的 `defer recover` 只包住
+- `v1.12.3:query/compile.go:106-138`：`Compile`；`:118-127` 的 `defer recover` 只包住
   `RewriteDistinct`/`RewriteTimeFields`/`RewriteRegexConditions`，**不包** `newCompiler`、`Clone`、
   `preprocess`、`compile`。
 - `v1.12.3:query/compile.go:309-310` 字段级分发到 `count_hll`；`:787-793` 校验参数个数并置
@@ -1392,11 +1424,14 @@ flowchart LR
 
 **案例（编译期 panic → 错误）**：输入
 `SELECT * FROM cpu WHERE ( host =~ /foo/ ^ other AND env =~ /bar/ ) and time >= now()-15m`。
-旧版在 `RewriteRegexConditions` 中把 `*influxql.BinaryExpr` 当 `*influxql.RegexLiteral` 断言，
-进程 panic；新版被 `:118` 的 recover 捕获，返回
-`likely malformed statement, unable to rewrite: interface conversion: ...`
-（测试期望见 `query/compile_test.go:364`）。注意：若 panic 发生在 `c.compile` 之前，recover
-尚未注册，仍由 `Executor.recover` 兜底（§7.8）。
+两版在 `RewriteRegexConditions` 中都会把 `*influxql.BinaryExpr` 当 `*influxql.RegexLiteral` 断言，
+panic 文本为 `interface conversion: influxql.Expr is *influxql.BinaryExpr, not *influxql.RegexLiteral`，但两条调用路径的结果不同：
+
+- **直接调用 `query.Compile`（单测路径）**：旧版没有 recover，调用方看到 panic（`v1.8.10:query/compile.go:106-127`）；新版在 `:118` 注册 `defer recover` 包住 `RewriteDistinct`/`RewriteTimeFields`/`RewriteRegexConditions`，返回错误 `likely malformed statement, unable to rewrite: interface conversion: influxql.Expr is *influxql.BinaryExpr, not *influxql.RegexLiteral`（测试期望见 `query/compile_test.go:364`）。
+- **HTTP `/query` 路径**：旧版 panic 发生在 `Executor.executeQuery` 的 goroutine 内，被 `defer e.recover` 捕获（`v1.8.10:query/executor.go:253-255,404-420`）：`RecoveredPanics += 1`、日志打印 `query [panic:...]`，并向结果通道发送 `Result{StatementID: -1, Err: "<原查询> [panic:interface conversion: ...]"}`；handler 在取结果前已写 `200 OK`，客户端看到 HTTP **200** + JSON `{"results":[{"statement_id":-1,"error":"SELECT ... [panic:interface conversion: ...]"}]}`，**进程不崩溃**。只有 `INFLUXDB_PANIC_CRASH=true`（`query.PanicCrashEnv`，`init` 时读取）才 `os.Exit(1)`。新版走正常错误返回（`statement_id: 0` 的 error result），同样不崩溃。
+- 注意：若 panic 发生在 `c.compile` 之前（新版 `defer` 尚未注册），仍由 `Executor.recover` 兜底（§7.8）。
+
+不要把旧版 HTTP 场景写成"进程 panic"：只有直接调用 `query.Compile` 的测试路径才会 panic，HTTP 路径由 `Executor.recover` 兜底返回错误结果。
 
 **风险**：`defer` 位置（§7.8）；`count_hll` 只接受 1 个参数，`SELECT count_hll(a,b)` 返回错误
 而不是 HLL；`OnlySelectors=false` 会影响 aux 字段校验（`compile.go:1019-1024`）。
@@ -1420,7 +1455,7 @@ flowchart TB
     B --> C["preparedStatement.Select (select.go:113)"]
     C --> D["buildCursor (select.go:622)"]
     D --> E{"valueMapper.calls 为空?"}
-    E -->|"是"| F["buildAuxIterator -> NewIteratorScanner -> scannerCursor"]
+    E -->|"是"| F["buildAuxIterator -> NewIteratorScanner -> scannerCursor<br/>（内部已含 Iterators.Merge :823 与 NewLimitIterator :846）"]
     E -->|"否"| G["buildExprIterator -> buildCallIterator (select.go:214)"]
     G --> H["引擎层 CreateIterator"]
     H --> I["Iterators.Merge (iterator.go:122) -> NewMergeIterator (:172)"]
@@ -1530,11 +1565,16 @@ flowchart TD
     A["storage/flux.storeReader.Read*"] --> B["Store.ReadFilterLimit / ReadGroupLimit / WindowAggregateLimit"]
     B --> C["GetReadSource + validateArgs (:88)"]
     C --> D["findShardIDs (:63)"]
-    D --> E{"len(shardIDs)==0?"}
+    D --> D1{"limitShardIDs 非空?"}
+    D1 -->|"是"| D2["limitToShardIDs (:149-154)"]
+    D1 -->|"否"| E{"len(shardIDs)==0?"}
+    D2 --> E
     E -->|"是"| F["return (nil, nil)"]
     E -->|"否"| G["newIndexSeriesCursor (:40)"]
-    G --> H["tsdb.CreateCursorIterators"]
-    H --> I["reads.NewFilteredResultSet / NewGroupResultSet / NewWindowAggregateResultSet"]
+    G --> G1{"ic==nil?"}
+    G1 -->|"是"| F2["return (nil, nil) (:157-160)"]
+    G1 -->|"否"| H["tsdb.CreateCursorIterators"]
+    H --> I["reads.NewFilteredResultSet / NewGroupResultSet / NewWindowAggregateResultSet（按入口三选一）"]
 ```
 
 **三条兄弟路径**：
@@ -1566,7 +1606,7 @@ flowchart TD
   `storage/flux.filterIterator.Do` 直接 `return nil`（`store.go:150-153`、
   `storage/flux/reader.go:151-154`）。
 - **错误**：`ReadSource==nil` → `missing read source`；db/RP 不存在 → `validateArgs` 错误；
-  `NodeToExpr` 失败 → `newIndexSeriesCursor` 返回错误（`series_cursor.go:67`）。
+  `NodeToExpr` 失败 → `newIndexSeriesCursor` 返回错误（`series_cursor.go:65-66`）。
 - **源码**：`services/storage/store.go:126-176`、`services/storage/series_cursor.go:40-100`。
 
 **风险**：① 空 shard/空 cursor 都折叠成 `(nil, nil)`，上层无法区分“没数据”和“读失败”；
@@ -1603,8 +1643,9 @@ flowchart TD
 
 ```mermaid
 flowchart LR
-    A["storage/flux row.Query"] --> B["tsdb.CreateCursorIterators"]
-    B --> C["tsm1 arrayCursorIterator.Next(CursorRequest)"]
+    A["services/storage newIndexSeriesCursor (:40)"] --> B["tsdb.CreateCursorIterators (tsdb/cursor.go:39)"]
+    B --> B2["[]CursorIterator → SeriesRow.Query (services/storage/series_cursor.go:62)"]
+    B2 --> C["tsm1 arrayCursorIterator.Next(CursorRequest)"]
     C --> D["floatArrayAscendingCursor.reset (array_cursor.gen.go:42)"]
     D --> E["KeyCursor.ReadFloatArrayBlock"]
     E --> F["cursors.FloatArray"]
@@ -1628,8 +1669,10 @@ flowchart LR
 **案例（#26691，跨包契约视角）**：
 
 - **输入/步骤**：完整输入与逐步数值见 §3.14(a)。本层只关心所有权：
-  `storage/flux` 通过 `tsdb.CreateCursorIterators` 拿到 `tsm1.arrayCursorIterator`，
-  后者的 `Next(CursorRequest)` 调用 `floatArrayAscendingCursor.reset/Next`；
+  `services/storage.newIndexSeriesCursor` 调用 `tsdb.CreateCursorIterators` 得到 `[]CursorIterator`，
+  放进 `SeriesRow.Query`；`storage/reads` 的 `createCursor` 从 `row.Query[0]` 取出
+  `tsm1.arrayCursorIterator`（`storage/reads/array_cursor.go:121-122`），其 `Next(CursorRequest)` 调用
+  `floatArrayAscendingCursor.reset/Next`；
   `reset` 只检查首块读错误，后续块仍走 `nextTSM` 的 `_` 丢弃路径。
 - **输出**：第 1 次 `Next()` 返回 1000 点（cache 995 + TSM 5），第 2 次旧版返回 8 点
   （5 个重复）、新版返回 3 点；累计唯一时间戳 1003。跨包可见的差异只有“重复”，
@@ -1762,7 +1805,11 @@ HLL sketch 的大小只与精度参数有关，与 series 数无关：p=16 时�
 | `[flux-controller]` 配置 | 不存在 | 新增；`query-concurrency>0` 时 `query-queue-size` 必须 >0；内存上限仅在 `total-max-memory-bytes>0` 时生效（0=不限，且绕过 `>= concurrency*initial` 校验） | **配错会启动失败**；0 值不会 | `query-concurrency`/`query-queue-size`/`total-max-memory-bytes`/`query-max-memory-bytes`（及 `query-initial-memory-bytes`）一起配 |
 | `ReadFilterSpec.Predicate` 类型 | `*semantic.FunctionExpression` | `*datatypes.Predicate` | **外部实现编译失败** | 改用 `ToStoragePredicate` 在计划期转换 |
 | `Reader` 接口 | 5 个方法（含 Close） | 6 个（+`ReadWindowAggregate`），alloc 变接口 | **编译失败** | 实现新方法；`memory.Allocator` 用接口值 |
-| `Store.GetSource` 返回类型 | gogo `proto.Message` | protobuf-go `proto.Message` | **编译失败** | 换 import；线格式不变 |
+| `Store.GetSource` 返回类型 | gogo `proto.Message` | protobuf-go `proto.Message` | **编译失败** | 换 import；线格式不变。**同主题另有编译期破坏**：`services/storage.GetReadSource(any types.Any)`（值）→ `GetReadSource(any *anypb.Any)`（指针），只换 import 不能编译（`v1.8.10:services/storage/store.go:28`；`v1.12.3:services/storage/store.go:28`） |
+| `storage/reads.NewFilteredResultSet` | `(ctx, req *datatypes.ReadFilterRequest, cur SeriesCursor)` | `(ctx, start, end int64, seriesCursor SeriesCursor)` | **编译失败** | 传 `req.Range.GetStart()/GetEnd()`（`v1.8.10:storage/reads/resultset.go:25`；`v1.12.3:storage/reads/resultset.go:25`） |
+| `storage/reads.NewReader` | `NewReader(s Store) influxdb.Reader` | 删除；改用 `storage/flux.NewReader(s storage.Store) query.Reader` | **编译失败** | 换包与 import（`v1.8.10:storage/reads/flux_reader.go:30`；`v1.12.3:storage/flux/reader.go:61`） |
+| `query.Aggregate*Points` 包级函数 | `AggregateFloatPoints` / `AggregateIntegerPoints` / `AggregateUnsignedPoints` / `AggregateStringPoints` / `AggregateBooleanPoints` | 删除；生成器改为 reducer 的 `Aggregate*Bulk` 方法 | **编译失败** | 改用 reducer 方法或自建包装（`v1.8.10:query/functions.gen.go:27,511,995,1479,1963`） |
+| `services/httpd.WriteError` | 导出 | 删除 | **编译失败** | 自行 `w.WriteResponse(Response{Err: err})`（`v1.8.10:services/httpd/response_writer.go:76`） |
 | 游标 stop 边界 | Flux `ReadFilter`/`ReadGroup` 必返回 `t==stop` 的点 | `EndTime=stop-1`，必不返回 | **边界结果变化（仅 Flux）**；InfluxQL 不走 `storage/reads`，两版相同 | 只有 Flux `range(stop:...)` 且 stop 上有数据点的查询会少一个点 |
 | `SHOW SERIES CARDINALITY FROM ...` | 精确 | HLL 近似 | **结果数值变化** | 需要精确时加 `EXACT` |
 | `SHOW TAG VALUES FROM "db"."rp"."m"` | 扫描所有 RP | 只扫指定 RP；多 RP 报错 | **结果变化/报错** | 去掉多 RP；不写 RP 仍跨所有 RP |
@@ -2126,7 +2173,7 @@ func (q *Query) ProfilerResults() (flux.ResultIterator, error) {
 | 每用户查询字节 | 无 | `services/httpd/config.go:68`、`handler.go:484`-`:511`、`:821`/`:913`/`:2094`/`:2259` | `4dcc8776c1` #27188 |
 | 查询结果 StatementID | `query/execution_context.go:93` 覆盖 | `query/execution_context.go:93` 不覆盖；`query/executor.go:432` | `0090c5b111` #22273 |
 | TaskManager user/超时日志 | `query/task_manager.go:148`、`:281` | `query/task_manager.go:34`、`:76`、`:144`、`:329` | `32d8b002d8` #26981、`88d2760bc8` #23978、`2b7164440f` #27196 |
-| 编译 panic 恢复 | 无 | `query/compile.go:106`、`:117`-`:128` | `98361e2073` #21792 |
+| 编译 panic 恢复 | 无 | `query/compile.go:106`、`:118`-`:127` | `98361e2073` #21792 |
 | 多子查询 panic | `query/select.go:588`-`:594` 强制 `*VarRef` | `query/select.go:588`-`:594` 传 `expr.Args[0]` | `9e00f0de98` #26143 |
 | DST offset | `query/iterator.go:864` | `query/iterator.go:856`-`:866` | `d60741b506` #25082 |
 | MergeIterator.Close | 恒 nil | `query/iterator.gen.go:161`-`:173` `errors.Join` | `5fda409f39` #24975 |
