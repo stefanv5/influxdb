@@ -31,6 +31,16 @@
 
 ---
 
+## 0. 五分钟速读
+
+- **API**：v1.8.10 的 `WriteToShard`/`*WithContext` 被 `WriteContext` + `StatsTracker` 取代；Shard/Engine 只接收 tracker。
+- **字段元数据**：全量 `fields.idx` 改为追加 `fields.idxl`（`O_APPEND|O_SYNC`），启动重放后合并；固定临时名 `fields.idx.tmp` 的残留会在同进程内 EEXIST，重启由 `cleanupTempTSMFiles` 清掉。
+- **写入顺序**：Shard 校验/存字段 → Engine → Cache → WAL；WAL 负责 fsync 批量。
+- **Snapshot**：一次快照可产出 1–4 个 sequence=1 的 L1 文件；失败重试/降级/`ClearSnapshot(false)` 见 §3.8.1。
+- **风险**：`fields.idxl` 失败时字段“内存已生效、磁盘未落盘”；unsigned `valueType` 盲区；订阅序列化进入写请求 goroutine。
+
+> **事实归属**：TSM 格式与 compaction 见 [04](04_storage_compaction_diff.md)/[17](../17_tsm_file_format_spec.md)；TSI/SeriesFile 见 [02](02_index_series_diff.md)/[14](../14_series_file_deep_dive_spec.md)；Cache/ring 见 [15](../15_ring_cache_concurrency_spec.md)。
+
 ## 1. 结论速览
 
 | # | 变更点 | v1.8.10 | v1.12.3 | 影响 | 证据 |

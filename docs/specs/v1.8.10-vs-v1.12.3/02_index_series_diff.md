@@ -28,6 +28,16 @@
 | 6 | 至少 1 个查询/创建案例、1 个删除案例 | 见 §6.1（创建 + `SHOW MEASUREMENTS`）与 §6.2（`DROP SERIES`/删 shard） | §6 |
 | 7 | 升级后是否自动重建/兼容，需要 buildtsi 吗 | 不需要；旧 TSI/SeriesFile 直接可读；只有 inmem→tsi 转换才需要 `buildtsi` | §5.2、§5.3 |
 
+## 0. 五分钟速读
+
+- **格式不变**：TSI1/SSEG/SIDX/MANIFEST、`fields.idx` 的 magic/version/布局与旧版一致，升级不需要 `buildtsi`。
+- **SIDX**：69B 头 + 两张 16B 元素的 RHH 表；运行时 `SeriesPartitionCompactor` 只重建 SIDX，不重写 SSEG。
+- **LogEntry**：Flag 是互斥枚举，不是可组合位图；组合值会落入 default 被当成插入。
+- **并发**：`TagValueIterator` 在 `RUnlock` 后仍 range 共享 map，与写路径并发可触发 `fatal error: concurrent map iteration and map write`。
+- **删除/fsync**：`NoFlush` 批处理 + 每分区一次 `FlushSegments`；删除路径 fsync 0→≤8，写路径仅新 series 请求 ≤64（两层 fan-out）。
+
+> **事实归属**：line protocol 见 [13](../13_line_protocol_parser_spec.md)；SeriesFile/SSEG/SIDX 细节见 [14](../14_series_file_deep_dive_spec.md)；TSM 见 [17](../17_tsm_file_format_spec.md)；字段元数据见 [01](01_write_path_diff.md)。
+
 ## 1. 结论速览
 
 | # | 变更点 | v1.8.10 | v1.12.3 | 影响 | 证据 |

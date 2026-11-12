@@ -42,6 +42,16 @@
 
 ---
 
+## 0. 五分钟速读
+
+- **两条读取路径**：InfluxQL 走 `Select→Prepare→buildCursor` 与逐点 iterator；storage/reads 才走 `arrayCursorIterator→Read*ArrayBlock`。
+- **query/control**：Flux 查询的状态机/队列/内存池/取消/指标；默认 `total-max-memory-bytes=0` 即不限制。
+- **Flux 下推**：filter/group/window aggregate 下推，25 种表；窗口游标 `EndTime=stop-1`；`mean` 用 mean+count 合并。
+- **InfluxQL**：以正确性修复为主；`IntegerFloatDivision=true`（int/int 恒 float64）；HLL 基数近似、`SHOW TAG VALUES` 单 RP、DST 窗口修复。
+- **错误语义**：filter `Err()` 恒 nil；window aggregate 的 `Err()` 会带错误；cursor 构造错误可能被折叠为 nil。
+
+> **事实归属**：iterator/cursor 细节见 [03](../03_query_engine_spec.md)/[08](../08_array_cursor_spec.md)；HTTP 见 [10](../10_http_service_spec.md)；InfluxQL 执行见 [11](../11_influxql_execution_spec.md)；storage reads 见 [09](../09_storage_reads_spec.md)。
+
 ## 1. 结论速览
 
 | # | 变更点 | v1.8.10 | v1.12.3 | 影响 | 证据 |

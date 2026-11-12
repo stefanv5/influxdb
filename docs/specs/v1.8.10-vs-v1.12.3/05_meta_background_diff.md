@@ -15,6 +15,16 @@
 > 5. **旧版删 shard 可能被"正在读它的查询"永久卡住**，整个 retention 循环停在 `Shard.Close()` 上；新版先"禁止新读者进入"，再检查"还有没有人在读"，有人读就跳过、下轮再来（#25055）。注意闸门与 `ShardInUse` **只统计 TSM/FileStore 的 reader**；TSI 索引迭代器（`LogFile`/`IndexFile` 的 `Retain/Release`）不在计数内，慢的索引类查询仍可让 `sh.Close()` 等待，见 §3.9、§7.16。
 > 6. **purger 从"一个人拿着大门钥匙锁住整栋楼干活"变成"用带锁的格子柜"**：旧版在整个扫描+关闭+删除期间持有 `purger.mu` 写锁，会把 `FileStore` 的提交路径一起拖住；新版换成 `sync.Map` + 极短临界区。
 
+## 0. 五分钟速读
+
+- **meta**：仍是 clone-modify-commit + tmp/fsync/rename + changed 广播；protobuf 生成器迁移，消息/命令号不变。
+- **retention**：读者闸门（`SetNewReadersBlocked`/`ShardInUse`）→ `DeleteShard` → `DropShardMetaRef` → phantom 自愈；`PruneShardGroups` 要求 `len(Shards)==0`。
+- **CQ**：调度/时间窗口基本未变；SELECT INTO 受写窗口影响，窗口外的桶会被丢弃并计 `QueryFail`。
+- **snapshotter**：IDMap 握手；`SetData`/`createNewDBShards` 失败分支不发响应。
+- **风险**：meta `Clone` 不复制 `Subscriptions`（浅拷贝）、`total-buffer-bytes=0` 除零、OSS lease 恒成功且无互斥。
+
+> **事实归属**：meta 状态机细节见 [07](../07_state_machine_spec.md)；retention/shard 生命周期见 [12](../12_background_services_spec.md)；CQ 见 [05](../05_downsampling_spec.md)；HTTP 见 [10](../10_http_service_spec.md)。
+
 ## 1. 结论速览
 
 | # | 变更点 | v1.8.10 | v1.12.3 | 影响 | 证据 |

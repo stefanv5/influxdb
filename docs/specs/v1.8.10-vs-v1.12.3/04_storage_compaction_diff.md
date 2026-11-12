@@ -23,6 +23,16 @@
 
 ---
 
+## 0. 五分钟速读
+
+- **TSM 格式未变**：magic/version、Block、28B IndexEntry、8B Footer、mmap、KeyCursor、tombstone v3/v4、digest 均可直接读旧文件。
+- **4→5 级**：L4 full 与 L5 optimize 分开；L5 有 aggressive points-per-block、双 limiter、启动 1h/后续 5m holdoff。
+- **正确性修复**：#27233 防 level 回退、#26911 嵌套低层文件（1.12 线回归）、#26670 full 未排期/in-use 泄漏。
+- **规划/调度**：`PlanCompactions` 收集 5 级；权重 `0.4/0.3/0.2/0.1/0.01`；文件命名 `%09d-%09d`，gen/seq 缓存。
+- **风险**：`FileStore.Replace` 不是原子事务，半途失败会留孤儿/旧 reader 指向已关闭文件。
+
+> **事实归属**：TSM 格式见 [17](../17_tsm_file_format_spec.md)；FileStore/KeyCursor 见 [16](../16_filestore_keycursor_spec.md)；写入/snapshot 见 [01](01_write_path_diff.md)。
+
 ## 1. 结论速览
 
 | # | 变更点 | v1.8.10 | v1.12.3 | 影响 | 证据 |

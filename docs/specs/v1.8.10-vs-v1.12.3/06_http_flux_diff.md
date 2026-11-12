@@ -39,6 +39,16 @@
 
 ---
 
+## 0. 五分钟速读
+
+- **路由**：21→39 条，新增 `/api/v2/delete`、14 条 `/api/v2/buckets*` 与 OPTIONS；v2 delete 按 bucket 删除会跨所有 RP。
+- **中间件**：`authenticate→gzip→writeThrottler→log/recovery` 的顺序；写限流 503（queue full/timeout，默认 30s）先于认证。
+- **TLS**：`TLSConfigManager`/`CertLoader`；SIGHUP 只重载 HTTP/OpenTSDB 证书，其余配置不生效；key 权限 0600。
+- **Flux**：关闭时认证开启且已有管理员返回 401，认证关闭/引导模式返回 403；`storage/flux` 读路径。
+- **可观测性**：`/debug/vars` 的 config/stats/cq（cq 扁平化）；pprof 认证矩阵；`200+Flush` 后执行期错误只进 body。
+
+> **事实归属**：HTTP 路由/中间件细节见 [10](../10_http_service_spec.md)；Flux 读见 [09](../09_storage_reads_spec.md)；InfluxQL 执行见 [11](../11_influxql_execution_spec.md)。
+
 ## 1. 结论速览
 
 | # | 变更点 | v1.8.10 | v1.12.3 | 影响 | 证据 |

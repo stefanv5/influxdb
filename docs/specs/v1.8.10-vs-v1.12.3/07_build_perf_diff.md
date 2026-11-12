@@ -16,6 +16,16 @@
 > 6. **有两处「化石」没清**：根目录 `Dockerfile` 还停在 `golang:1.15.10` + `dep ensure`，`appveyor.yml` 还停在 `GOROOT=C:\go112` + `dep`。它们和 `go.mod` 已经完全对不上，属于历史遗留，不要拿它们当构建入口。
 > 7. **性能回归基础设施反而退化了**：旧版 1.8 线的 `perf_test`（AWS EC2/terraform/S3）没有进入 1.12.3 线，CI 也不跑 `go test -bench`；所以 §4 只讲机制与调用点，不给“提升 X%”的数字（§3.10.5、§4.8）。
 
+## 0. 五分钟速读
+
+- **工具链**：Go 1.13→1.24.0/toolchain 1.24.13；依赖 51→181；Flux 0.196.1、InfluxQL 1.4.1、JWT v4。
+- **构建/发布**：拆成构建、CI、打包、发布、分发 5 个模块；cross-builder 镜像 + Rust `libunwind`；产物收窄为 linux amd64/arm64、darwin/windows amd64。
+- **性能**：18 项按 compaction/TSI/query/cache/build 分组；另有 7 条是修复/新功能/持久化，不应算“优化”。
+- **计数**：planner 的 `level()` 调用次数按旧/新调用点分别重算（文内给公式与下界），不是 benchmark。
+- **风险**：旧 `perf_test`/AWS/S3 基础设施被删除且无替代；`Dockerfile`/`appveyor.yml` 仍是旧工具链死代码。
+
+> **事实归属**：各子系统机制见 01–06；构建/CI/发布/性能细节仅本文展开。
+
 ## 1. 结论速览
 
 | # | 变更点 | v1.8.10 | v1.12.3 | 影响 | 证据 |

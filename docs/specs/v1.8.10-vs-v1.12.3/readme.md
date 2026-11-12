@@ -22,6 +22,16 @@
 
 ---
 
+## 0. 五分钟速读
+
+- **基线**：本组文档以 `v1.12.3`（`f3d5cb68ab`）为代码基准，不是 `v1.8.10`；两者相差 527 个提交、602 个文件。
+- **最大变化**：compaction 从 4 级变 5 级，并修复 level 回退、嵌套低层文件、full 未排期等磁盘问题；**TSM 文件格式未变**。
+- **写入**：`*WithContext` 删除，改为 `WriteContext` + `StatsTracker`；`fields.idx -> fields.idxl`；`time` 字段不再被 engine 静默剥离。
+- **查询**：Flux 引入 `query/control` 与聚合下推；InfluxQL 以正确性修复为主；`SHOW SERIES CARDINALITY` 变为 HLL 近似。
+- **运维**：TLS/SIGHUP 只重载证书，路由 21→39，Go 1.13→1.24，依赖 51→181；升级前按 §5 清单核对。
+
+> **事实归属**：本文只做汇总与导航；各子系统细节以 01–07 为准，出现冲突时以源码为准。
+
 ## 1. 版本身份与基线
 
 ### 1.1 两个版本是谁
